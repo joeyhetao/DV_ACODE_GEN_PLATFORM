@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(python gen_templates.py)",
+      "Bash(ls -lh d:/tools/github/DV_ACODE_GEN_PLATFORM/templates/*.xlsx)"
+    ]
+  }
+}
