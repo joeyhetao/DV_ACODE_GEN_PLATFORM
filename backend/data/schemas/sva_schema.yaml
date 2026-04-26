@@ -1,0 +1,99 @@
+fields:
+  - col: A
+    field_key: row_id
+    name: 编号
+    type: text
+    required: true
+  - col: B
+    field_key: module
+    name: 所属模块
+    type: text
+    required: true
+  - col: C
+    field_key: clk
+    name: 时钟
+    type: text
+    required: true
+  - col: D
+    field_key: rst
+    name: 复位信号
+    type: text
+    required: true
+  - col: E
+    field_key: rst_polarity
+    name: 复位极性
+    type: enum
+    required: true
+    values:
+      - 高有效
+      - 低有效
+  - col: F
+    field_key: protocol
+    name: 协议
+    type: enum
+    required: false
+    values:
+      - AXI4
+      - AHB
+      - APB
+      - 通用
+  - col: S
+    field_key: intent
+    name: 验证意图
+    type: text
+    required: true
+  - col: T
+    field_key: severity
+    name: 严重级别
+    type: enum
+    required: false
+    values:
+      - error
+      - warning
+      - info
+    default: error
+  - col: U
+    field_key: comment
+    name: 备注
+    type: text
+    required: false
+  - col: V
+    field_key: _out_template
+    name: "[输出]匹配模板"
+    type: text
+    required: false
+    output: true
+  - col: W
+    field_key: _out_confidence
+    name: "[输出]置信度"
+    type: number
+    required: false
+    output: true
+  - col: X
+    field_key: _out_status
+    name: "[输出]生成状态"
+    type: enum
+    required: false
+    output: true
+    values:
+      - 已生成
+      - 需确认
+      - 需修改
+
+signals:
+  start_col: G
+  max_count: 4
+  cols_per_signal: 3
+  sub_fields:
+    - suffix: 名称
+      field_key: name
+      type: text
+      required_for_first: true
+    - suffix: 位宽
+      field_key: width
+      type: integer
+      required_for_first: true
+    - suffix: 角色
+      field_key: role
+      type: enum
+      required_for_first: true

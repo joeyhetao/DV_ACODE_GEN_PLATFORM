@@ -1,0 +1,69 @@
+id: sva_data_integrity_v1
+version: "1.0.0"
+name: 数据完整性无损坏断言
+code_type: assertion
+subcategory: data_integrity
+protocol: []
+tags:
+  - data_integrity
+  - stability
+  - protection
+keywords:
+  - 数据完整性
+  - 稳定
+  - 保护
+  - integrity
+  - stable
+description: |
+  验证在使能信号无效期间，受保护的数据信号不被意外修改，适用于寄存器写保护、数据锁存等场景。
+parameters:
+  - name: module_name
+    type: string
+    required: true
+    description: 模块名
+  - name: clk
+    type: string
+    required: true
+    description: 时钟信号
+    default: clk
+  - name: rst_n
+    type: string
+    required: true
+    description: 复位信号
+    default: rst_n
+  - name: enable
+    type: string
+    required: true
+    description: 写使能信号名（高有效）
+    role_hint: enable
+  - name: data
+    type: string
+    required: true
+    description: 被保护的数据信号名
+    role_hint: data
+maturity: stable
+related_ids: []
+template_body: |
+  // SVA: 数据完整性保护 — {{ module_name }}
+  module {{ module_name }}_data_integrity_sva (
+      input logic        {{ clk }},
+      input logic        {{ rst_n }},
+      input logic        {{ enable }},
+      input logic [31:0] {{ data }}
+  );
+
+    // 使能无效时数据不允许改变
+    property p_data_no_change_without_enable;
+      @(posedge {{ clk }}) disable iff (!{{ rst_n }})
+      !{{ enable }} |-> $stable({{ data }});
+    endproperty
+
+    a_data_integrity: assert property (p_data_no_change_without_enable)
+      else $error("[SVA FAIL] %m: {{ data }} 在 {{ enable }} 无效时发生变化 @ %0t", $time);
+
+    c_data_write_enabled: cover property (
+      @(posedge {{ clk }}) disable iff (!{{ rst_n }})
+      {{ enable }} ##1 !{{ enable }}
+    );
+
+  endmodule

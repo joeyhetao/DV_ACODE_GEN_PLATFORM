@@ -1,0 +1,69 @@
+id: cov_cross_coverage_v1
+version: "1.0.0"
+name: 交叉覆盖率组
+code_type: coverage
+subcategory: cross_coverage
+protocol: []
+tags:
+  - coverage
+  - cross
+  - corner_case
+keywords:
+  - 交叉覆盖
+  - cross
+  - 组合覆盖
+  - corner_case
+description: |
+  对两个信号的值域进行交叉覆盖率统计，用于发现信号组合的未覆盖corner case。
+parameters:
+  - name: group_name
+    type: string
+    required: true
+    description: 覆盖率组名
+  - name: clk
+    type: string
+    required: true
+    description: 时钟信号
+    default: clk
+  - name: signal_a
+    type: string
+    required: true
+    description: 第一个信号名
+    role_hint: data
+  - name: signal_b
+    type: string
+    required: true
+    description: 第二个信号名
+    role_hint: control
+  - name: bins_a
+    type: string
+    required: true
+    description: 信号A的bins定义
+    default: "{[0:3]}"
+  - name: bins_b
+    type: string
+    required: true
+    description: 信号B的bins定义
+    default: "{0, 1}"
+maturity: stable
+related_ids:
+  - cov_value_coverage_v1
+template_body: |
+  // Coverage: 交叉覆盖率 — {{ group_name }}
+  covergroup cg_{{ group_name }}_cross @(posedge {{ clk }});
+    option.per_instance = 1;
+    option.comment = "{{ group_name }} 交叉覆盖率";
+
+    cp_{{ signal_a }}: coverpoint {{ signal_a }} {
+      bins a_vals[] = {{ bins_a }};
+    }
+
+    cp_{{ signal_b }}: coverpoint {{ signal_b }} {
+      bins b_vals[] = {{ bins_b }};
+    }
+
+    cx_{{ signal_a }}_x_{{ signal_b }}: cross cp_{{ signal_a }}, cp_{{ signal_b }};
+
+  endgroup
+
+  cg_{{ group_name }}_cross cg_{{ group_name }}_cross_inst = new();

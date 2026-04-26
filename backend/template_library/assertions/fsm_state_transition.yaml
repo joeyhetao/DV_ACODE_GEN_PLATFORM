@@ -1,0 +1,78 @@
+id: sva_fsm_state_transition_v1
+version: "1.0.0"
+name: FSM状态转换合法性断言
+code_type: assertion
+subcategory: fsm
+protocol: []
+tags:
+  - fsm
+  - state_machine
+  - transition
+keywords:
+  - FSM
+  - 状态机
+  - 状态转换
+  - state
+  - transition
+description: |
+  在特定条件下，FSM必须从指定状态转换到目标状态，防止非法状态跳转。
+parameters:
+  - name: module_name
+    type: string
+    required: true
+    description: 模块名
+  - name: clk
+    type: string
+    required: true
+    description: 时钟信号
+    default: clk
+  - name: rst_n
+    type: string
+    required: true
+    description: 复位信号
+    default: rst_n
+  - name: state_sig
+    type: string
+    required: true
+    description: 状态信号名
+    role_hint: state
+  - name: from_state
+    type: string
+    required: true
+    description: 初始状态枚举值
+    default: IDLE
+  - name: condition
+    type: string
+    required: true
+    description: 触发转换的条件表达式
+  - name: to_state
+    type: string
+    required: true
+    description: 目标状态枚举值
+    default: ACTIVE
+maturity: stable
+related_ids: []
+template_body: |
+  // SVA: FSM状态转换合法性 — {{ module_name }}
+  module {{ module_name }}_fsm_transition_sva (
+      input logic        {{ clk }},
+      input logic        {{ rst_n }},
+      input logic [3:0]  {{ state_sig }},
+      input logic        {{ condition }}
+  );
+
+    // 当FSM在from_state且条件满足时，下一拍必须转换到to_state
+    property p_fsm_{{ from_state }}_to_{{ to_state }};
+      @(posedge {{ clk }}) disable iff (!{{ rst_n }})
+      ({{ state_sig }} == {{ from_state }} && {{ condition }}) |=> ({{ state_sig }} == {{ to_state }});
+    endproperty
+
+    a_fsm_{{ from_state }}_to_{{ to_state }}: assert property (p_fsm_{{ from_state }}_to_{{ to_state }})
+      else $error("[SVA FAIL] %m: FSM 未从 {{ from_state }} 转换到 {{ to_state }} @ %0t", $time);
+
+    c_fsm_transition: cover property (
+      @(posedge {{ clk }}) disable iff (!{{ rst_n }})
+      ({{ state_sig }} == {{ from_state }}) ##1 ({{ state_sig }} == {{ to_state }})
+    );
+
+  endmodule

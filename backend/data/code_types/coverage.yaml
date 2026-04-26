@@ -1,0 +1,16 @@
+id: coverage
+display_name: UVM功能覆盖率
+excel_sheet_name: Coverage需求
+excel_schema_file: schemas/coverage_schema.yaml
+signal_roles:
+  - main
+  - cross1
+  - cross2
+normalization_pattern: "覆盖 [信号名] 在 [场景/条件] 下的 [覆盖类型]"
+scenario_templates_file: scenarios/coverage_scenarios.yaml
+subcategories:
+  - value
+  - transition
+  - cross
+  - protocol
+  - exception

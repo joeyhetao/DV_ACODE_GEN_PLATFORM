@@ -1,0 +1,63 @@
+id: cov_value_coverage_v1
+version: "1.0.0"
+name: 信号值域覆盖率组
+code_type: coverage
+subcategory: value_coverage
+protocol: []
+tags:
+  - coverage
+  - value
+  - bins
+keywords:
+  - 值覆盖
+  - 枚举
+  - bins
+  - value_coverage
+description: |
+  对信号的值域进行分bin覆盖率统计，适用于状态机、控制信号、枚举类型信号的覆盖率收集。
+parameters:
+  - name: group_name
+    type: string
+    required: true
+    description: 覆盖率组名
+  - name: clk
+    type: string
+    required: true
+    description: 时钟信号
+    default: clk
+  - name: rst_n
+    type: string
+    required: true
+    description: 复位信号
+    default: rst_n
+  - name: signal
+    type: string
+    required: true
+    description: 被覆盖信号名
+    role_hint: data
+  - name: signal_width
+    type: integer
+    required: true
+    description: 信号位宽
+    default: "4"
+  - name: bins_expr
+    type: string
+    required: true
+    description: bins定义表达式，如 {0, 1, 2, 3} 或 {[0:15]}
+    default: "{[0:15]}"
+maturity: stable
+related_ids: []
+template_body: |
+  // Coverage: 信号值域覆盖率 — {{ group_name }}
+  covergroup cg_{{ group_name }}_value @(posedge {{ clk }});
+    option.per_instance = 1;
+    option.comment = "{{ group_name }} 值域覆盖率";
+
+    cp_{{ signal }}: coverpoint {{ signal }} {
+      bins valid_values[] = {{ bins_expr }};
+      bins others = default;
+    }
+
+  endgroup
+
+  cg_{{ group_name }}_value cg_{{ group_name }}_value_inst = new();

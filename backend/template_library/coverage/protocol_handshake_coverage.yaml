@@ -1,0 +1,80 @@
+id: cov_protocol_handshake_v1
+version: "1.0.0"
+name: 协议握手覆盖率组
+code_type: coverage
+subcategory: protocol_coverage
+protocol:
+  - AXI4
+  - AXI4-Lite
+  - AXI4-Stream
+tags:
+  - coverage
+  - handshake
+  - protocol
+keywords:
+  - 握手覆盖
+  - valid
+  - ready
+  - 协议覆盖
+  - AXI
+description: |
+  收集Valid/Ready握手协议的关键场景覆盖率，包含握手成功、valid等待、ready预备等场景。
+parameters:
+  - name: group_name
+    type: string
+    required: true
+    description: 覆盖率组名
+  - name: clk
+    type: string
+    required: true
+    description: 时钟信号
+    default: clk
+  - name: rst_n
+    type: string
+    required: true
+    description: 复位信号
+    default: rst_n
+  - name: valid
+    type: string
+    required: true
+    description: Valid信号名
+    role_hint: valid
+  - name: ready
+    type: string
+    required: true
+    description: Ready信号名
+    role_hint: ready
+maturity: stable
+related_ids:
+  - cov_value_coverage_v1
+template_body: |
+  // Coverage: 协议握手场景覆盖率 — {{ group_name }}
+  covergroup cg_{{ group_name }}_handshake @(posedge {{ clk }});
+    option.per_instance = 1;
+    option.comment = "{{ group_name }} Valid/Ready握手场景覆盖率";
+
+    // 握手状态交叉：覆盖4种组合
+    cp_{{ valid }}: coverpoint {{ valid }} {
+      bins active   = {1};
+      bins inactive = {0};
+    }
+
+    cp_{{ ready }}: coverpoint {{ ready }} {
+      bins active   = {1};
+      bins inactive = {0};
+    }
+
+    cx_handshake: cross cp_{{ valid }}, cp_{{ ready }} {
+      // valid=1, ready=1: 握手成功
+      bins handshake_done    = binsof(cp_{{ valid }}.active)   && binsof(cp_{{ ready }}.active);
+      // valid=1, ready=0: 等待响应
+      bins valid_wait        = binsof(cp_{{ valid }}.active)   && binsof(cp_{{ ready }}.inactive);
+      // valid=0, ready=1: ready预备
+      bins ready_preemptive  = binsof(cp_{{ valid }}.inactive) && binsof(cp_{{ ready }}.active);
+      // valid=0, ready=0: 双方空闲
+      bins both_inactive     = binsof(cp_{{ valid }}.inactive) && binsof(cp_{{ ready }}.inactive);
+    }
+
+  endgroup
+
+  cg_{{ group_name }}_handshake cg_{{ group_name }}_handshake_inst = new();

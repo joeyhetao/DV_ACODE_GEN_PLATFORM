@@ -1,0 +1,149 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: dv_platform
+      POSTGRES_USER: dvuser
+      POSTGRES_PASSWORD: dvpassword
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dvuser -d dv_platform"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      redis-server
+      --maxmemory 2gb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    volumes:
+      - qdrant_data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6333/healthz || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  embedding_service:
+    build:
+      context: ./embedding_service
+      dockerfile: Dockerfile.gpu
+    env_file: .env
+    environment:
+      - EMBED_MODEL=BAAI/bge-m3
+      - RERANK_MODEL=BAAI/bge-reranker-v2-m3
+      - DEVICE=cuda
+    volumes:
+      - hf_cache:/root/.cache/huggingface
+    ports:
+      - "8001:8001"
+    depends_on:
+      - qdrant
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8001/health || exit 1"]
+      interval: 30s
+      timeout: 20s
+      retries: 5
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://dvuser:dvpassword@postgres:5432/dv_platform
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - EMBEDDING_SERVICE_URL=http://embedding_service:8001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+      embedding_service:
+        condition: service_healthy
+    volumes:
+      - backend_uploads:/app/uploads
+      - backend_backups:/app/backups
+
+  celery_worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: celery -A app.tasks.batch_tasks worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-10}
+    env_file: .env
+    environment:
+      - DATABASE_URL=postgresql+asyncpg://dvuser:dvpassword@postgres:5432/dv_platform
+      - REDIS_URL=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - EMBEDDING_SERVICE_URL=http://embedding_service:8001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      embedding_service:
+        condition: service_healthy
+    volumes:
+      - backend_uploads:/app/uploads
+
+  backup:
+    image: postgres:16-alpine
+    env_file: .env
+    environment:
+      - PGPASSWORD=dvpassword
+      - BACKUP_RETAIN_DAYS=${BACKUP_RETAIN_DAYS:-7}
+    entrypoint: |
+      sh -c '
+        while true; do
+          sleep 86400
+          pg_dump -h postgres -U dvuser -d dv_platform -F c -f /backups/dv_platform_$(date +%Y%m%d_%H%M%S).dump
+          find /backups -name "*.dump" -mtime +$$BACKUP_RETAIN_DAYS -delete
+          echo "Backup completed at $(date)"
+        done
+      '
+    volumes:
+      - backend_backups:/backups
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    depends_on:
+      - backend
+
+  nginx:
+    image: nginx:alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      - backend
+      - frontend
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  hf_cache:
+  backend_uploads:
+  backend_backups:

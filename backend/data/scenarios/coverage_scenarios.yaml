@@ -1,0 +1,51 @@
+scenarios:
+  - id: value_coverage
+    name: 信号值覆盖
+    description: 覆盖信号在特定场景下的所有取值
+    params:
+      - name: signal
+        description: 被覆盖的信号名
+        required: true
+      - name: condition
+        description: 覆盖场景/条件描述
+        required: true
+    template: "覆盖 {signal} 在 {condition} 下的所有值"
+
+  - id: transition_coverage
+    name: 信号转移覆盖
+    description: 覆盖信号的状态转移
+    params:
+      - name: signal
+        description: 被覆盖的信号名
+        required: true
+      - name: condition
+        description: 覆盖场景/条件描述
+        required: true
+    template: "覆盖 {signal} 在 {condition} 下的状态转移"
+
+  - id: cross_coverage
+    name: 信号交叉覆盖
+    description: 覆盖两个信号的组合取值空间
+    params:
+      - name: signal1
+        description: 第一个信号名
+        required: true
+      - name: signal2
+        description: 第二个信号名
+        required: true
+      - name: condition
+        description: 覆盖场景/条件描述
+        required: true
+    template: "覆盖 {signal1} 与 {signal2} 在 {condition} 下的交叉组合"
+
+  - id: protocol_handshake_coverage
+    name: 协议握手覆盖
+    description: 覆盖握手信号的各种组合场景
+    params:
+      - name: valid
+        description: valid信号名
+        required: true
+      - name: ready
+        description: ready信号名
+        required: true
+    template: "覆盖 {valid} 和 {ready} 在握手协议下的所有组合场景"

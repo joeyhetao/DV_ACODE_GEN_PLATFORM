@@ -1,0 +1,78 @@
+id: sva_handshake_timeout_v1
+version: "1.0.0"
+name: Valid-Ready握手超时检测断言
+code_type: assertion
+subcategory: handshake
+protocol:
+  - AXI4
+  - AXI4-Lite
+  - AXI4-Stream
+tags:
+  - handshake
+  - timeout
+  - valid_ready
+keywords:
+  - valid
+  - ready
+  - timeout
+  - 握手
+  - 超时
+description: |
+  检测Valid信号拉高后Ready信号必须在规定周期内响应，防止死锁或性能退化。
+parameters:
+  - name: module_name
+    type: string
+    required: true
+    description: 模块名
+  - name: clk
+    type: string
+    required: true
+    description: 时钟信号
+    default: clk
+  - name: rst_n
+    type: string
+    required: true
+    description: 复位信号
+    default: rst_n
+  - name: valid
+    type: string
+    required: true
+    description: Valid信号名
+    role_hint: valid
+  - name: ready
+    type: string
+    required: true
+    description: Ready信号名
+    role_hint: ready
+  - name: max_cycles
+    type: integer
+    required: true
+    description: 最大等待周期数
+    default: "16"
+maturity: stable
+related_ids:
+  - sva_handshake_stable_v1
+template_body: |
+  // SVA: Valid-Ready握手超时检测 — {{ module_name }}
+  module {{ module_name }}_handshake_timeout_sva (
+      input logic {{ clk }},
+      input logic {{ rst_n }},
+      input logic {{ valid }},
+      input logic {{ ready }}
+  );
+
+    // valid拉高后max_cycles个周期内ready必须响应
+    property p_handshake_no_timeout;
+      @(posedge {{ clk }}) disable iff (!{{ rst_n }})
+      $rose({{ valid }}) |-> ##[1:{{ max_cycles }}] {{ ready }};
+    endproperty
+
+    a_handshake_no_timeout: assert property (p_handshake_no_timeout)
+      else $error("[SVA FAIL] %m: 握手超时 — {{ valid }} 拉高后 {{ max_cycles }} 周期内 {{ ready }} 未响应 @ %0t", $time);
+
+    c_handshake_fast_ack: cover property (
+      @(posedge {{ clk }}) disable iff (!{{ rst_n }})
+      $rose({{ valid }}) ##1 {{ ready }}
+    );
+
+  endmodule

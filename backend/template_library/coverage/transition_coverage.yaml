@@ -1,0 +1,67 @@
+id: cov_transition_coverage_v1
+version: "1.0.0"
+name: 状态转换覆盖率组
+code_type: coverage
+subcategory: transition_coverage
+protocol: []
+tags:
+  - coverage
+  - transition
+  - fsm
+keywords:
+  - 转换覆盖
+  - transition
+  - FSM
+  - 状态机
+description: |
+  收集信号值之间的状态转换覆盖率，适用于FSM状态转换完整性验证。
+parameters:
+  - name: group_name
+    type: string
+    required: true
+    description: 覆盖率组名
+  - name: clk
+    type: string
+    required: true
+    description: 时钟信号
+    default: clk
+  - name: rst_n
+    type: string
+    required: true
+    description: 复位信号
+    default: rst_n
+  - name: signal
+    type: string
+    required: true
+    description: 被覆盖信号名（通常为状态信号）
+    role_hint: state
+  - name: signal_width
+    type: integer
+    required: true
+    description: 信号位宽
+    default: "3"
+  - name: state_list
+    type: string
+    required: true
+    description: 合法状态值列表，逗号分隔，如 IDLE,ACTIVE,DONE
+    default: "IDLE, ACTIVE, DONE"
+maturity: stable
+related_ids:
+  - cov_value_coverage_v1
+template_body: |
+  // Coverage: 状态转换覆盖率 — {{ group_name }}
+  covergroup cg_{{ group_name }}_transition @(posedge {{ clk }});
+    option.per_instance = 1;
+    option.comment = "{{ group_name }} 状态转换覆盖率";
+
+    cp_{{ signal }}: coverpoint {{ signal }} {
+      bins states[] = {{{ state_list }}};
+    }
+
+    cp_{{ signal }}_trans: coverpoint {{ signal }} {
+      bins trans[] = ({{ state_list }} => {{ state_list }});
+    }
+
+  endgroup
+
+  cg_{{ group_name }}_transition cg_{{ group_name }}_transition_inst = new();

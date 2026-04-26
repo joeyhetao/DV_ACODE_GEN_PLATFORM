@@ -1,0 +1,80 @@
+id: sva_handshake_stable_v1
+version: "1.0.0"
+name: AXI Valid-Ready握手数据稳定性断言
+code_type: assertion
+subcategory: handshake
+protocol:
+  - AXI4
+  - AXI4-Lite
+  - AXI4-Stream
+tags:
+  - handshake
+  - stability
+  - valid_ready
+keywords:
+  - valid
+  - ready
+  - stable
+  - 握手
+  - 数据稳定
+description: |
+  当valid拉高而ready未响应期间，数据信号必须保持稳定。
+  适用于所有基于Valid/Ready握手协议的接口，如AXI4、AXI4-Stream等。
+parameters:
+  - name: module_name
+    type: string
+    required: true
+    description: 模块名
+    role_hint: null
+  - name: clk
+    type: string
+    required: true
+    description: 时钟信号
+    default: clk
+  - name: rst_n
+    type: string
+    required: true
+    description: 复位信号（低有效）
+    default: rst_n
+  - name: valid
+    type: string
+    required: true
+    description: Valid信号名
+    role_hint: valid
+  - name: ready
+    type: string
+    required: true
+    description: Ready信号名
+    role_hint: ready
+  - name: data
+    type: string
+    required: true
+    description: 需保持稳定的数据信号
+    role_hint: data
+maturity: stable
+related_ids: []
+template_body: |
+  // SVA: Valid-Ready握手数据稳定性 — {{ module_name }}
+  module {{ module_name }}_handshake_stable_sva (
+      input logic        {{ clk }},
+      input logic        {{ rst_n }},
+      input logic        {{ valid }},
+      input logic        {{ ready }},
+      input logic [31:0] {{ data }}
+  );
+
+    // 当valid有效且ready未响应时，data必须保持稳定
+    property p_data_stable_when_valid;
+      @(posedge {{ clk }}) disable iff (!{{ rst_n }})
+      ({{ valid }} && !{{ ready }}) |-> ##1 $stable({{ data }});
+    endproperty
+
+    a_data_stable_when_valid: assert property (p_data_stable_when_valid)
+      else $error("[SVA FAIL] %m: {{ data }} 在握手期间发生变化 @ %0t", $time);
+
+    c_data_stable_when_valid: cover property (
+      @(posedge {{ clk }}) disable iff (!{{ rst_n }})
+      ({{ valid }} && !{{ ready }}) ##1 ({{ valid }} && {{ ready }})
+    );
+
+  endmodule

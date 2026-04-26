@@ -1,0 +1,74 @@
+id: sva_timing_max_delay_v1
+version: "1.0.0"
+name: 最大延迟时序约束断言
+code_type: assertion
+subcategory: timing
+protocol: []
+tags:
+  - timing
+  - delay
+  - latency
+keywords:
+  - 延迟
+  - 时序
+  - latency
+  - max_delay
+  - 响应时间
+description: |
+  约束起始事件发生后结束事件必须在指定最大延迟周期内发生，用于验证时序SLA。
+parameters:
+  - name: module_name
+    type: string
+    required: true
+    description: 模块名
+  - name: clk
+    type: string
+    required: true
+    description: 时钟信号
+    default: clk
+  - name: rst_n
+    type: string
+    required: true
+    description: 复位信号
+    default: rst_n
+  - name: start_event
+    type: string
+    required: true
+    description: 起始事件信号名
+    role_hint: start
+  - name: end_event
+    type: string
+    required: true
+    description: 结束事件信号名
+    role_hint: end
+  - name: max_delay
+    type: integer
+    required: true
+    description: 最大延迟周期数
+    default: "8"
+maturity: stable
+related_ids: []
+template_body: |
+  // SVA: 最大延迟时序约束 — {{ module_name }}
+  module {{ module_name }}_max_delay_sva (
+      input logic {{ clk }},
+      input logic {{ rst_n }},
+      input logic {{ start_event }},
+      input logic {{ end_event }}
+  );
+
+    // 起始事件发生后，结束事件必须在max_delay周期内发生
+    property p_max_delay;
+      @(posedge {{ clk }}) disable iff (!{{ rst_n }})
+      $rose({{ start_event }}) |-> ##[1:{{ max_delay }}] {{ end_event }};
+    endproperty
+
+    a_max_delay: assert property (p_max_delay)
+      else $error("[SVA FAIL] %m: {{ end_event }} 未在 {{ max_delay }} 周期内响应 {{ start_event }} @ %0t", $time);
+
+    c_min_delay: cover property (
+      @(posedge {{ clk }}) disable iff (!{{ rst_n }})
+      $rose({{ start_event }}) ##1 {{ end_event }}
+    );
+
+  endmodule

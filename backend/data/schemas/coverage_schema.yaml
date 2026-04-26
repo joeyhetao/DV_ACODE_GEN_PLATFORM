@@ -1,0 +1,139 @@
+fields:
+  - col: A
+    field_key: row_id
+    name: 编号
+    type: text
+    required: true
+  - col: B
+    field_key: module
+    name: 所属模块
+    type: text
+    required: true
+  - col: C
+    field_key: clk
+    name: 采样时钟
+    type: text
+    required: true
+  - col: D
+    field_key: rst
+    name: 复位信号
+    type: text
+    required: true
+  - col: E
+    field_key: rst_polarity
+    name: 复位极性
+    type: enum
+    required: true
+    values:
+      - 高有效
+      - 低有效
+  - col: F
+    field_key: cover_type
+    name: 覆盖类型
+    type: enum
+    required: false
+    values:
+      - 值覆盖
+      - 转移覆盖
+      - 交叉覆盖
+  - col: G
+    field_key: main_signal_name
+    name: 主信号名称
+    type: text
+    required: true
+  - col: H
+    field_key: main_signal_width
+    name: 主信号位宽
+    type: integer
+    required: true
+  - col: I
+    field_key: main_signal_dtype
+    name: 主信号数据类型
+    type: enum
+    required: true
+    values:
+      - logic
+      - uint
+      - enum
+  - col: J
+    field_key: cross1_name
+    name: 交叉信号1名称
+    type: text
+    required: false
+  - col: K
+    field_key: cross1_width
+    name: 交叉信号1位宽
+    type: integer
+    required: false
+  - col: L
+    field_key: cross1_dtype
+    name: 交叉信号1数据类型
+    type: enum
+    required: false
+    values:
+      - logic
+      - uint
+      - enum
+  - col: M
+    field_key: cross2_name
+    name: 交叉信号2名称
+    type: text
+    required: false
+  - col: N
+    field_key: cross2_width
+    name: 交叉信号2位宽
+    type: integer
+    required: false
+  - col: O
+    field_key: cross2_dtype
+    name: 交叉信号2数据类型
+    type: enum
+    required: false
+    values:
+      - logic
+      - uint
+      - enum
+  - col: P
+    field_key: bin_hint
+    name: Bin提示
+    type: text
+    required: false
+  - col: Q
+    field_key: sample_condition
+    name: 采样条件
+    type: text
+    required: false
+  - col: R
+    field_key: intent
+    name: 覆盖意图
+    type: text
+    required: true
+  - col: S
+    field_key: comment
+    name: 备注
+    type: text
+    required: false
+  - col: T
+    field_key: _out_template
+    name: "[输出]匹配模板"
+    type: text
+    required: false
+    output: true
+  - col: U
+    field_key: _out_confidence
+    name: "[输出]置信度"
+    type: number
+    required: false
+    output: true
+  - col: V
+    field_key: _out_status
+    name: "[输出]生成状态"
+    type: enum
+    required: false
+    output: true
+    values:
+      - 已生成
+      - 需确认
+      - 需修改
+
+signals: null

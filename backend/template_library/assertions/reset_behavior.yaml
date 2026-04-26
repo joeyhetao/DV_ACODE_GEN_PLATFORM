@@ -1,0 +1,76 @@
+id: sva_reset_behavior_v1
+version: "1.0.0"
+name: 复位释放后初始值断言
+code_type: assertion
+subcategory: reset
+protocol: []
+tags:
+  - reset
+  - initialization
+  - power_on
+keywords:
+  - 复位
+  - reset
+  - 初始值
+  - initialization
+description: |
+  验证复位信号释放后目标信号必须在指定周期内达到初始值，确保正确的复位行为。
+parameters:
+  - name: module_name
+    type: string
+    required: true
+    description: 模块名
+  - name: clk
+    type: string
+    required: true
+    description: 时钟信号
+    default: clk
+  - name: rst_n
+    type: string
+    required: true
+    description: 复位信号（低有效）
+    default: rst_n
+  - name: target
+    type: string
+    required: true
+    description: 目标信号名
+    role_hint: data
+  - name: init_value
+    type: string
+    required: true
+    description: 复位后期望的初始值
+    default: "0"
+  - name: settle_cycles
+    type: integer
+    required: false
+    description: 复位释放后允许的稳定周期数
+    default: "1"
+maturity: stable
+related_ids: []
+template_body: |
+  // SVA: 复位释放后初始值验证 — {{ module_name }}
+  module {{ module_name }}_reset_behavior_sva (
+      input logic        {{ clk }},
+      input logic        {{ rst_n }},
+      input logic [31:0] {{ target }}
+  );
+
+    // 复位期间target必须为init_value
+    property p_reset_value;
+      @(posedge {{ clk }})
+      !{{ rst_n }} |-> ({{ target }} == {{ init_value }});
+    endproperty
+
+    // 复位释放后settle_cycles内target达到init_value
+    property p_reset_release;
+      @(posedge {{ clk }})
+      $rose({{ rst_n }}) |-> ##[0:{{ settle_cycles }}] ({{ target }} == {{ init_value }});
+    endproperty
+
+    a_reset_value: assert property (p_reset_value)
+      else $error("[SVA FAIL] %m: 复位期间 {{ target }} != {{ init_value }} @ %0t", $time);
+
+    a_reset_release: assert property (p_reset_release)
+      else $error("[SVA FAIL] %m: 复位释放后 {{ settle_cycles }} 周期内 {{ target }} 未达到 {{ init_value }} @ %0t", $time);
+
+  endmodule

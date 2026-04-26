@@ -1,0 +1,90 @@
+scenarios:
+  - id: handshake_stable
+    name: Valid-Ready握手数据稳定性
+    description: 当valid拉高ready未响应期间，数据保持稳定
+    params:
+      - name: valid
+        description: valid信号名
+        required: true
+      - name: ready
+        description: ready信号名
+        required: true
+      - name: data
+        description: 需保持稳定的数据信号名
+        required: true
+    template: "当 {valid} 有效且 {ready} 未响应时，{data} 必须保持稳定"
+
+  - id: handshake_timeout
+    name: Valid-Ready握手超时检测
+    description: valid拉高后ready必须在指定周期内响应
+    params:
+      - name: valid
+        description: valid信号名
+        required: true
+      - name: ready
+        description: ready信号名
+        required: true
+      - name: max_cycles
+        description: 最大等待周期数
+        required: true
+    template: "当 {valid} 有效后，{ready} 必须在 {max_cycles} 个时钟周期内响应"
+
+  - id: timing_max_delay
+    name: 最大延迟约束
+    description: 起始事件到结束事件的最大延迟
+    params:
+      - name: start
+        description: 起始事件信号名
+        required: true
+      - name: end
+        description: 结束事件信号名
+        required: true
+      - name: max_delay
+        description: 最大延迟周期数
+        required: true
+    template: "当 {start} 发生后，{end} 必须在 {max_delay} 个时钟周期内发生"
+
+  - id: fsm_state_transition
+    name: FSM状态转换约束
+    description: 在特定条件下FSM必须转换到目标状态
+    params:
+      - name: state_sig
+        description: 状态信号名
+        required: true
+      - name: from_state
+        description: 初始状态值
+        required: true
+      - name: condition
+        description: 触发转换的条件
+        required: true
+      - name: to_state
+        description: 目标状态值
+        required: true
+    template: "当 {state_sig} 为 {from_state} 且 {condition} 时，{state_sig} 必须转换到 {to_state}"
+
+  - id: data_integrity_no_corruption
+    name: 数据完整性无损坏
+    description: 使能信号有效时数据不应被意外修改
+    params:
+      - name: enable
+        description: 使能信号名
+        required: true
+      - name: data
+        description: 被保护的数据信号名
+        required: true
+    template: "当 {enable} 无效时，{data} 必须保持稳定不被修改"
+
+  - id: reset_behavior
+    name: 复位行为约束
+    description: 复位释放后信号必须达到初始值
+    params:
+      - name: rst
+        description: 复位信号名
+        required: true
+      - name: target
+        description: 目标信号名
+        required: true
+      - name: init_value
+        description: 初始值
+        required: true
+    template: "当 {rst} 释放后，{target} 必须在一个时钟周期内达到 {init_value}"

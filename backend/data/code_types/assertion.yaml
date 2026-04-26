@@ -1,0 +1,27 @@
+id: assertion
+display_name: SVA断言
+excel_sheet_name: SVA需求
+excel_schema_file: schemas/sva_schema.yaml
+signal_roles:
+  - valid
+  - ready
+  - data
+  - state
+  - req
+  - ack
+  - start
+  - end
+  - enable
+  - count
+  - other
+normalization_pattern: "当 [触发条件] 时，[验证对象] 必须 [约束内容]"
+scenario_templates_file: scenarios/assertion_scenarios.yaml
+subcategories:
+  - handshake
+  - timing
+  - fsm
+  - data_integrity
+  - bus_protocol
+  - reset
+  - counter
+  - arbitration
