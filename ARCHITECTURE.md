@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.10  
+**版本**：v2.11  
 **状态**：已确认  
-**日期**：2026-04-22  
+**日期**：2026-04-27  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -13,8 +13,9 @@
 - v2.5 → v2.6：可行性评审修订——§1.1/1.2 架构图 "Claude API" 改为通用 "LLM API"；预检去除 LLM 调用（§3.11.3）；llm_configs 加 DB 部分唯一索引（§4.1）；Redis maxmemory 策略 + 生成缓存 TTL 90天（§3.6）；Celery 默认并发数 10（§3.7）；dev 环境 Embedding Service 小模型降级方案（§8.2）
 - v2.6 → v2.7：新增模板入库查重机制（§3.8）——名称精确匹配 + 语义相似度检查（阈值 0.90），覆盖 Admin UI 新建、YAML 批量导入、贡献审核三条路径；更新 API 端点（§5.1）、新增 TEMPLATE_DEDUP_THRESHOLD 环境变量（§8.4）
 - v2.7 → v2.8：新增数据备份与误操作保护机制（§3.13）——三层防护（操作保护/自动备份/恢复路径）；新增 admin_audit_logs 表（§4.1）；Docker Compose 新增 backup 服务（§8.1）；新增审计日志 API 端点（§5.1）；新增 BACKUP_RETAIN_DAYS / QDRANT_SNAPSHOT_ENABLED 环境变量（§8.4）
-- v2.8 → v2.9：架构分层解耦优化——新增代码类型注册表（§3.14，code_types/*.yaml 驱动，零 Python 代码扩展新类型）；新增生成流水线编排器（§3.15，8步 Pipeline 统一入口）；服务层重组为 core/rag/llm/intent/parser/platform 六子包（§7）；Excel 解析改为 schema 驱动（§3.9）；意图标准化 Prompt 改为 registry 驱动（§3.11.2）；templates 表 `category` 列重命名为 `code_type`（§4.1）；Qdrant payload 同步更名（§4.2）；新增 GET /api/v1/code-types 端点（§5.1）；模板 YAML `category` 字段改为 `code_type`（§6）；data/ 目录新增 code_types/、schemas/、scenarios/ 三个子目录（§7）
+- v2.8 → v2.9：架构分层解耦优化——新增代码类型注册表（§3.14，code_types/*.yaml 驱动，零 Python 代码扩展新类型）；新增生成流水线编排器（§3.15，8步 Pipeline 统一入口）；服务层重组为 core/rag/llm/intent/parser/platform 六子包（§7）；Excel 解析改为 schema 驱动（§3.9）；意图标准化 Prompt 改为 registry 驱动（§3.11.2）；templates 表 `category` 列重命名为 `code_type`（§4.1）；Qdrant payload 同步更名（§4.2）；新增 GET /api/v1/generate/code-types 端点（§5.1）；模板 YAML `category` 字段改为 `code_type`（§6）；data/ 目录新增 code_types/、schemas/、scenarios/ 三个子目录（§7）
 - v2.9 → v2.10：模板查重机制优化——步骤 B 从 Stage1 Hybrid RRF 检索改为 dense-only 余弦相似度检索（§3.8），解决 RRF 分数缺乏可解释单位的问题；补充说明框（关键词重叠 ≠ 语义重复，dense-only 与生成链路 hybrid 两套查询独立）；更新 TEMPLATE_DEDUP_THRESHOLD 环境变量注释（§8.4）
+- v2.10 → v2.11：初始实现对齐——API v1 端点平铺于 api/v1/（删除 endpoints/ 子目录），贡献者与管理员审核端点合并为单文件（§3.10.4）；code-types 端点路径更正为 /api/v1/generate/code-types（§3.14.4、§5.1）；流水线接口类更名为 PipelineInput/PipelineResult，Step 1 改为 IntentNormalize（§3.15.2、§3.15.3）；备份 volume 更正为 backend_backups（§3.13.2）；迁移文件合并为 001_initial_schema.py（§7）
 
 ---
 
@@ -814,14 +815,13 @@ backend/app/
 ├── schemas/
 │   ├── contribution.py          # ContributionCreate / ContributionResponse / ContributionAdminView
 │   └── notification.py          # NotificationResponse
-├── api/v1/endpoints/
-│   ├── contributions.py         # 贡献者端点（提交/查看/修改）
-│   └── admin_contributions.py   # 管理员审核端点
-├── services/
-│   └── contribution_service.py  # 贡献入库流水线（调用 create_template()）
-└── migrations/
-    └── 003_add_contributions_and_notifications.sql
+├── api/v1/
+│   └── contributions.py         # 贡献者端点（提交/查看/修改）及管理员审核端点（合并单文件）
+└── services/platform/
+    └── contribution_service.py  # 贡献入库流水线（调用 create_template()）
 ```
+
+> **注**：贡献者端点与管理员审核端点合并在同一 `contributions.py` 文件中，通过 `require_role` 依赖注入区分权限。所有表结构均在 `migrations/versions/001_initial_schema.py` 初始迁移中统一建立。
 
 ### 3.11 验证意图标准化服务
 
@@ -1155,16 +1155,14 @@ class CodeTypeRegistry:
 #### 3.14.4 新增 API 端点
 
 ```
-GET /api/v1/code-types
+GET /api/v1/generate/code-types
   响应：[
-    { "id": "assertion", "display_name": "SVA断言",
-      "signal_roles": ["valid","ready","data",...],
-      "subcategories": ["handshake","timing",...] },
-    { "id": "coverage",  "display_name": "UVM功能覆盖率", ... }
+    { "id": "assertion", "display_name": "SVA断言" },
+    { "id": "coverage",  "display_name": "UVM功能覆盖率" }
   ]
 ```
 
-前端通过此端点动态获取类型列表，单条生成页面的"代码类型"下拉和信号角色选项均由后端驱动，新增代码类型时前端**无需任何改动**。
+前端通过此端点动态获取类型列表，单条生成页面的"代码类型"下拉均由后端驱动，新增代码类型时前端**无需任何改动**。该端点挂载在 `/generate` 路由组下（`router = APIRouter(prefix="/generate")`）。
 
 ---
 
@@ -1180,75 +1178,73 @@ GET /api/v1/code-types
 
 ```python
 @dataclass
-class GenerationRequest:
+class PipelineInput:
+    original_intent: str   # 用户填写的验证意图原文
     code_type: str         # "assertion" | "coverage" | ...（registry 中注册的 id）
-    intent: str            # 用户填写的验证意图原文
-    clk: str               # 时钟信号
-    rst: str               # 复位信号
-    rst_polarity: str      # "high_active" | "low_active"
     protocol: str | None   # 可选协议过滤
-    signals: list[SignalInfo]  # [{name, width, role}, ...]（最多4条）
-    extra_fields: dict     # 代码类型专属字段（coverage的bin_hint等）
+    clk: str               # 时钟信号（默认 "clk"）
+    rst: str               # 复位信号（默认 "rst_n"）
+    rst_polarity: str      # 复位极性（默认 "低有效"）
+    signals: list[dict]    # [{name, width, role}, ...]
 
 @dataclass
-class GenerationResult:
-    status: str            # "generated" | "needs_selection" | "low_confidence"
-    code: str | None
-    template_id: str | None
-    template_version: str | None
+class PipelineResult:
+    status: str            # "success"
+    code: str
+    template_id: str
+    template_name: str
+    version: str
     confidence: float
-    rag_candidates: list
+    normalized_intent: str
+    intent_hash: str
+    rag_candidates: list[dict]
     params_used: dict
     cache_hit: bool
     intent_cache_hit: bool
-    normalized_intent: str
 ```
 
 #### 3.15.3 8 步流水线
 
 ```
-GenerationPipeline.run(request: GenerationRequest) → GenerationResult
+run_pipeline(inp: PipelineInput, db: AsyncSession) → PipelineResult
 
-Step 1: CacheLookup
-  输入：request → cache_key = SHA256(code_type + normalized_intent + signals_canonical)
-  命中 → 直接返回，流水线结束
-  未命中 → 进入 Step 2
+Step 1: IntentNormalize
+  调用 normalize_intent(inp.original_intent, db)
+  输出：normalized_intent + intent_hash（SHA256，temperature=0，确定性）
 
-Step 2: IntentNormalize
-  读取 registry.get_normalization_pattern(request.code_type)
-  调用 LLM.complete(system=固定prompt+句式, user=request.intent)
-  输出：normalized_intent（temperature=0，确定性）
+Step 2: IntentCacheLookup
+  lookup_history(intent_hash) → 若命中，取历史 template_id + params
+  再尝试 get_generation_cache(tmpl_id, version, params)
+  双重命中 → 直接返回（intent_cache_hit=True, cache_hit=True），流水线结束
+  未命中 → 进入 Step 3
 
-Step 3: Embed
-  调用 Embedding Service /embed（dense + sparse + colbert）
-  输出：三种向量
-
-Step 4: RAGRetrieve
-  Stage1 Qdrant 混合检索（code_type 作为主过滤条件，protocol 作为次过滤）
+Step 3+4: Embed + RAGRetrieve
+  rag_retrieve(normalized_intent, db, code_type)
+  Stage1 Qdrant 混合检索（dense+sparse RRF，code_type 过滤）
   Stage2 ColBERT MaxSim 精排
   Stage3 bge-reranker 精排
-  输出：Top-3 候选模板（template_id + score）
+  输出：Top-N 候选模板
 
 Step 5: TemplateSelect
-  从 PostgreSQL 取 Top-3 完整模板内容
-  调用 LLM.select_template(rag_prompt)（工具调用，JSON Schema 约束）
+  调用 LLM.select_template(normalized_intent, signal_context, candidates)
   输出：{template_id, param_mapping, confidence}
 
+Step 5b: GenerationCacheLookup
+  get_generation_cache(template_id, version, params)
+  命中 → 直接返回（cache_hit=True），流水线结束
+
 Step 6: ParamMap
-  从 template.parameters 中读取 role_hint
-  通过角色规则引擎将 request.signals 映射至模板参数
-  clk/rst 直接从 request 填充
-  extra_fields 通过 field_key 直接填充
+  从 template.parameters 读取 role_hint，通过角色规则引擎映射 inp.signals
+  clk / rst / rst_polarity 直接从 inp 填充，剩余字段取 default
   输出：最终 params_used
 
 Step 7: Render
-  Jinja2 StrictUndefined 渲染
+  render_template(template_body, params)（Jinja2 StrictUndefined）
   输出：code（确定性字符串）
 
 Step 8: CacheWrite
-  写入 Redis（TTL 90天）
-  写入 generation_records（PostgreSQL）
-  写入 intent_cache（历史意图库，无 TTL）
+  set_generation_cache(template_id, version, params, code)（Redis TTL 90天）
+  save_history(intent_hash, template_id, params, confidence, code)（历史意图库）
 ```
 
 #### 3.15.4 端点层变薄
@@ -1281,7 +1277,7 @@ pg_dump --format=custom --compress=9
   保留最近 7 份，约占用空间：模板库 100 条时 ~10MB/份
 ```
 
-备份文件存储于命名 Docker volume `postgres_backups`，挂载到宿主机持久化目录。
+备份文件存储于命名 Docker volume `backend_backups`，挂载到宿主机持久化目录。
 
 #### 3.13.3 Qdrant 快照（可选，加速恢复）
 
@@ -1558,7 +1554,7 @@ WHERE is_default = true;
 
 | 方法 | 路径 | 描述 | 权限 |
 |------|------|------|------|
-| GET | `/api/v1/code-types` | 获取已注册代码类型列表（前端动态读取，无需硬编码） | 普通用户+ |
+| GET | `/api/v1/generate/code-types` | 获取已注册代码类型列表（前端动态读取，无需硬编码） | 普通用户+ |
 | POST | `/api/v1/generate` | 单条代码生成（完整 RAG 链路） | 普通用户+ |
 | POST | `/api/v1/generate/render` | 参数变更后重新渲染（不走 LLM/RAG） | 普通用户+ |
 | POST | `/api/v1/batch/upload` | 上传 Excel 创建批量任务 | 普通用户+ |
@@ -1772,16 +1768,16 @@ DV_ACODE_GEN_PLATFORM/
 │   ├── app/
 │   │   ├── api/
 │   │   │   └── v1/
-│   │   │       └── endpoints/
-│   │   │           ├── generate.py              # 单条生成端点
-│   │   │           ├── batch.py                 # 批量生成端点
-│   │   │           ├── templates.py             # 模板库查询端点
-│   │   │           ├── admin.py                 # 管理员端点（模板 CRUD）
-│   │   │           ├── admin_llm.py             # LLM 模型配置 + 测试端点（新增）
-│   │   │           ├── contributions.py         # 贡献者端点（提交/查看/修改）
-│   │   │           ├── admin_contributions.py   # 管理员审核端点
-│   │   │           ├── notifications.py         # 站内通知端点
-│   │   │           └── auth.py                  # 认证端点
+│   │   │       ├── router.py                    # APIRouter 汇总注册
+│   │   │       ├── generate.py                  # 单条生成端点 + /code-types
+│   │   │       ├── batch.py                     # 批量生成端点
+│   │   │       ├── templates.py                 # 模板库查询端点
+│   │   │       ├── admin.py                     # 管理员端点（模板 CRUD + 用户管理 + 审计日志）
+│   │   │       ├── admin_llm.py                 # LLM 模型配置 + 测试端点
+│   │   │       ├── contributions.py             # 贡献者端点 + 管理员审核端点（合并单文件）
+│   │   │       ├── notifications.py             # 站内通知端点
+│   │   │       ├── intent_builder.py            # 场景构建器端点
+│   │   │       └── auth.py                      # 认证端点
 │   │   ├── core/
 │   │   │   ├── config.py                 # 环境配置（从环境变量读取）
 │   │   │   ├── database.py               # PostgreSQL 连接
@@ -1789,13 +1785,14 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   ├── cache.py                  # Redis 连接
 │   │   │   └── security.py               # JWT 认证工具
 │   │   ├── models/
-│   │   │   ├── template.py               # SQLAlchemy 模板模型
+│   │   │   ├── template.py               # SQLAlchemy 模板模型（Template + TemplateVersion）
 │   │   │   ├── user.py                   # 用户模型
 │   │   │   ├── generation_record.py      # 生成历史模型
 │   │   │   ├── batch_job.py              # 批量任务模型
-│   │   │   ├── llm_config.py             # LLM 配置模型（新增）
+│   │   │   ├── llm_config.py             # LLM 配置模型
 │   │   │   ├── contribution.py           # 模板贡献模型
-│   │   │   └── notification.py           # 站内通知模型
+│   │   │   ├── notification.py           # 站内通知模型
+│   │   │   └── audit_log.py              # 管理员操作审计日志模型
 │   │   ├── schemas/
 │   │   │   ├── generate.py               # 生成请求/响应 Schema
 │   │   │   ├── template.py               # 模板 Schema
@@ -1860,8 +1857,7 @@ DV_ACODE_GEN_PLATFORM/
 │   │       ├── protocol/
 │   │       └── exception/
 │   │
-│   ├── scripts/
-│   │   └── lib_manager.py                # CLI：模板导入/验证/重建Qdrant索引
+│   ├── lib_manager.py                    # CLI：模板导入/验证/重建Qdrant索引（位于 backend/ 根目录）
 │   │
 │   ├── data/
 │   │   ├── code_types/                   # 代码类型注册配置（扩展新类型只需新增文件）
@@ -1873,11 +1869,11 @@ DV_ACODE_GEN_PLATFORM/
 │   │   └── scenarios/                    # 场景句式模板（各类型独立文件）
 │   │       ├── assertion_scenarios.yaml  # SVA 场景构建器句式
 │   │       └── coverage_scenarios.yaml   # Coverage 场景构建器句式
-│   ├── alembic/                          # 数据库迁移
-│   │   # 003_add_contributions_and_notifications.sql
-│   │   # 004_add_intent_fields_to_generation_records.sql
-│   │   # 005_add_llm_configs.sql
-│   │   # 006_rename_category_to_code_type.sql（新增）
+│   ├── migrations/                       # Alembic 数据库迁移
+│   │   ├── env.py
+│   │   ├── script.py.mako
+│   │   └── versions/
+│   │       └── 001_initial_schema.py     # 初始全量建表（含所有表结构）
 │   ├── tests/
 │   ├── Dockerfile
 │   └── requirements.txt
