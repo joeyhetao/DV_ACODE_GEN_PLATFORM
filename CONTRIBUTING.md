@@ -24,39 +24,46 @@
 ```
 DV_ACODE_GEN_PLATFORM/
 ├── .github/
-│   └── PULL_REQUEST_TEMPLATE.md   # PR 模板
-├── backend/                        # FastAPI 后端
+│   └── PULL_REQUEST_TEMPLATE.md        # PR 模板
+├── backend/                             # FastAPI 后端
 │   ├── app/
-│   │   ├── api/                   # 路由层
-│   │   ├── core/                  # 配置、安全
-│   │   ├── engine/                # 算法匹配引擎（确定性核心）
-│   │   ├── llm/                   # LLM 参数提取层
-│   │   ├── models/                # SQLAlchemy ORM
-│   │   ├── schemas/               # Pydantic Schema
-│   │   └── templates_lib/         # Jinja2 模板渲染
-│   ├── tests/
+│   │   ├── api/
+│   │   │   └── v1/                     # 路由层（auth/generate/templates/batch/admin 等）
+│   │   ├── core/                        # 配置、安全、数据库、Qdrant 连接
+│   │   ├── models/                      # SQLAlchemy ORM 模型
+│   │   ├── schemas/                     # Pydantic 请求/响应 Schema
+│   │   ├── services/
+│   │   │   ├── core/                   # 确定性生成引擎（pipeline/renderer/dedup/cache）
+│   │   │   ├── intent/                 # 意图提取（normalizer/preflight/builder/history）
+│   │   │   ├── llm/                    # LLM 适配层（Anthropic + OpenAI 兼容工厂）
+│   │   │   ├── parser/                 # Excel 需求表解析
+│   │   │   ├── platform/               # 审计日志、备份、贡献审核
+│   │   │   └── rag/                    # 三阶段 RAG 检索流水线
+│   │   ├── tasks/                       # Celery 异步任务（批量生成）
+│   │   └── main.py
+│   ├── template_library/                # YAML 模板库（受版本控制）
+│   │   ├── assertions/                 # SVA 断言模板
+│   │   └── coverage/                   # 功能覆盖率模板
 │   ├── Dockerfile
 │   └── requirements.txt
-├── frontend/                       # React + TypeScript
+├── frontend/                            # React + TypeScript
 │   ├── src/
-│   │   ├── components/
-│   │   ├── pages/
-│   │   └── api/
+│   │   ├── api/                        # API 请求层
+│   │   ├── components/                 # 公共组件
+│   │   ├── pages/                      # 页面组件
+│   │   └── store/                      # 状态管理（Zustand）
 │   ├── Dockerfile
 │   └── package.json
-├── templates/                      # YAML 模板库（受版本控制）
-│   ├── sva/                       # SVA 断言模板
-│   └── coverage/                  # 功能覆盖率模板
-├── deploy/                         # 部署配置
+├── deploy/                              # 部署配置
 │   ├── docker-compose.yml
 │   ├── docker-compose.prod.yml
 │   └── nginx/
-├── docs/                           # 补充文档
-├── PRD.md                          # 产品需求文档
-├── ARCHITECTURE.md                 # 架构设计文档
-├── CONTRIBUTING.md                 # 本文件
-├── CHANGELOG.md                    # 变更日志
-└── README.md                       # 项目入口
+├── docs/                                # 补充文档
+├── PRD.md                               # 产品需求文档
+├── ARCHITECTURE.md                      # 架构设计文档
+├── CONTRIBUTING.md                      # 本文件
+├── CHANGELOG.md                         # 变更日志
+└── README.md                            # 项目入口
 ```
 
 ---
@@ -301,9 +308,9 @@ git push origin feature/your-feature-name
 
 ### Review 标准
 
-- 确定性核心（`engine/`）变更必须有单元测试覆盖
-- LLM 调用不得出现在 `engine/` 层
-- 模板变更需同步更新 `templates/` 目录的 YAML 文件
+- 确定性核心（`services/core/`）变更必须有单元测试覆盖
+- LLM 调用不得出现在 `services/core/` 层
+- 模板变更需同步更新 `backend/template_library/` 目录的 YAML 文件
 - 不得在代码中硬编码 API Key 或密码
 
 ### 合并策略

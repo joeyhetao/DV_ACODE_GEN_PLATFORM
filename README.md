@@ -17,8 +17,8 @@ IC验证辅助代码生成平台 — 输入结构化需求表，确定性输出 
 
 | 层级 | 技术 |
 |------|------|
-| 后端 | Python 3.11 + FastAPI + PostgreSQL + pgvector + Redis + Jinja2 |
-| LLM | Anthropic Claude API（可扩展第三方模型） |
+| 后端 | Python 3.11 + FastAPI + PostgreSQL + Qdrant + Redis + Jinja2 |
+| LLM | Anthropic Claude API（可扩展 OpenAI 兼容接口） |
 | 前端 | React + TypeScript + Monaco Editor |
 | 部署 | Docker + Docker Compose + Nginx |
 
@@ -49,14 +49,18 @@ docker compose -f deploy/docker-compose.yml up --build
 
 ## 项目状态
 
-当前阶段：**架构设计完成，开发启动中**
+当前阶段：**核心功能实现完成，待 Alpha 测试**
 
 - [x] PRD 确认（v2.7）
 - [x] 架构设计
-- [ ] 后端骨架搭建
-- [ ] 确定性引擎核心实现
-- [ ] 前端框架搭建
-- [ ] 模板库初始化（AXI4 协议优先）
+- [x] 后端骨架搭建
+- [x] 确定性引擎核心实现（pipeline / renderer / dedup / cache）
+- [x] 三阶段 RAG 检索流水线（混合检索 → ColBERT 精排 → Cross-Encoder 重排）
+- [x] 前端框架搭建（生成页、意图构建器、模板库、批量处理、管理控制台）
+- [x] 模板库初始化（SVA 断言 5 个模板）
+- [x] 批量处理 & Celery 任务队列
+- [x] LLM 多模型配置管理
+- [x] Docker Compose 完整栈
 - [ ] Alpha 测试
 
 ## License
