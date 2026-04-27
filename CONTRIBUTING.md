@@ -169,8 +169,8 @@ pip install -r requirements-dev.txt
 cp .env.example .env
 # 编辑 .env，填写本地 PostgreSQL / Redis / Anthropic Key
 
-# 启动基础设施（PostgreSQL + Redis + pgvector）
-docker compose -f ../deploy/docker-compose.yml up -d db redis
+# 启动基础设施（PostgreSQL + Redis + Qdrant）
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d postgres redis qdrant
 
 # 数据库迁移
 alembic upgrade head
@@ -198,7 +198,7 @@ npm run dev
 
 ```bash
 # 在项目根目录
-docker compose -f deploy/docker-compose.yml up --build
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
 # 前端: http://localhost:3000
 # 后端: http://localhost:8000
 # API文档: http://localhost:8000/docs
