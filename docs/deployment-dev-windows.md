@@ -41,8 +41,8 @@
 
 GPU 不是必须的：
 
-- **没 GPU**：embedding_service 自动用 CPU 推理 BGE-M3，单次生成 ~30s（用小模型时 ~5s）
-- **有 NVIDIA GPU**：单次推理 ~50ms。Docker Desktop 4.26+ 在 WSL2 下自动支持 GPU passthrough，无需额外配置
+- **没 GPU**：embedding_service 自动用 CPU 推理 BGE-M3 + BGE-reranker-v2-m3（两个模型分别用于向量化和 RAG 三阶段重排），单次生成 ~30s（dev overlay 下用小模型 `bge-small-zh-v1.5` 约 ~5s）
+- **有 NVIDIA GPU**：BGE-M3 + Reranker 加载到 GPU 显存（共 ~6 GB），单次推理 ~50ms。Docker Desktop 4.26+ 在 WSL2 下自动支持 GPU passthrough，无需额外配置
 
 GPU 验证：
 
@@ -115,7 +115,8 @@ copy .env.example .env
 # 32 字符以上随机字符串即可，dev 用占位也能跑
 JWT_SECRET_KEY=dev-jwt-secret-pad-this-to-at-least-32-chars
 
-# 64 位十六进制（256-bit AES key）。用 PowerShell 生成：
+# 64 个 hex 字符（即 32 字节 = 256-bit AES key，注意"64 位"指字符数不是 bit 数）
+# PowerShell 生成方式：
 # -join ((48..57 + 97..102) | Get-Random -Count 64 | %{[char]$_})
 LLM_KEY_ENCRYPTION_SECRET=00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff
 
@@ -128,6 +129,8 @@ SUPER_ADMIN_PASSWORD=YourDevPassword
 ### 3.3 前端首次构建
 
 前端用 bind mount 把 `frontend/dist/` 挂进容器，**必须先 build 才能启动**：
+
+> 本节命令在 **PowerShell** 中运行（不是 WSL bash）。`npm` 由你装的 Node.js 提供，是 Windows 全局可执行命令。如果用了反引号续行（` `` `），那是 PowerShell 风格；用 bash 则换成反斜杠 `\`。
 
 ```powershell
 cd frontend
@@ -288,6 +291,8 @@ docker compose exec backend python lib_manager.py list
 ```
 
 后续修改 `template_library/*.yaml` 后只需再跑 `import`。
+
+> 标志说明：`import` 默认会跳过名称冲突 + 跳过语义高度相似（余弦 ≥ `TEMPLATE_DEDUP_THRESHOLD`，默认 0.90）的模板。开发期反复迭代同一模板时常用 `python lib_manager.py import --force` **跳过语义查重**强制覆盖（名称冲突仍阻止）。
 
 ---
 
