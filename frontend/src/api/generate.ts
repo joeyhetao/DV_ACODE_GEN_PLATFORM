@@ -25,7 +25,8 @@ export interface GenerateResponse {
 
 export const generateApi = {
   generate: async (req: GenerateRequest) => {
-    const res = await apiClient.post<GenerateResponse>('/generate', req)
+    // GLM-4.7 thinking 模式 + 3 次 LLM 调用，单次生成实测 ~55s，给 3min 留余量
+    const res = await apiClient.post<GenerateResponse>('/generate', req, { timeout: 180000 })
     return res.data
   },
   render: async (template_id: string, template_version: string, params: Record<string, unknown>) => {
