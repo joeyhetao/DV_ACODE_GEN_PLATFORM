@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Card, Table, Tag, Button, Space, Popconfirm, Select, Input, message, Modal, Form } from 'antd'
-import { SearchOutlined, EditOutlined, DeleteOutlined, PlusOutlined } from '@ant-design/icons'
+import { SearchOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons'
 import { templatesApi, TemplateListItem } from '../../api/templates'
 
 const maturityColors: Record<string, string> = { draft: 'blue', stable: 'green', deprecated: 'gray' }

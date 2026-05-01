@@ -1,13 +1,12 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Card, Upload, Button, Select, Progress, Table, Tag, Space,
-  Steps, Alert, Typography, Statistic, Row, Col, message, Divider,
+  Steps, Alert, Statistic, Row, Col, message, Divider,
 } from 'antd'
 import { UploadOutlined, DownloadOutlined, EyeOutlined, SendOutlined } from '@ant-design/icons'
 import { batchApi, BatchJob, PreflightRowResult } from '../../api/batch'
 import { generateApi } from '../../api/generate'
 
-const { Text } = Typography
 
 export default function BatchPage() {
   const [codeTypes, setCodeTypes] = useState<{ id: string; display_name: string }[]>([])

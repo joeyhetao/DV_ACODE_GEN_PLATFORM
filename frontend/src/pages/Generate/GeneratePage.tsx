@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import {
-  Card, Form, Input, Select, Button, Row, Col, Space, Tag, Alert,
+  Card, Form, Input, Select, Button, Row, Col, Space, Tag,
   Statistic, Divider, Typography, Table, Collapse, message,
 } from 'antd'
 import { ThunderboltOutlined, CopyOutlined, SendOutlined, PlusOutlined, DeleteOutlined } from '@ant-design/icons'
@@ -8,7 +8,7 @@ import Editor from '@monaco-editor/react'
 import { generateApi, GenerateResponse, SignalInfo } from '../../api/generate'
 
 const { TextArea } = Input
-const { Text, Title } = Typography
+const { Text } = Typography
 
 type SignalRow = SignalInfo & { _key: string }
 

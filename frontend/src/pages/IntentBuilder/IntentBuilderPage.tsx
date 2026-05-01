@@ -5,7 +5,7 @@ import { intentBuilderApi, Scenario } from '../../api/intentBuilder'
 import { generateApi } from '../../api/generate'
 import { useNavigate } from 'react-router-dom'
 
-const { Text, Title } = Typography
+const { Text } = Typography
 
 export default function IntentBuilderPage() {
   const navigate = useNavigate()

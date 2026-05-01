@@ -45,7 +45,7 @@ parameters:
     required: true
     description: 合法状态值列表，逗号分隔，如 IDLE,ACTIVE,DONE
     default: "IDLE, ACTIVE, DONE"
-maturity: stable
+maturity: production
 related_ids:
   - cov_value_coverage_v1
 template_body: |
@@ -55,7 +55,7 @@ template_body: |
     option.comment = "{{ group_name }} 状态转换覆盖率";
 
     cp_{{ signal }}: coverpoint {{ signal }} {
-      bins states[] = {{{ state_list }}};
+      bins states[] = {{ '{' }}{{ state_list }}{{ '}' }};
     }
 
     cp_{{ signal }}_trans: coverpoint {{ signal }} {

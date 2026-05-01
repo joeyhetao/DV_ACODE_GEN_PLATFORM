@@ -51,7 +51,7 @@ parameters:
     required: true
     description: 需保持稳定的数据信号
     role_hint: data
-maturity: stable
+maturity: production
 related_ids: []
 template_body: |
   // SVA: Valid-Ready握手数据稳定性 — {{ module_name }}

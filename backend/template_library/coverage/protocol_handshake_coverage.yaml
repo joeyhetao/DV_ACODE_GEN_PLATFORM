@@ -44,7 +44,7 @@ parameters:
     required: true
     description: Ready信号名
     role_hint: ready
-maturity: stable
+maturity: production
 related_ids:
   - cov_value_coverage_v1
 template_body: |

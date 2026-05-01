@@ -49,7 +49,7 @@ parameters:
     required: true
     description: 最大等待周期数
     default: "16"
-maturity: stable
+maturity: production
 related_ids:
   - sva_handshake_stable_v1
 template_body: |

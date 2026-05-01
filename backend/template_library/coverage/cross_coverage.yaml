@@ -45,7 +45,7 @@ parameters:
     required: true
     description: 信号B的bins定义
     default: "{0, 1}"
-maturity: stable
+maturity: production
 related_ids:
   - cov_value_coverage_v1
 template_body: |
