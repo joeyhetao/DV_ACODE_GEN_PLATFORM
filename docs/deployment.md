@@ -310,14 +310,14 @@ curl http://localhost/
 
 # 后端 API 健康检查
 curl http://localhost/api/health
-# 期望响应：{"status": "ok"}
+# 期望响应：{"status":"ok"}
 
 # Embedding Service 健康检查（容器内网）
-docker compose exec backend curl http://embedding_service:8001/health
-# 期望响应：{"status": "ok"}
+docker compose exec backend python -c "import httpx, asyncio; r = asyncio.run(httpx.AsyncClient().get('http://embedding_service:8001/health')); print(r.text)"
+# 期望响应：{"status":"ok"}
 
 # Qdrant 健康检查（容器内网）
-docker compose exec backend curl http://qdrant:6333/healthz
+docker compose exec backend python -c "import httpx, asyncio; r = asyncio.run(httpx.AsyncClient().get('http://qdrant:6333/healthz')); print(r.text)"
 ```
 
 ### 6.3 访问 API 文档

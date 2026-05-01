@@ -51,7 +51,7 @@ class Settings(BaseSettings):
 
     # Super admin (for initial setup)
     super_admin_username: str = "admin"
-    super_admin_password: str = "admin123"
+    super_admin_password: str = "YnZn@2021"
     super_admin_email: str = "admin@example.com"
 
     @field_validator("jwt_secret_key")
