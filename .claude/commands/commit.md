@@ -11,6 +11,88 @@
 
 ## 执行步骤
 
+### 第零步：上库前置审计（强制，无法跳过）
+
+提交任何 commit 之前，先做三轮安全审计。任一轮发现问题都**硬停**，不得继续后续步骤，先向用户报告并等明确处置指令。
+
+#### 0a. 未追踪文件分流
+
+```bash
+git status --short | grep "^??"
+```
+
+对每个 `??` 文件（即 untracked 但未被 `.gitignore` 拦截的文件），按下表归类后向用户**输出分流方案**等确认：
+
+| 类别 | 判断特征 | 默认处理 |
+|---|---|---|
+| **应追踪** | 源代码（.py / .ts / .tsx / .js / .yaml / .sh / Dockerfile / .conf / .toml / .json）<br>项目文档（README/CHANGELOG/PRD/ARCHITECTURE/CONTRIBUTING/docs/*.md）<br>配置文件（docker-compose*.yml / nginx*.conf / pyproject.toml / package.json / tsconfig.json）<br>新增模板（template_library/**/*.yaml） | 加入下一步 commit 候选 |
+| **应忽略**（但 .gitignore 漏了） | node_modules/ / dist/ / __pycache__/ / .venv/ / *.pyc / coverage/ / hf_cache/ / models/ | **先补 .gitignore**，提示用户单独 commit gitignore，不要把这些文件 add |
+| **可疑—需用户决定** | 文件名含 `temp_` / `tmp_` / `scratch_` / `draft_` / `wip_` / `personal_` / `test_local`<br>未配套被引用的孤立脚本<br>无后缀且非典型项目文件 | **报告给用户**：列出文件名 + 内容前 5 行，等用户决定 commit / ignore / 删除 |
+| **绝对禁止** | 文件名含 `secret` / `credential` / `private_key` / `id_rsa` / `*.pem` / `*.key` / `*.crt` / `.env`（任何变体，包括 `.env.production` / `.env.local`） | **拒绝 commit + 立刻报警**：警告用户该文件是敏感数据，建议加入 .gitignore；若已是 .gitignore 漏了，先补 |
+
+输出示例：
+
+```
+未追踪文件分流：
+✓ 应追踪（自动加入候选）：
+  - backend/app/services/new_feature.py
+  - docs/feature-spec.md
+
+⚠ 可疑（请确认）：
+  - scratch_test.sh    （文件名含 "scratch_"，请确认是临时脚本还是要保留？）
+
+✗ 绝对禁止：
+  - secrets.json       （含 "secret" 关键词，已自动跳过；建议加入 .gitignore）
+
+是否按此分流执行？
+```
+
+#### 0b. 敏感内容扫描
+
+对**所有候选 staged 文件**（修改的 + 经 0a 确认要追踪的）做内容扫描，检查以下模式：
+
+| 类别 | 正则 / 关键词 | 处置 |
+|---|---|---|
+| 第三方 API Key | `sk-[A-Za-z0-9]{20,}` (OpenAI/智谱/Anthropic 等)<br>`ghp_[A-Za-z0-9]{36}` / `github_pat_[A-Za-z0-9_]{82}` (GitHub)<br>`xoxb-\d+-\d+-[A-Za-z0-9]+` (Slack)<br>`AKIA[0-9A-Z]{16}` (AWS Access Key) | **硬阻止**，定位到行，提示移到 .env |
+| AWS Secret | `aws_secret_access_key\s*=\s*[A-Za-z0-9/+=]{40}` | **硬阻止**，定位到行 |
+| 私钥块 | `-----BEGIN [A-Z ]*PRIVATE KEY-----` | **硬阻止**，建议挪到 secrets/ 目录并加 .gitignore |
+| JWT Token | `eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}` | **硬阻止**，定位到行 |
+| 硬编码密码 | `(password\|passwd\|secret\|pwd)\s*[:=]\s*["'][^"'$\{][^"']{4,}["']`<br>排除：值是 placeholder（含 `change-me` / `example` / `your-` / `xxx` / `<...>` / `${...}` / `os.environ`）<br>排除：`SUPER_ADMIN_PASSWORD` 在 config.py 里的开发默认值（已是已知非生产值） | **警告 + 等用户确认**，可能是占位符 |
+| 内部 IP / 主机名 | `\b(?:10\\.\|172\\.(?:1[6-9]\|2[0-9]\|3[01])\.\|192\\.168\\.)\d+\\.\d+\\.\d+`<br>排除：`192.168.1.1` / `10.0.0.1` 等示例 IP；排除 docker-compose 内部 hostname（`postgres` / `redis` / `qdrant` / `backend` 等） | **警告 + 等用户确认**，可能是公司内网地址 |
+| 个人路径 | `[Cc]:[\\\/]Users[\\\/]\w+`<br>`/Users/\w+`<br>`/home/[\w\-]+` | **警告 + 等用户确认**，是否要替换成相对路径 |
+| 个人邮箱（非 Co-Authored-By） | `[\w\.\-]+@(?!example\.com\|test\.com\|noreply\.\|anthropic\.com)[\w\.\-]+\.\w+` | **警告**，可能含真实人名 |
+
+**扫描方法**：用 Grep 工具对每个候选文件运行上述模式，命中则向用户输出：
+```
+⛔ 检测到敏感内容，已阻止 commit：
+
+  文件：backend/app/services/llm/openai_compat_client.py
+  行 12：    api_key="sk-abc123def456ghi789jkl012mno345pqr678stu"
+            ↑ 第三方 API Key 直接硬编码
+
+  建议：改为 api_key=os.getenv("LLM_API_KEY")，并在 .env 中配置。
+        请修复后重试 /commit。
+```
+
+发现敏感内容时**只报告，不自动修改**——修改决策权在用户。
+
+#### 0c. 已追踪文件中的"应忽略"模式
+
+```bash
+git ls-files | grep -E "(\.env$|\.env\.[^e]|\.pem$|\.key$|\.crt$|credentials|node_modules|__pycache__|\.pyc$|\.DS_Store|\.swp$)"
+```
+
+如有命中，说明历史上误追踪过敏感/构建文件，向用户报告并建议：
+1. `git rm --cached <file>` 从索引移除（保留磁盘文件）
+2. 补 .gitignore 防止下次再被加回
+3. 把这两步作为一个独立的 `chore: cleanup wrongly tracked` commit
+
+---
+
+**第零步审计全部通过后**，向用户输出一行简报（例：`审计通过：未追踪 2 个新文件已分类，6 个修改文件无敏感内容。开始第一步…`），然后自动进入第一步。
+
+---
+
 ### 第一步：采集工作区状态
 
 ```bash
@@ -136,6 +218,8 @@ push 前确认：
 | commit message 不带 Co-Authored-By trailer | 永远附上 `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` |
 | 提交敏感文件（.env, *.key, *.pem, .claude/settings.local.json, credentials*） | 跳过并在汇报中提示用户加 .gitignore |
 | 不读 diff 直接 commit | 至少 `git diff --stat` 确认范围 |
+| **跳过第零步审计直接进入 commit 流程** | 即使用户传 `push` / `全部合并` 等参数，第零步也必须先跑完；审计有"绝对禁止"或"硬阻止"项时**禁止**继续，等用户处置 |
+| 自动修改用户的源代码（即使是为了消除敏感内容警告） | 只报告位置 + 建议；改不改、怎么改由用户决定 |
 
 ---
 
