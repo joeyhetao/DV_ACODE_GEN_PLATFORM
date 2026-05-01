@@ -4,8 +4,6 @@ from qdrant_client.models import (
     FusionQuery,
     Fusion,
     SparseVector,
-    NamedSparseVector,
-    NamedVector,
     Filter,
     FieldCondition,
     MatchValue,
@@ -45,7 +43,7 @@ async def stage1_hybrid_search(
                 filter=query_filter,
             ),
             Prefetch(
-                query=NamedSparseVector(name="sparse", vector=sparse_vector),
+                query=sparse_vector,
                 using="sparse",
                 limit=limit,
                 filter=query_filter,
@@ -54,7 +52,6 @@ async def stage1_hybrid_search(
         query=FusionQuery(fusion=Fusion.RRF),
         limit=limit,
         with_payload=True,
-        with_vectors=["colbert"],
     )
 
     return [

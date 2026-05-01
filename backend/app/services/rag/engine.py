@@ -62,12 +62,15 @@ async def rag_retrieve(
             candidate_texts.append("。".join(parts))
             valid_stage2.append(item)
 
-    stage3 = await stage3_rerank(
-        query_text=normalized_intent,
-        stage2_results=valid_stage2,
-        candidate_texts=candidate_texts,
-        top_k=settings.rag_stage3_top_k,
-    )
+    try:
+        stage3 = await stage3_rerank(
+            query_text=normalized_intent,
+            stage2_results=valid_stage2,
+            candidate_texts=candidate_texts,
+            top_k=settings.rag_stage3_top_k,
+        )
+    except Exception:
+        stage3 = valid_stage2[: settings.rag_stage3_top_k]
 
     enriched = []
     for item in stage3:
