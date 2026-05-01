@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 产品需求文档（PRD）
 
-**版本**：v2.7  
+**版本**：v2.8  
 **状态**：已确认  
-**日期**：2026-04-22  
+**日期**：2026-05-01  
 **变更**：
 - v1.0 → v2.0：输入方式由"自然语言+Excel信号表"调整为"双表格结构化输入"（SVA需求表 + 功能覆盖率需求表）
 - v2.0 → v2.1：新增模板贡献与审核机制，处理 RAG 置信度 < 50% 时模板缺口的知识沉淀闭环
@@ -12,6 +12,7 @@
 - v2.4 → v2.5：新增模板入库查重机制（名称精确匹配 + 语义相似度检查），覆盖 Admin UI 新建、YAML 批量导入、贡献审核三条入库路径
 - v2.5 → v2.6：新增数据备份与误操作保护机制——§4.6 数据安全与可恢复性非功能需求；§3.4 新增 Dry-Run 预检和操作审计日志功能
 - v2.6 → v2.7：架构分层解耦优化——§1.2 产品定位补充代码类型可扩展性说明；§4.2 扩展性需求覆盖新代码类型场景；§5 模板分类体系注册制说明；§7 Out of Scope 区分永久约束与可扩展项
+- v2.7 → v2.8：§4.3 性能指标按所选 LLM 是否为 thinking 模型分档（非 thinking 模型保持 <10s，thinking 模型如 GLM-4.7 / DeepSeek-R1 调整为 60-150s）；§3.5.1 LLM 模型清单补充 GLM 系列与 Ollama 本地部署说明
 
 ---
 
@@ -240,19 +241,19 @@ Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最
 
 | 字段 | 类型 | 说明 |
 |------|------|------|
-| 名称 | 文本 | 显示名称，如 `DeepSeek-V3`、`本地Qwen2.5` |
+| 名称 | 文本 | 显示名称，如 `智谱大模型`、`DeepSeek-V3`、`本地Qwen2.5` |
 | Provider | 枚举 | `Anthropic 原生` / `OpenAI 兼容` |
-| Base URL | URL | API 地址；Anthropic 原生可留空使用默认 |
+| Base URL | URL | API 地址；Anthropic 原生可留空使用默认；OpenAI 兼容常用：智谱 `https://open.bigmodel.cn/api/paas/v4/`、DeepSeek `https://api.deepseek.com/v1`、Ollama `http://host.docker.internal:11434/v1` |
 | API Key | 密码框 | 加密存储，界面只展示前4位掩码 |
-| Model ID | 文本 | 模型标识，如 `deepseek-chat`、`claude-sonnet-4-6` |
-| 输出模式 | 枚举 | `工具调用（Tool Calling）` / `JSON Mode` / `Prompt JSON`，决定结构化输出策略 |
+| Model ID | 文本 | 模型标识，如 `glm-4.7`、`deepseek-chat`、`claude-sonnet-4-6` |
+| 输出模式 | 枚举 | `工具调用（Tool Calling）` / `JSON Mode` / `Prompt JSON`，决定结构化输出策略；OpenAI 兼容路径当前固定走两步纯文本以兼容 thinking 模型 |
 | Temperature | 数字 | 默认 0.0（确定性约束） |
-| Max Tokens | 整数 | 默认 512 |
+| Max Tokens | 整数 | 默认 2048；thinking 类模型（GLM-4.7、DeepSeek-R1）建议 ≥ 4096，否则 reasoning_tokens 占满会出现空响应 |
 
 **Provider 说明**：
 
 - **Anthropic 原生**：使用 Anthropic Python SDK，支持原生 Tool Calling，结构化输出最可靠
-- **OpenAI 兼容**：使用 `openai` SDK 的 `base_url` 参数，覆盖 DeepSeek、Qwen、Ollama、vLLM 等所有兼容实现
+- **OpenAI 兼容**：使用 `openai` SDK 的 `base_url` 参数，覆盖 智谱 GLM、DeepSeek、Qwen、Ollama、vLLM 等所有兼容实现；本地部署的 Ollama 在 Docker 网络中通过 `host.docker.internal` 访问宿主机端口
 
 #### 3.5.2 模型测试功能
 
@@ -568,9 +569,11 @@ Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最
 ### 4.3 性能
 
 - 单条生成（缓存命中）：响应时间 < 500ms
-- 单条生成（缓存未命中，含LLM调用）：响应时间 < 10s
-- 批量生成：支持单次上传不少于100行Excel，整体生成时间 < 5分钟
-- 系统支持至少50个并发用户
+- 单条生成（缓存未命中，含 LLM 调用）：
+  - 非 thinking 类模型（Claude、DeepSeek-V3、GPT-4o、Qwen-Plus 等）：< 10s
+  - Thinking 类模型（GLM-4.7、DeepSeek-R1 等）：60-150s（reasoning_tokens 占主要时间，前端 `/generate` 默认超时 180s）
+- 批量生成：支持单次上传不少于 100 行 Excel，整体生成时间 < 5 分钟（按非 thinking 模型估算；thinking 模型下需相应放宽，建议批量场景配置非 thinking 模型）
+- 系统支持至少 50 个并发用户
 
 ### 4.4 可用性
 
