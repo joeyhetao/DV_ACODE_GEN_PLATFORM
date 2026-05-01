@@ -11,6 +11,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.0] - 2026-04-27
+
+### Added
+- 部署手册 `docs/deployment.md`，覆盖 Docker Compose 完整栈启动、环境变量配置、嵌入服务 GPU/CPU 选择、首次初始化流程
+- `/update-docs` 与 `/update-specs` 两个 slash command 工具骨架，支持按真实项目状态自动同步 README/CHANGELOG/CONTRIBUTING 与 PRD/ARCHITECTURE
+
+### Changed
+- ARCHITECTURE.md 与首版平台实现对齐：补全 Qdrant 三阶段 RAG、独立嵌入服务、LLM 多模型工厂、Celery 任务队列等模块
+- CONTRIBUTING.md 中的 docker-compose 路径修正为根目录形式（取消废弃的 `deploy/` 路径）
+- README/CHANGELOG/CONTRIBUTING 整体与项目当前实现状态同步
+
+---
+
 ## [0.2.0] - 2026-04-26
 
 ### Added
@@ -41,6 +54,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/releases/tag/v0.1.0

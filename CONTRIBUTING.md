@@ -28,7 +28,8 @@ DV_ACODE_GEN_PLATFORM/
 ├── backend/                             # FastAPI 后端
 │   ├── app/
 │   │   ├── api/
-│   │   │   └── v1/                     # 路由层（auth/generate/templates/batch/admin 等）
+│   │   │   └── v1/                     # 路由层（auth/generate/templates/batch/admin/admin_llm/
+│   │   │                               #         intent_builder/contributions/notifications）
 │   │   ├── core/                        # 配置、安全、数据库、Qdrant 连接
 │   │   ├── models/                      # SQLAlchemy ORM 模型
 │   │   ├── schemas/                     # Pydantic 请求/响应 Schema
@@ -38,27 +39,38 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   ├── llm/                    # LLM 适配层（Anthropic + OpenAI 兼容工厂）
 │   │   │   ├── parser/                 # Excel 需求表解析
 │   │   │   ├── platform/               # 审计日志、备份、贡献审核
-│   │   │   └── rag/                    # 三阶段 RAG 检索流水线
-│   │   ├── tasks/                       # Celery 异步任务（批量生成）
+│   │   │   └── rag/                    # 三阶段 RAG（stage1_hybrid/stage2_colbert/stage3_reranker）
+│   │   ├── tasks/                       # Celery 异步任务（celery_app/batch_tasks）
 │   │   └── main.py
 │   ├── template_library/                # YAML 模板库（受版本控制）
 │   │   ├── assertions/                 # SVA 断言模板
 │   │   └── coverage/                   # 功能覆盖率模板
+│   ├── lib_manager.py                   # 模板库管理 CLI（导入/同步 Qdrant）
 │   ├── Dockerfile
 │   └── requirements.txt
-├── frontend/                            # React + TypeScript
+├── embedding_service/                   # 独立嵌入服务（BGE-M3 + Reranker，GPU/CPU 可选）
+│   ├── app/                            # FastAPI 服务（main/models/routers/schemas）
+│   ├── Dockerfile.gpu
+│   └── requirements.txt
+├── frontend/                            # React + TypeScript + Vite
 │   ├── src/
-│   │   ├── api/                        # API 请求层
-│   │   ├── components/                 # 公共组件
-│   │   ├── pages/                      # 页面组件
-│   │   └── store/                      # 状态管理（Zustand）
+│   │   ├── api/                        # API 请求层（client/auth/generate/admin 等）
+│   │   ├── components/                 # 公共组件（MainLayout 等）
+│   │   ├── hooks/                      # 自定义 React Hook
+│   │   ├── pages/                      # 页面组件（Generate/Batch/Library/IntentBuilder/
+│   │   │                               #           MyContributions/Admin/Login）
+│   │   ├── store/                      # 状态管理（Zustand）
+│   │   └── utils/                      # 工具函数
+│   ├── nginx-frontend.conf             # 前端容器内 nginx 配置
 │   ├── Dockerfile
 │   └── package.json
-├── deploy/                              # 部署配置
-│   ├── docker-compose.yml
-│   ├── docker-compose.prod.yml
-│   └── nginx/
-├── docs/                                # 补充文档
+├── docker-compose.yml                   # 主 compose（CPU 默认栈）
+├── docker-compose.dev.yml               # 开发 overlay（端口透出等）
+├── docker-compose.hotreload.yml         # 后端 --reload + 源码挂载
+├── docker-compose.gpu-linux.yml         # Linux GPU overlay（CUDA passthrough）
+├── docker-compose.gpu-windows.yml       # Windows GPU overlay（WSL2 GPU）
+├── nginx.conf                           # 入口反向代理（前端 + /api 路由）
+├── docs/                                # 补充文档（deployment.md 等）
 ├── PRD.md                               # 产品需求文档
 ├── ARCHITECTURE.md                      # 架构设计文档
 ├── CONTRIBUTING.md                      # 本文件
