@@ -206,15 +206,22 @@ npm run dev
 # 访问 http://localhost:5173
 ```
 
-### 3.4 一键启动（完整栈）
+### 3.4 一键启动（容器化完整栈）
+
+如果不想在主机上装 Python / Node 直接跑后端、前端，而是把所有服务都放进 Docker 跑（hot reload + bind mount + 一致环境），完整指引见：
+
+- **Win11 本机**：[docs/deployment-dev-windows.md](docs/deployment-dev-windows.md)（含 `.wslconfig` 优化、Docker Desktop 崩溃处置、bundle bind mount、HF 模型路径等本机特有的内容）
+- **Linux/Mac 本机**：直接套用上面 Win11 那份的 §3-§4 流程，把 PowerShell 命令换成 bash 即可，路径用相对路径
+
+简化版命令（适用所有平台）：
 
 ```bash
-# 在项目根目录
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
-# 前端: http://localhost:3000
-# 后端: http://localhost:8000
-# API文档: http://localhost:8000/docs
+cd frontend && npm install && npm run build && cd ..
+docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.hotreload.yml up -d
+# 前端 + 后端 + API 文档统一入口: http://localhost/
 ```
+
+> §3.2、§3.3 描述的是「主机原生开发」路径（Python venv 跑 uvicorn + npm run dev 跑 vite），适合需要 IDE 断点调试或快速迭代的贡献者；本节是「容器化开发」路径，环境一致性最高。两种路径任选其一。
 
 ---
 

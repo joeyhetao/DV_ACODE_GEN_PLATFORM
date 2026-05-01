@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- 部署文档拆分为两份独立分册：
+  - `docs/deployment-dev-windows.md`：Win11 本机开发部署（含 .wslconfig 优化、hot reload、bind mount、Docker daemon 崩溃处置、HF 模型 VHDX 路径等）
+  - `docs/deployment-prod-linux.md`：Linux 公司内网生产部署（含受限外网 mirror 配置、模型预下载与 bind mount、备份与恢复演练、安全加固清单 11 项）
+
+### Changed
+- `docs/deployment.md` 由 680 行重写为 ~50 行索引文档，仅承载场景对比表与跳转
+- README.md 文档索引表新增三条 deployment 子文档链接
+
 ---
 
 ## [0.3.0] - 2026-04-27

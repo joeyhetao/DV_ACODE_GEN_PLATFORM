@@ -43,10 +43,13 @@ docker compose up --build
 
 | 文档 | 说明 |
 |------|------|
-| [PRD.md](PRD.md) | 产品需求文档（v2.7） |
+| [PRD.md](PRD.md) | 产品需求文档 |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | 系统架构设计 |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | 建仓、开发、文档维护指南 |
 | [CHANGELOG.md](CHANGELOG.md) | 版本变更历史 |
+| [docs/deployment.md](docs/deployment.md) | 部署索引（场景对比 + 跳转分册） |
+| [docs/deployment-dev-windows.md](docs/deployment-dev-windows.md) | Win11 本机开发部署（hot reload + bind mount） |
+| [docs/deployment-prod-linux.md](docs/deployment-prod-linux.md) | Linux 公司内网生产部署（受限外网 + GPU + 安全加固） |
 
 ## 项目状态
 
