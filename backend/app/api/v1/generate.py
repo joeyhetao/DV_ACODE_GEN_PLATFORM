@@ -46,6 +46,10 @@ async def generate(
         result = await run_pipeline(inp, db)
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
     record = GenerationRecord(
         user_id=current_user.id,

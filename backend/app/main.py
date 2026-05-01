@@ -76,6 +76,9 @@ app = FastAPI(
     version="1.0.0",
     description="IC验证辅助代码生成平台 API",
     lifespan=lifespan,
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
 )
 
 app.add_middleware(
@@ -90,5 +93,6 @@ app.include_router(v1_router)
 
 
 @app.get("/health")
+@app.get("/api/health")
 async def health():
     return {"status": "ok"}
