@@ -94,8 +94,8 @@ async def _import(lib_dir: Path, force: bool):
                     template_body=data["template_body"],
                     maturity=data.get("maturity", "draft"),
                     related_ids=data.get("related_ids"),
-                    created_by="lib_manager",
-                    sync_status="pending",
+                    created_by=None,
+                    sync_status="syncing",
                 )
                 db.add(template)
                 await db.commit()
@@ -145,7 +145,7 @@ def cmd_validate(lib_dir: str):
 @cli.command("rebuild")
 @click.option("--collection", default=None, help="Qdrant collection 名称")
 def cmd_rebuild(collection: str | None):
-    """重建 Qdrant 向量索引（同步所有 sync_status=pending 的模板）"""
+    """重建 Qdrant 向量索引（同步所有 sync_status=syncing 的模板）"""
     asyncio.run(_rebuild(collection))
 
 
@@ -156,7 +156,7 @@ async def _rebuild(collection: str | None):
 
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(Template).where(Template.is_active == True, Template.sync_status == "pending")
+            select(Template).where(Template.is_active == True, Template.sync_status == "syncing")
         )
         templates = result.scalars().all()
         click.echo(f"待同步模板: {len(templates)}")
@@ -283,7 +283,8 @@ async def _sync_to_qdrant(db, template, collection: str | None = None):
     dense_vec = result["dense"][0]
     sparse_vec = result["sparse"][0]
 
-    point_id = str(uuid.uuid4())
+    # 用模板 ID 派生确定性 UUID，保证 upsert 真正覆盖旧 point
+    point_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, template.id))
     await qdrant.upsert(
         collection_name=collection,
         points=[
@@ -292,8 +293,8 @@ async def _sync_to_qdrant(db, template, collection: str | None = None):
                 vector={
                     "dense": dense_vec,
                     "sparse": SparseVector(
-                        indices=sparse_vec["indices"],
-                        values=sparse_vec["values"],
+                        indices=[int(k) for k in sparse_vec.keys()],
+                        values=list(sparse_vec.values()),
                     ),
                 },
                 payload={
@@ -306,7 +307,7 @@ async def _sync_to_qdrant(db, template, collection: str | None = None):
     )
 
     template.qdrant_point_id = point_id
-    template.sync_status = "synced"
+    template.sync_status = "ok"
     await db.commit()
 
 
