@@ -10,3 +10,10 @@ services:
     volumes:
       - ./backend:/app
       - backend_uploads:/app/uploads
+
+  # 前端 dist 用 bind mount 替代镜像内副本，本地 npm run build 后立即生效，
+  # 不必重 build 前端镜像，也避免 compose down/up 时容器重建导致 bundle 回滚。
+  # 使用前提：先在 frontend/ 目录跑过一次 npm run build（dist/ 必须存在）。
+  frontend:
+    volumes:
+      - ./frontend/dist:/usr/share/nginx/html:ro
