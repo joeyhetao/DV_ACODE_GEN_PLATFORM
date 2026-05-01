@@ -4,7 +4,8 @@ from pydantic import BaseModel
 
 class TemplateSelectionOutput(BaseModel):
     template_id: str
-    param_mapping: dict[str, str]
+    # 允许 int/str/float — LLM 提取的 signal_width 等参数本身可能是数字类型
+    param_mapping: dict
     confidence: float
 
 

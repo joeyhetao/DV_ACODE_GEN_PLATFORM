@@ -14,6 +14,7 @@ class LLMClient(ABC):
         normalized_intent: str,
         signal_context: str,
         candidates: list[dict],
+        original_intent: str = "",
     ) -> TemplateSelectionOutput:
         ...
 

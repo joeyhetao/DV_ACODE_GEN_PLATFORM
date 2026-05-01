@@ -11,13 +11,14 @@ class LLMConfigCreate(BaseModel):
     model_id: str
     output_mode: str = "tool_calling"
     temperature: float = 0.0
-    max_tokens: int = 512
+    max_tokens: int = 2048
     is_active: bool = True
     is_default: bool = False
 
 
 class LLMConfigUpdate(BaseModel):
     name: str | None = None
+    provider: str | None = None
     base_url: str | None = None
     api_key: str | None = None
     model_id: str | None = None
@@ -25,6 +26,7 @@ class LLMConfigUpdate(BaseModel):
     temperature: float | None = None
     max_tokens: int | None = None
     is_active: bool | None = None
+    is_default: bool | None = None
 
 
 class LLMConfigOut(BaseModel):

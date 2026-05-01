@@ -1,12 +1,11 @@
 import { useState, useEffect } from 'react'
 import {
   Card, Table, Tag, Button, Space, Modal, Form, Input, Select,
-  Switch, InputNumber, Popconfirm, message, Alert, Typography,
+  Switch, InputNumber, Popconfirm, message, Alert,
 } from 'antd'
 import { PlusOutlined, DeleteOutlined, EditOutlined, StarOutlined, ExperimentOutlined } from '@ant-design/icons'
 import { adminApi, LLMConfig } from '../../api/admin'
 
-const { Text } = Typography
 
 export default function AdminLLMPage() {
   const [configs, setConfigs] = useState<LLMConfig[]>([])
@@ -135,7 +134,7 @@ export default function AdminLLMPage() {
               <Select.Option value="openai_compatible">OpenAI Compatible</Select.Option>
             </Select>
           </Form.Item>
-          <Form.Item name="base_url" label="Base URL (OpenAI Compatible 填写)"><Input placeholder="https://api.example.com/v1" /></Form.Item>
+          <Form.Item name="base_url" label="Base URL (OpenAI Compatible 填写)" extra="常用：智谱 https://open.bigmodel.cn/api/paas/v4/  · DeepSeek https://api.deepseek.com/v1  · Ollama http://host.docker.internal:11434/v1"><Input placeholder="https://open.bigmodel.cn/api/paas/v4/" /></Form.Item>
           <Form.Item name="api_key" label={editingId ? 'API Key（留空不更新）' : 'API Key'} rules={editingId ? [] : [{ required: true }]}>
             <Input.Password placeholder={editingId ? '留空不修改' : 'sk-...'} />
           </Form.Item>
@@ -151,7 +150,7 @@ export default function AdminLLMPage() {
             <Form.Item name="temperature" label="Temperature" initialValue={0.0}>
               <InputNumber min={0} max={1} step={0.1} style={{ width: 100 }} />
             </Form.Item>
-            <Form.Item name="max_tokens" label="Max Tokens" initialValue={512}>
+            <Form.Item name="max_tokens" label="Max Tokens" initialValue={2048}>
               <InputNumber min={128} max={4096} step={128} style={{ width: 120 }} />
             </Form.Item>
           </Space>
