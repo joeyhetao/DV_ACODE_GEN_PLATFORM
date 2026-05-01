@@ -1,6 +1,7 @@
 services:
   postgres:
     image: postgres:16-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_DB: dv_platform
       POSTGRES_USER: dvuser
@@ -15,6 +16,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    restart: unless-stopped
     command: >
       redis-server
       --maxmemory 2gb
@@ -29,6 +31,7 @@ services:
 
   qdrant:
     image: qdrant/qdrant:latest
+    restart: unless-stopped
     volumes:
       - qdrant_data:/qdrant/storage
     healthcheck:
@@ -42,6 +45,7 @@ services:
     build:
       context: ./embedding_service
       dockerfile: Dockerfile.gpu
+    restart: unless-stopped
     env_file: .env
     environment:
       - EMBED_MODEL=BAAI/bge-m3
@@ -64,6 +68,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    restart: unless-stopped
     env_file: .env
     environment:
       - DATABASE_URL=postgresql+asyncpg://dvuser:dvpassword@postgres:5432/dv_platform
@@ -87,6 +92,7 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+    restart: unless-stopped
     command: celery -A app.tasks.batch_tasks worker --loglevel=info --concurrency=${CELERY_CONCURRENCY:-10}
     env_file: .env
     environment:
@@ -106,6 +112,7 @@ services:
 
   backup:
     image: postgres:16-alpine
+    restart: unless-stopped
     env_file: .env
     environment:
       - PGPASSWORD=dvpassword
@@ -129,11 +136,13 @@ services:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+    restart: unless-stopped
     depends_on:
       - backend
 
   nginx:
     image: nginx:alpine
+    restart: unless-stopped
     ports:
       - "80:80"
     volumes:
