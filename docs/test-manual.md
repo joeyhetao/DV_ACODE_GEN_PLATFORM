@@ -13,7 +13,7 @@
 
 0. [测试前置准备](#0-测试前置准备)
 1. [代码生成 — 高置信度命中（10 模板逐一）](#1-代码生成--高置信度命中)
-2. [代码生成 — 易混淆模板对照（4 对）](#2-代码生成--易混淆模板对照测试)
+2. [代码生成 — 易混淆模板对照（5 对）](#2-代码生成--易混淆模板对照测试)
 3. [代码生成 — 低置信度兜底场景（6 个）](#3-代码生成--低置信度兜底场景)
 4. [缓存层行为验证](#4-缓存层行为验证)
 5. [模板贡献机制（3 个完整流程）](#5-模板贡献机制)
@@ -89,6 +89,91 @@ docker logs -f dv_acode_gen_platform-backend-1 2>&1 | Select-String "Pipeline|GL
 ```
 
 后续每个用例的"后端验证"步骤都依赖此日志窗口。
+
+### 0.6 实测验证流程（手册自维护循环）
+
+本手册不是写完就一劳永逸的静态参考 —— 模板库会扩充、LLM 会切换、BGE-M3 会升级，每次变动都可能让 §1 的"高置信度命中"用例失效。**任何 QA 跑出与手册期望不一致的结果，都按下面流程修补手册**，把单次 bug 报告变成可被未来新人复用的经验。
+
+#### 流程图
+
+```
+跑 §1.x 用例
+   │
+   ↓
+观察前端结果 + 后端日志
+   │
+   ├── 命中预期模板 + confidence ≥ 0.9 + 代码片段对 → ✅ 用例通过，跳过
+   │
+   └── 任何一项不对 → ⚠️ 进入修补流程
+        │
+        ↓
+   Step 1：判定根因（看后端日志）
+        │
+        ├── [GLM Step1] selected='<期望模板>' → LLM 选对了，问题在参数/渲染 → 走 Step 2A
+        │
+        ├── [GLM Step1] selected='<其他模板>' → LLM 主动选错 → 走 Step 2B
+        │
+        ├── [GLM Step1] raw='' / [Pipeline] LLM selected '', fallback to: <RAG[0]>
+        │   → fallback 路径，看 RAG Top 3 排序 → 走 Step 2B
+        │
+        └── 抛异常 / HTTP 500 / 无任何日志 → 平台 bug，不是用例问题 → 走 Step 2C
+```
+
+#### 三类修补 Action
+
+**Step 2A — LLM 选对了但参数/渲染不对**
+
+- 多半是 §1.x 输入文本里某个参数值表述不规范，正则提取或 LLM Step2 没拿到
+- **修法**：在 §1.x 输入文本里把该参数值显式化（如把"位宽 3 位"改成"位宽 3 bit / signal_width=3"）
+- 通常不需要新增 §2 / 附录 B 条目
+
+**Step 2B — RAG 选错模板（最常见，§1.1 的真实情况）**
+
+- LLM 是基于 RAG 给的 Top 3 候选选的；如果正确模板压根没进 Top 3，LLM 怎么也选不出
+- **修补三步**：
+
+  | 步骤 | 操作 | 例子（参考 commit `55e0003`）|
+  |---|---|---|
+  | (a) **改 §1.x 输入文本** | 增加该模板**独有**关键词（看 `template_library/<id>.yaml` 的 `keywords` 与 `description`），减少与误命中模板共享的关键词 | "数据寄存器在写使能 wr_en 无效期间保持稳定" → "**寄存器写保护**场景的**数据完整性**断言：当 wr_en 无效时数据 data_reg **不被意外修改**" |
+  | (b) **§2 加易混淆对照对** | 把 "应该选 A 但实测选了 B" 沉淀为新 §2.x，含 A/B 两个判别用例 + 区分关键词说明 + 已知陷阱描述 | §2.5 数据完整性 vs 握手数据稳定 |
+  | (c) **如有系统层偏差，附录 B 加一条** | 如果根因是 confidence 显示陷阱、RAG 算法偏好等系统级问题，写到附录 B 让团队后续修代码 | 附录 B.4 confidence 显示语义混乱 |
+
+**Step 2C — 平台异常**
+
+- 不属于手册问题，按 [deployment-dev-windows.md §8.2](deployment-dev-windows.md#8-常见问题与故障排查) 排查，定位后单独提 bug
+
+#### 模板独有关键词查询脚本
+
+判定"独有 vs 共享"关键词时用这个脚本快速对照：
+
+```powershell
+# 列出所有模板的 keywords + description 头一行，便于对照
+docker exec dv_acode_gen_platform-postgres-1 psql -U dvuser -d dv_platform -c `
+  "SELECT id, keywords, LEFT(description, 50) FROM templates WHERE is_active = true ORDER BY code_type, id;"
+```
+
+#### 提交修补的 git 流程
+
+按 `/commit` skill：
+
+```
+git add docs/test-manual.md
+# commit message 格式：
+# docs(test): fix §X.Y input + add §2.Z confusion pair from real test feedback
+#
+# 原输入 / 实际命中 / 根因分析 / 三步修补的描述
+# Co-Authored-By: ...
+```
+
+参考真实示例：commit `55e0003`（§1.1 → §2.5 修补全过程）。
+
+#### 这套流程的价值
+
+- 每个 QA 发现的偏差都变成一份**针对性的对照测试**，下一个 QA 不会重蹈覆辙
+- 手册逐渐从"凭代码 grep 推测的理想用例"演化为"基于真实模型表现的反脆弱用例集"
+- 附录 B 的 gap 清单会被实测扩充，最终倒逼平台代码改进
+
+> 💡 **第一份"实测验证记录"已收录**：§2.5 + 附录 B.4 第二段 = 用户 §1.1 测试反馈的产物（commit `55e0003`）。
 
 ---
 
