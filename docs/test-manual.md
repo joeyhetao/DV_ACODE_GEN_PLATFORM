@@ -181,6 +181,10 @@ git add docs/test-manual.md
 
 10 个模板各 1 个用例。**期望全部 confidence ≥ 0.9**（LLM Step1 选中分数固定为 0.9，见 [openai_compat_client.py:78](../backend/app/services/llm/openai_compat_client.py#L78)）。
 
+> 💡 **assertion 模板参数填充建议**：测试 §1.1-§1.6 这 6 个 assertion 模板时，**强烈建议同时填写 UI「信号列表」并指定 role**（如 valid / ready / data / enable / state / start / end）。pipeline.py 的 `_map_params` 函数会按 `role_hint` 确定性把信号名映射到对应模板参数。仅靠功能描述里的"信号 xxx"措辞依赖 LLM Step2 语义映射，**不稳定**（见 §1.1 v2→v3 演化教训 + 附录 B.6）。
+>
+> coverage 模板（§1.7-§1.10）则**主要靠功能描述里的信号名/位宽/状态列表**，由正则提取 + LLM Step2 协同填充，相对可靠，可不填信号列表。
+
 ### 用例总表
 
 | # | 模板 ID | 输入摘要（功能描述）| code_type |
@@ -231,20 +235,42 @@ INFO: ... POST /api/v1/generate ... 200 OK       # 成功响应
 
 - **template_id**：`sva_data_integrity_v1`
 - **code_type**：`assertion`
-- **输入文本**（**v2 — 强判别版**）：
+- **输入文本**（**v3 — 强判别 + 显式参数版**）：
   ```
-  寄存器写保护场景的数据完整性断言：当写使能 wr_en 无效时受保护的数据信号 data_reg 不被意外修改，模块 reg_block
+  寄存器写保护场景的数据完整性断言：模块名为 reg_block，当写使能无效时数据信号不被意外修改
   ```
+- **信号列表**（必填，否则参数走兜底）：
+
+  | 信号名 | 位宽 | 角色 |
+  |---|---|---|
+  | `wr_en` | 1 | enable |
+  | `data_reg` | 32 | data |
+
 - **期望生成代码**包含：
   ```systemverilog
   // SVA: 数据完整性 — reg_block
-  property p_reg_block_data_integrity;
+  module reg_block_data_integrity_sva (
+     input logic clk,
+     input logic rst_n,
+     input logic wr_en,
+     input logic [31:0] data_reg
+  );
+
+  property p_data_no_change_without_enable;
     @(posedge clk) disable iff (!rst_n)
       !wr_en |-> $stable(data_reg);
   endproperty
   ```
 
-> ⚠️ **此用例曾踩坑**：原版输入"数据寄存器在写使能 wr_en 无效期间保持稳定"实测被 BGE-reranker 排到 `sva_handshake_stable_v1`（confidence 100% 误导，实际 RAG[0] fallback）。原因：两个模板都含"数据"+"稳定"关键词，handshake_stable 描述"数据信号必须保持稳定"与原输入"保持稳定"逐字匹配。修正后的 v2 输入显式包含 data_integrity 独有关键词「数据完整性」「寄存器写保护」「不被意外修改」三处，将判别性大幅提升。**详见 §2.5 易混淆对照与附录 B.4。**
+> ⚠️ **此用例曾踩两次坑**（v1 → v2 → v3 演化）：
+> - **v1 → v2**（commit `55e0003`）：原版被 BGE-reranker 排到 `sva_handshake_stable_v1`（confidence 100% 误导）。原因：两个模板都含"数据"+"稳定"关键词且 handshake_stable description "数据信号必须保持稳定" 与原输入 "保持稳定" 字面匹配。v2 加入「数据完整性」「寄存器写保护」「不被意外修改」3 个独有关键词解决。
+> - **v2 → v3**（本次修补）：v2 模板选对了，但 LLM Step2 未把 `wr_en/data_reg/reg_block` 映射到 `enable/data/module_name` 参数 → pipeline.py 末尾的"参数名占位符"兜底触发，生成代码出现字面量 `enable` `data` `module_name`。
+>
+> **根因**：pipeline.py 的 `_extract_params_from_intent` 正则**只提取 coverage 模板用的参数名**（signal / group_name / signal_width / state_list），assertion 模板的 `enable` / `data` / `module_name` 等参数完全靠 LLM Step2 语义映射，不稳定。
+>
+> **修法**：v3 用 UI「信号列表」+ role 映射（`role=enable` → `enable` 参数，`role=data` → `data` 参数），由 pipeline.py 的 `_map_params` role-hint 引擎确定性填充，绕过 LLM Step2 的不稳定性。
+>
+> **详见 §2.5 易混淆对照、附录 B.4 confidence 显示陷阱、附录 B.6 assertion 参数提取盲区。**
 
 ### §1.2 FSM 状态转换断言
 
@@ -868,6 +894,18 @@ asyncio.run(main())
   1. 区分前端显示：LLM 选中显示 confidence，fallback 路径显示 "RAG 推荐（无 LLM 信心）"
   2. confidence < 0.5 时前端弹 Modal 警告
   3. confidence < 0.3 时后端返回 422 + 提示文本
+
+### B.6 正则参数提取仅覆盖 coverage 模板，assertion 模板纯靠 LLM Step2
+
+- **位置**：[backend/app/services/core/pipeline.py](../backend/app/services/core/pipeline.py) `_extract_params_from_intent` 函数
+- **现状**：硬编码只提取 `signal` / `group_name` / `signal_width` / `state_list` / `bins_expr` 五个字段（恰好对应 4 个 coverage 模板的参数名），assertion 模板的 `enable` / `data` / `module_name` / `valid` / `ready` / `start_event` / `end_event` / `target` 等参数**完全无正则兜底**
+- **影响**：assertion 用例若功能描述未触发 LLM Step2 正确语义映射 → 走 pipeline.py 末尾"参数名占位符"兜底（`params[name] = name`），生成代码出现字面量 `enable` / `data` 等，**SystemVerilog 不可编译**
+- **复现**：测试手册 §1.1 v2 输入命中 `sva_data_integrity_v1`，但 LLM Step2 未把 `wr_en/data_reg/reg_block` 映射到 `enable/data/module_name`，最终生成 `module_name_data_integrity_sva` + `!enable |-> $stable(data)`（信号名是字面量"enable""data"，不是用户的真实信号名）
+- **临时绕过**：用 UI「信号列表」role 映射（参考 §1 章首建议），由 `_map_params` 的 role-hint 引擎确定性填充
+- **修复建议**（按工作量从小到大）：
+  1. 扩展正则覆盖常见 assertion 参数名（"模块名为 xxx" → `module_name`，"使能信号 xxx" / "使能为 xxx" → `enable`，"数据信号 xxx" → `data`）
+  2. 给 LLM Step2 prompt 加更明确的"必须把用户提到的信号名填到对应参数里"约束，并在系统消息里举 1-2 个完整 mapping 示例
+  3. UI 表单层提供「参数填充辅助」：选完 code_type 和模板后展示该模板必填参数列表，让用户直接对应填值，跳过 LLM Step2 完全
 
 ### B.5 ColBERT Stage2 当前实质退化
 - **位置**：[backend/app/services/rag/stage1_hybrid.py](../backend/app/services/rag/stage1_hybrid.py) 不再请求 `with_vectors=["colbert"]`
