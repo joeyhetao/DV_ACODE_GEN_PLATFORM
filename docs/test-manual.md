@@ -895,17 +895,34 @@ asyncio.run(main())
   2. confidence < 0.5 时前端弹 Modal 警告
   3. confidence < 0.3 时后端返回 422 + 提示文本
 
-### B.6 正则参数提取仅覆盖 coverage 模板，assertion 模板纯靠 LLM Step2
+### B.6 正则参数提取（已部分修复，还有语义参数留给 LLM）
 
 - **位置**：[backend/app/services/core/pipeline.py](../backend/app/services/core/pipeline.py) `_extract_params_from_intent` 函数
-- **现状**：硬编码只提取 `signal` / `group_name` / `signal_width` / `state_list` / `bins_expr` 五个字段（恰好对应 4 个 coverage 模板的参数名），assertion 模板的 `enable` / `data` / `module_name` / `valid` / `ready` / `start_event` / `end_event` / `target` 等参数**完全无正则兜底**
-- **影响**：assertion 用例若功能描述未触发 LLM Step2 正确语义映射 → 走 pipeline.py 末尾"参数名占位符"兜底（`params[name] = name`），生成代码出现字面量 `enable` / `data` 等，**SystemVerilog 不可编译**
-- **复现**：测试手册 §1.1 v2 输入命中 `sva_data_integrity_v1`，但 LLM Step2 未把 `wr_en/data_reg/reg_block` 映射到 `enable/data/module_name`，最终生成 `module_name_data_integrity_sva` + `!enable |-> $stable(data)`（信号名是字面量"enable""data"，不是用户的真实信号名）
-- **临时绕过**：用 UI「信号列表」role 映射（参考 §1 章首建议），由 `_map_params` 的 role-hint 引擎确定性填充
-- **修复建议**（按工作量从小到大）：
-  1. 扩展正则覆盖常见 assertion 参数名（"模块名为 xxx" → `module_name`，"使能信号 xxx" / "使能为 xxx" → `enable`，"数据信号 xxx" → `data`）
-  2. 给 LLM Step2 prompt 加更明确的"必须把用户提到的信号名填到对应参数里"约束，并在系统消息里举 1-2 个完整 mapping 示例
-  3. UI 表单层提供「参数填充辅助」：选完 code_type 和模板后展示该模板必填参数列表，让用户直接对应填值，跳过 LLM Step2 完全
+- **历史现状**：硬编码只提取 5 个 coverage 字段，**6 个 assertion 模板的所有参数完全无正则兜底**，纯靠 LLM Step2 → 生成代码经常出现字面量 `enable` / `data` / `module_name` 占位符
+- **复现**：手册 §1.1 v2 输入命中 `sva_data_integrity_v1` 但 LLM Step2 未把 `wr_en/data_reg/reg_block` 映射到 `enable/data/module_name` → 生成 `module_name_data_integrity_sva` + `!enable |-> $stable(data)`
+- **修复进展（commit `<本次 commit hash>`）**：方案 1 落地，新增正则覆盖以下 assertion 参数：
+
+  | 参数 | 触发模式 | 适用模板 |
+  |---|---|---|
+  | `module_name` | "模块[名][为/是/:] X" | 所有 6 个 assertion |
+  | `max_cycles` / `max_delay` | "N [个] 周期[内/以内]" | handshake_timeout / timing_max_delay |
+  | `init_value` | "初始值/复位值[为/是/:] N"（支持十进制和 0xFF）| reset_behavior |
+  | `enable` / `data` / `valid` / `ready` / `target` / `start_event` / `end_event` / `state_sig` | "X[信号][名][为/是/:] Y"（强分隔符） | 各 assertion 模板按需 |
+
+- **仍未覆盖（依赖 LLM Step2 + signal-list role-hint）**：
+  - `from_state` / `to_state` / `condition`（fsm_state_transition）—— 太语义化，正则无法可靠抓取
+  - `settle_cycles`（reset_behavior）—— 与 `max_cycles` 单位都是"N 周期"，无法区分
+
+- **设计取舍**：
+  1. **强分隔符要求**：信号名提取必须有 `[为是：:]` 分隔，避免 "使能 X 拉高时" 误匹配；用户写 "使能 wr_en" 而非 "使能信号为 wr_en" 时**仍需依赖 signal-list role-hint**
+  2. **`max_cycles` + `max_delay` 同时填**：模板的 parameters 列表只声明其一，另一个被 `_map_params` 静默忽略，无副作用
+  3. **正则提取优先级 > signal-list role-hint**：用户在文本写"数据信号为 wr_data"+ 信号列表填"data_reg role=data" 时正则赢，符合"显式优于推断"语义
+
+- **回归保护**：[backend/tests/test_extract_params.py](../backend/tests/test_extract_params.py) 含 22 个单元测试覆盖上述所有正则模式，跑法：`docker compose exec backend pytest tests/test_extract_params.py -v`
+
+- **后续优化**：
+  - 方案 2（强化 LLM Step2 prompt + few-shot examples）：对仍依赖 LLM 的语义参数有效，可独立做
+  - 方案 3（UI 两步式确认面板）：根治方案，让用户在生成前确认所有参数，跳过 LLM 不稳定性
 
 ### B.5 ColBERT Stage2 当前实质退化
 - **位置**：[backend/app/services/rag/stage1_hybrid.py](../backend/app/services/rag/stage1_hybrid.py) 不再请求 `with_vectors=["colbert"]`

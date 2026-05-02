@@ -10,6 +10,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **正则参数提取扩展**（pipeline.py `_extract_params_from_intent`）：从只覆盖 5 个 coverage 字段扩展到额外覆盖 11 个 assertion 参数（module_name / max_cycles / max_delay / init_value / enable / data / valid / ready / target / start_event / end_event / state_sig），让"模块名为 X，使能信号为 Y"这类半结构化句式不再依赖 LLM Step2 语义映射
+- **首份单元测试** `backend/tests/test_extract_params.py`：22 个测试覆盖既有 coverage 提取（回归保护）+ 新增 assertion 提取 + 反例（避免误提取）+ §1.1/§1.4/§1.6 完整集成场景。容器内跑 `docker compose exec backend pytest tests/test_extract_params.py -v`
 - 部署文档拆分为两份独立分册：
   - `docs/deployment-dev-windows.md`：Win11 本机开发部署（含 .wslconfig 优化、hot reload、bind mount、Docker daemon 崩溃处置、HF 模型 VHDX 路径等）
   - `docs/deployment-prod-linux.md`：Linux 公司内网生产部署（含受限外网 mirror 配置、模型预下载与 bind mount、备份与恢复演练、安全加固清单 11 项）

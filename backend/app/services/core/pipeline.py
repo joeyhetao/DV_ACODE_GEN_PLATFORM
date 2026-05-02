@@ -233,9 +233,34 @@ async def _keyword_supplement(
     return supplements
 
 
+_ASSERTION_SIGNAL_PATTERNS: list[tuple[str, list[str]]] = [
+    (r'使能(?:信号)?名?\s*[为是：:]\s*([A-Za-z_]\w*)',           ['enable']),
+    (r'数据(?:信号)?名?\s*[为是：:]\s*([A-Za-z_]\w*)',           ['data']),
+    (r'valid(?:\s*信号)?\s*[为是：:]\s*([A-Za-z_]\w*)',          ['valid']),
+    (r'ready(?:\s*信号)?\s*[为是：:]\s*([A-Za-z_]\w*)',          ['ready']),
+    (r'目标(?:信号)?名?\s*[为是：:]\s*([A-Za-z_]\w*)',           ['target']),
+    (r'起始(?:信号|事件)?\s*[为是：:]\s*([A-Za-z_]\w*)',         ['start_event']),
+    (r'(?:结束|应答)(?:信号|事件)?\s*[为是：:]\s*([A-Za-z_]\w*)', ['end_event']),
+    (r'状态信号(?:名)?\s*[为是：:]\s*([A-Za-z_]\w*)',            ['state_sig']),
+]
+
+
 def _extract_params_from_intent(intent: str) -> dict:
-    """从自然语言描述中用正则提取常见参数值。"""
+    """从自然语言描述中用正则提取常见参数值。
+
+    覆盖范围：
+      coverage 模板：signal / group_name / signal_width / state_list / bins_expr
+      assertion 模板：module_name / max_cycles / max_delay / init_value /
+                     enable / data / valid / ready / target / start_event /
+                     end_event / state_sig（强分隔符模式，要求"X 信号 [名] [为/是/:] Y"）
+
+    不覆盖（依赖 LLM Step2 + signal-list role-hint 兜底）：
+      from_state / to_state / condition（fsm_state_transition）— 太语义化
+      settle_cycles（reset_behavior）— 与 max_cycles 单位冲突
+    """
     params: dict = {}
+
+    # ── coverage 模板参数 ──────────────────────────────────────────────────
 
     # 信号名：状态信号名为cur_state / 信号名为xxx / 信号xxx
     m = re.search(r'(?:状态)?信号名?[为是：:]\s*(\w+)', intent)
@@ -259,6 +284,34 @@ def _extract_params_from_intent(intent: str) -> dict:
     if len(states) >= 2:
         params["state_list"] = ", ".join(states)
         params["bins_expr"] = "{" + ", ".join(states) + "}"
+
+    # ── assertion 模板参数 ────────────────────────────────────────────────
+
+    # module_name：模块名为 reg_block / 模块名是 X / 模块: X
+    m = re.search(r'模块名?\s*[为是：:]\s*([A-Za-z_]\w*)', intent)
+    if m:
+        params["module_name"] = m.group(1)
+
+    # max_cycles / max_delay：N 周期内 / N 个周期 / 8 周期
+    # 同时填两个 key，模板 parameters 里没声明的会被 _map_params 静默忽略
+    m = re.search(r'(\d+)\s*(?:个)?\s*周期(?:内|以内)?', intent)
+    if m:
+        n = int(m.group(1))
+        params["max_cycles"] = n
+        params["max_delay"] = n
+
+    # init_value：初始值为 0 / 复位值: 0xFF / 初始值是 1
+    # 注意：hex 模式必须排在 \d+ 之前，否则 \d+ 会先匹配 "0xFF" 中的 "0" 就停下
+    m = re.search(r'(?:初始|复位)值\s*[为是：:]?\s*(0[xX][\da-fA-F]+|\d+)', intent)
+    if m:
+        params["init_value"] = m.group(1)
+
+    # 信号名（保守模式，要求强分隔符 [为是：:]）
+    for pattern, param_names in _ASSERTION_SIGNAL_PATTERNS:
+        m = re.search(pattern, intent, re.IGNORECASE)
+        if m:
+            for pname in param_names:
+                params.setdefault(pname, m.group(1))
 
     print(f"[Pipeline] extracted from intent: {params}", flush=True)
     return params
