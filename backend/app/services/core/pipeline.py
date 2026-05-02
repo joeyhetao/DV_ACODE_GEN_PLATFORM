@@ -31,6 +31,7 @@ class PipelineInput:
 
 @dataclass
 class PipelineResult:
+    """legacy 一步式返回（run_pipeline / batch_tasks 用）。"""
     status: str
     code: str
     template_id: str
@@ -45,41 +46,74 @@ class PipelineResult:
     intent_cache_hit: bool = False
 
 
-async def run_pipeline(inp: PipelineInput, db: AsyncSession) -> PipelineResult:
+@dataclass
+class PreviewResult:
+    """方案 3 两步式：第一步 preview 输出（含参数来源标识）。"""
+    template_id: str
+    template_name: str
+    template_version: str
+    confidence: float
+    confidence_source: str                       # "llm_step1" | "rag_fallback" | "intent_cache"
+    rag_candidates: list[dict]                   # 含 parameters 字段供前端切换用
+    params: dict[str, dict]                      # {name: {value, source, required, description, type}}
+    intent_hash: str
+    normalized_intent: str
+    quick_render: bool = False                   # intent_cache 命中 → True，前端跳确认面板
+
+
+@dataclass
+class RenderInput:
+    """方案 3 两步式：第二步 render 输入（用户确认/编辑后的最终参数）。"""
+    template_id: str
+    template_version: str
+    params: dict                                 # value-only dict
+    intent_hash: str | None = None               # 透传以关联 history
+    confidence: float = 0.0
+    normalized_intent: str = ""
+
+
+async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResult:
+    """两步式流水线第一步：意图归一化 → RAG → LLM 选模板/填参数 → 参数源标注。
+
+    不渲染、不写代码缓存。意图缓存命中时返回 quick_render=True 让前端直接调 render。
+    """
+    from app.models.template import Template
+
     # Step 1: Intent Normalize
     normalized, intent_hash = await normalize_intent(inp.original_intent, db)
 
-    # Step 2: Cache Lookup (intent-level)
+    # Step 2: Intent Cache Lookup
     history = await lookup_history(intent_hash)
     if history:
         tmpl_id = history.get("template_id")
         tmpl_version = history.get("version", "1")
-        params = history.get("param_mapping", {})
-        cached_code = await get_generation_cache(tmpl_id, tmpl_version, params)
+        history_params = history.get("param_mapping", {})
+        cached_code = await get_generation_cache(tmpl_id, tmpl_version, history_params)
         if cached_code:
-            from app.models.template import Template
             tmpl = await db.get(Template, tmpl_id)
-            return PipelineResult(
-                status="success",
-                code=cached_code,
+            # 缓存命中：构建一个最小 PreviewResult，标记 quick_render
+            params_with_source = {
+                name: {"value": v, "source": "default", "required": True, "description": "", "type": "string"}
+                for name, v in history_params.items()
+            }
+            return PreviewResult(
                 template_id=tmpl_id,
                 template_name=tmpl.name if tmpl else "",
-                version=tmpl.version if tmpl else tmpl_version,
+                template_version=tmpl.version if tmpl else tmpl_version,
                 confidence=history.get("confidence", 1.0),
-                normalized_intent=normalized,
-                intent_hash=intent_hash,
+                confidence_source="intent_cache",
                 rag_candidates=[],
-                params_used=params,
-                cache_hit=True,
-                intent_cache_hit=True,
+                params=params_with_source,
+                intent_hash=intent_hash,
+                normalized_intent=normalized,
+                quick_render=True,
             )
 
-    # Step 3 + 4: Embed + RAG Retrieve (Stage1 → Stage2 → Stage3)
+    # Step 3 + 4: RAG Retrieve
     rag_candidates = await rag_retrieve(normalized, db, code_type=inp.code_type)
     if not rag_candidates:
         raise ValueError("未能从模板库中检索到合适的模板，请检查意图描述或丰富模板库")
 
-    # 去重：Qdrant 里可能有同一模板的多个 point
     seen_ids: set[str] = set()
     deduped: list[dict] = []
     for c in rag_candidates:
@@ -88,7 +122,7 @@ async def run_pipeline(inp: PipelineInput, db: AsyncSession) -> PipelineResult:
             deduped.append(c)
     rag_candidates = deduped
 
-    # 关键词补充召回：弥补向量搜索召回不足（如 FSM → cov_transition_coverage_v1）
+    # Step 4b: Keyword Supplement
     supplements = await _keyword_supplement(
         normalized + " " + inp.original_intent,
         db,
@@ -97,9 +131,9 @@ async def run_pipeline(inp: PipelineInput, db: AsyncSession) -> PipelineResult:
     )
     if supplements:
         print(f"[Pipeline] keyword supplement: {[s['template_id'] for s in supplements]}", flush=True)
-        rag_candidates = supplements + rag_candidates  # 关键词匹配的排在前面
+        rag_candidates = supplements + rag_candidates
 
-    # Step 5: Template Select via LLM tool call
+    # Step 5: LLM Step1 + Step2
     llm = await get_default_llm_client(db)
     signal_context = _build_signal_context(inp)
     candidate_dicts = [
@@ -117,12 +151,12 @@ async def run_pipeline(inp: PipelineInput, db: AsyncSession) -> PipelineResult:
     )
     print(f"[Pipeline] LLM selection: template_id={selection.template_id!r} confidence={selection.confidence}", flush=True)
 
-    from app.models.template import Template
     template = None
+    confidence_source = "llm_step1"
     if selection.template_id and selection.template_id.lower() not in ("none", "", "null"):
         template = await db.get(Template, selection.template_id)
 
-    # 降级：LLM 选不到时用候选第一名（关键词补充后第一名是最佳匹配）
+    # Fallback: LLM 选不到时取 RAG 第一名
     if not template:
         fallback_id = rag_candidates[0]["template_id"]
         template = await db.get(Template, fallback_id)
@@ -134,66 +168,136 @@ async def run_pipeline(inp: PipelineInput, db: AsyncSession) -> PipelineResult:
                 param_mapping=selection.param_mapping,
                 confidence=float(rag_candidates[0]["score"]),
             )
+            confidence_source = "rag_fallback"
 
     if not template:
         raise ValueError("未能确定有效模板，请检查模板库或调整意图描述")
 
-    # Step 6: Param Map（意图提取 + LLM映射 + role-hint + 兜底）
-    extracted = _extract_params_from_intent(inp.original_intent)
-    # LLM 结果优先覆盖提取结果
-    merged_mapping = {**extracted, **selection.param_mapping}
-    params = _map_params(template, inp, merged_mapping)
-    print(f"[Pipeline] params={params}", flush=True)
+    # Step 6: Param Map with source tracking
+    regex_mapping = _extract_params_from_intent(inp.original_intent)
+    params_with_source = _map_params_with_source(
+        template, inp, regex_mapping=regex_mapping, llm_mapping=selection.param_mapping
+    )
+    print(f"[Pipeline] params={_values_only(params_with_source)}", flush=True)
 
-    # Step 1b: Generation cache lookup (template+params level)
-    version_str = str(template.version)
-    cached_code = await get_generation_cache(template.id, version_str, params)
-    if cached_code:
-        rag_summary = [{"template_id": c["template_id"], "name": c["name"], "score": c["score"]} for c in rag_candidates]
-        return PipelineResult(
-            status="success",
-            code=cached_code,
-            template_id=template.id,
-            template_name=template.name,
-            version=version_str,
-            confidence=selection.confidence,
-            normalized_intent=normalized,
-            intent_hash=intent_hash,
-            rag_candidates=rag_summary,
-            params_used=params,
-            cache_hit=True,
-            intent_cache_hit=False,
-        )
+    # 构建 RAG 候选摘要（含 parameters 供前端切换用）
+    rag_summary = [
+        {
+            "template_id": c["template_id"],
+            "name": c["name"],
+            "score": c["score"],
+            "parameters": c["template"].parameters if c.get("template") else [],
+        }
+        for c in rag_candidates
+    ]
 
-    # Step 7: Render with Jinja2 StrictUndefined
-    code = render_template(template.template_body, params, template.id, version_str)
-
-    rag_summary = [{"template_id": c["template_id"], "name": c["name"], "score": c["score"]} for c in rag_candidates]
-
-    # Step 8: Cache Write
-    await set_generation_cache(template.id, version_str, params, code)
-    await save_history(
-        intent_hash=intent_hash,
+    return PreviewResult(
         template_id=template.id,
-        param_mapping=params,
+        template_name=template.name,
+        template_version=str(template.version),
         confidence=selection.confidence,
-        code=code,
+        confidence_source=confidence_source,
+        rag_candidates=rag_summary,
+        params=params_with_source,
+        intent_hash=intent_hash,
+        normalized_intent=normalized,
+        quick_render=False,
     )
 
+
+async def pipeline_render(req: RenderInput, db: AsyncSession) -> tuple[str, bool]:
+    """两步式流水线第二步：用户确认参数后渲染 + 写缓存 + 保存历史。
+
+    返回 (code, cache_hit)。GenerationRecord 由 API 端点写（不在此函数内）。
+    """
+    from app.models.template import Template
+    template = await db.get(Template, req.template_id)
+    if not template:
+        raise ValueError(f"模板不存在: {req.template_id}")
+
+    # Step 5b: Generation cache lookup
+    version_str = str(template.version)
+    cached_code = await get_generation_cache(template.id, version_str, req.params)
+    if cached_code:
+        return cached_code, True
+
+    # Step 7: Render
+    code = render_template(template.template_body, req.params, template.id, version_str)
+
+    # Step 8: Cache write + history save
+    await set_generation_cache(template.id, version_str, req.params, code)
+    if req.intent_hash:
+        await save_history(
+            intent_hash=req.intent_hash,
+            template_id=template.id,
+            param_mapping=req.params,
+            confidence=req.confidence,
+            code=code,
+        )
+
+    return code, False
+
+
+async def run_pipeline(inp: PipelineInput, db: AsyncSession) -> PipelineResult:
+    """legacy 一步式封装：依次调 preview + render，给 batch_tasks / 既有 /generate 端点用。"""
+    preview = await pipeline_preview(inp, db)
+    params_value_only = _values_only(preview.params)
+
+    if preview.quick_render:
+        # intent_cache 命中：preview 已经把缓存 code 透传了；需要 render 来取 code
+        # 但缓存的 code 在 history 里，需要重查 generation_cache
+        cached_code = await get_generation_cache(
+            preview.template_id, preview.template_version, params_value_only
+        )
+        if cached_code:
+            return PipelineResult(
+                status="success",
+                code=cached_code,
+                template_id=preview.template_id,
+                template_name=preview.template_name,
+                version=preview.template_version,
+                confidence=preview.confidence,
+                normalized_intent=preview.normalized_intent,
+                intent_hash=preview.intent_hash,
+                rag_candidates=[],
+                params_used=params_value_only,
+                cache_hit=True,
+                intent_cache_hit=True,
+            )
+
+    render_input = RenderInput(
+        template_id=preview.template_id,
+        template_version=preview.template_version,
+        params=params_value_only,
+        intent_hash=preview.intent_hash,
+        confidence=preview.confidence,
+        normalized_intent=preview.normalized_intent,
+    )
+    code, cache_hit = await pipeline_render(render_input, db)
+
+    rag_summary = [
+        {"template_id": c["template_id"], "name": c["name"], "score": c["score"]}
+        for c in preview.rag_candidates
+    ]
     return PipelineResult(
         status="success",
         code=code,
-        template_id=template.id,
-        template_name=template.name,
-        version=version_str,
-        confidence=selection.confidence,
-        normalized_intent=normalized,
-        intent_hash=intent_hash,
+        template_id=preview.template_id,
+        template_name=preview.template_name,
+        version=preview.template_version,
+        confidence=preview.confidence,
+        normalized_intent=preview.normalized_intent,
+        intent_hash=preview.intent_hash,
         rag_candidates=rag_summary,
-        params_used=params,
-        cache_hit=False,
+        params_used=params_value_only,
+        cache_hit=cache_hit,
         intent_cache_hit=False,
     )
+
+
+def _values_only(params_with_source: dict[str, dict]) -> dict:
+    """从 {name: {value, source, ...}} 提取纯值字典，供 render_template 使用。"""
+    return {name: meta["value"] for name, meta in params_with_source.items()}
 
 
 async def _keyword_supplement(
@@ -328,14 +432,46 @@ def _build_signal_context(inp: PipelineInput) -> str:
     return "\n".join(lines)
 
 
-def _map_params(template, inp: PipelineInput, llm_mapping: dict) -> dict:
-    params: dict = {}
+def _map_params_with_source(
+    template,
+    inp: PipelineInput,
+    regex_mapping: dict,
+    llm_mapping: dict,
+) -> dict[str, dict]:
+    """方案 3：返回每参数的 value + source 标识（5 类源），供前端 5 色徽标显示。
+
+    优先级（与 legacy _map_params 对齐：LLM > regex > signal-list > default > placeholder）：
+      1. llm        — LLM Step2 推断
+      2. regex      — _extract_params_from_intent 正则提取
+      3. signal_list — 用户填写的信号列表 + role-hint 自动映射
+      4. default    — 模板 default 字段 / clk/rst/rst_polarity from PipelineInput / 语义兜底
+      5. placeholder — required 参数仍缺失时用参数名本身（生成代码会出现字面量，必须用户改）
+    """
     parameters: list[dict] = template.parameters or []
+    param_meta = {p["name"]: p for p in parameters if p.get("name")}
+    result: dict[str, dict] = {}
 
-    # Start from merged mapping (extracted + LLM)
-    params.update(llm_mapping)
+    def _set(name: str, value, source: str) -> None:
+        if name in result:
+            return
+        meta = param_meta.get(name, {})
+        result[name] = {
+            "value": value,
+            "source": source,
+            "required": meta.get("required", False),
+            "description": meta.get("description", ""),
+            "type": meta.get("type", "string"),
+        }
 
-    # Role-hint engine: fill signal roles from inp.signals
+    # 1. LLM 优先（与 legacy {**extracted, **selection.param_mapping} 保持一致）
+    for name, value in llm_mapping.items():
+        _set(name, value, "llm")
+
+    # 2. regex（不覆盖 LLM）
+    for name, value in regex_mapping.items():
+        _set(name, value, "regex")
+
+    # 3. signal-list role-hint
     signals_by_role: dict[str, list[dict]] = {}
     for sig in inp.signals:
         role = sig.get("role", "other")
@@ -343,52 +479,58 @@ def _map_params(template, inp: PipelineInput, llm_mapping: dict) -> dict:
 
     for param_def in parameters:
         name = param_def.get("name")
-        if not name or name in params:
+        if not name or name in result:
             continue
         role_hint = param_def.get("role_hint")
         if role_hint and role_hint in signals_by_role:
             matched = signals_by_role[role_hint]
-            params[name] = matched[0]["name"] if len(matched) == 1 else [m["name"] for m in matched]
+            value = matched[0]["name"] if len(matched) == 1 else [m["name"] for m in matched]
+            _set(name, value, "signal_list")
 
-    # Mandatory defaults from PipelineInput
+    # 4. defaults（clk/rst/rst_polarity from PipelineInput + template default）
     for param_def in parameters:
         name = param_def.get("name")
-        if not name or name in params:
+        if not name or name in result:
             continue
         if name == "clk":
-            params[name] = inp.clk
+            _set(name, inp.clk, "default")
         elif name in ("rst", "rst_n"):
-            params[name] = inp.rst
+            _set(name, inp.rst, "default")
         elif name == "rst_polarity":
-            params[name] = inp.rst_polarity
+            _set(name, inp.rst_polarity, "default")
         elif "default" in param_def:
-            params[name] = param_def["default"]
+            _set(name, param_def["default"], "default")
 
-    # Semantic fallbacks
+    # 5. semantic fallbacks
     for param_def in parameters:
         name = param_def.get("name")
-        if not name or name in params:
+        if not name or name in result:
             continue
         if name == "group_name":
+            value = "cov_group"
             for sig_key in ("signal", "valid", "data", "state"):
-                if sig_key in params:
-                    params[name] = params[sig_key]
+                if sig_key in result:
+                    value = result[sig_key]["value"]
                     break
-            else:
-                params[name] = "cov_group"
+            _set(name, value, "default")
         elif name == "signal":
             if inp.signals:
-                params[name] = inp.signals[0]["name"]
+                _set(name, inp.signals[0]["name"], "default")
         elif name == "state_list":
-            params[name] = "IDLE, ACTIVE, DONE"
+            _set(name, "IDLE, ACTIVE, DONE", "default")
         elif name == "bins_expr":
-            width = int(params.get("signal_width", 4))
-            params[name] = f"{{[0:{2**width - 1}]}}"
+            width = 4
+            if "signal_width" in result:
+                try:
+                    width = int(result["signal_width"]["value"])
+                except (TypeError, ValueError):
+                    pass
+            _set(name, f"{{[0:{2**width - 1}]}}", "default")
 
-    # 最终兜底：required 参数仍缺失时用参数名本身，保证 Jinja2 不崩溃
+    # 6. placeholder（required 参数兜底用参数名本身）
     for param_def in parameters:
         name = param_def.get("name")
-        if name and name not in params and param_def.get("required"):
-            params[name] = name
+        if name and name not in result and param_def.get("required"):
+            _set(name, name, "placeholder")
 
-    return params
+    return result
