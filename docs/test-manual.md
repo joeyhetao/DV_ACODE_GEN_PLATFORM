@@ -146,9 +146,9 @@ INFO: ... POST /api/v1/generate ... 200 OK       # 成功响应
 
 - **template_id**：`sva_data_integrity_v1`
 - **code_type**：`assertion`
-- **输入文本**：
+- **输入文本**（**v2 — 强判别版**）：
   ```
-  需要验证数据寄存器在写使能 wr_en 无效期间保持稳定，模块名为 reg_block，数据信号 data_reg
+  寄存器写保护场景的数据完整性断言：当写使能 wr_en 无效时受保护的数据信号 data_reg 不被意外修改，模块 reg_block
   ```
 - **期望生成代码**包含：
   ```systemverilog
@@ -158,6 +158,8 @@ INFO: ... POST /api/v1/generate ... 200 OK       # 成功响应
       !wr_en |-> $stable(data_reg);
   endproperty
   ```
+
+> ⚠️ **此用例曾踩坑**：原版输入"数据寄存器在写使能 wr_en 无效期间保持稳定"实测被 BGE-reranker 排到 `sva_handshake_stable_v1`（confidence 100% 误导，实际 RAG[0] fallback）。原因：两个模板都含"数据"+"稳定"关键词，handshake_stable 描述"数据信号必须保持稳定"与原输入"保持稳定"逐字匹配。修正后的 v2 输入显式包含 data_integrity 独有关键词「数据完整性」「寄存器写保护」「不被意外修改」三处，将判别性大幅提升。**详见 §2.5 易混淆对照与附录 B.4。**
 
 ### §1.2 FSM 状态转换断言
 
@@ -289,7 +291,9 @@ INFO: ... POST /api/v1/generate ... 200 OK       # 成功响应
 
 ## 2. 代码生成 — 易混淆模板对照测试
 
-下面 4 对模板因为关键词重叠/语义相近，容易让 RAG 选错。本章每对各设 2 个用例（A 倾向 / B 倾向），每跑 5 次至少 4 次该选对应的（80% 准确率底线）。
+下面 5 对模板因为关键词重叠/语义相近，容易让 RAG 选错。本章每对各设 2 个用例（A 倾向 / B 倾向），每跑 5 次至少 4 次该选对应的（80% 准确率底线）。
+
+> **§2.5 是实测验证发现的真实陷阱**（在 §1.1 测试中暴露），不是凭空设想的混淆对。其他 4 对则基于模板 keywords/description 的潜在重叠分析。
 
 ### §2.1 握手 stable vs timeout
 
@@ -322,6 +326,23 @@ INFO: ... POST /api/v1/generate ... 200 OK       # 成功响应
 |---|---|---|---|
 | 2.4-A | "对 data 信号和 mode 信号做交叉覆盖" | `cov_cross_coverage_v1` | "交叉" / "两个信号" |
 | 2.4-B | "对 state 信号 0-7 做值域覆盖" | `cov_value_coverage_v1` | "值域" / "单信号" |
+
+### §2.5 数据完整性 vs 握手数据稳定（实测验证发现）⚠️
+
+两份模板都有「数据」+「稳定/stable」类关键词，且 description 都谈"数据保持稳定"，是当前 RAG 最严重的混淆对。
+
+| 用例 | 输入文本 | 期望模板 | 区分关键词 |
+|---|---|---|---|
+| 2.5-A | "**寄存器写保护**场景的**数据完整性**断言：当 wr_en 无效时数据 data_reg **不被意外修改**" | `sva_data_integrity_v1` | "数据完整性"（exact keyword）/ "寄存器写保护"（description verbatim）/ "不被意外修改"（description verbatim）|
+| 2.5-B | "AXI 握手 awvalid 拉高 awready 未响应时 awaddr 必须保持稳定" | `sva_handshake_stable_v1` | "AXI"（tag）/ "valid"+"ready"（keyword）/ "握手"（keyword）|
+
+**已知陷阱**：仅写"数据 ... 保持稳定"且不带 valid/ready/握手字眼时，BGE-reranker 仍倾向 `sva_handshake_stable_v1`（其 description "数据信号必须保持稳定" 与用户原话 "保持稳定" 字面匹配度更高），confidence 显示 **100%** 但实际是 fallback 路径取 RAG[0] 的分数（见附录 B.4 的 confidence 显示陷阱）。
+
+**判别建议**：data_integrity 场景必须显式写「数据完整性」「写保护」「锁存」「不被修改」中至少一个独有关键词。
+
+### §2.6（占位 — 关于 confidence 显示）
+
+附录 B.4 描述的"confidence 100% 但选错模板"现象在 §2.5-A v1 输入中复现。测试时**不能只看 confidence 颜色，必须核对模板 ID + 后端日志的 `[GLM Step1] selected=...` 行**确认是 LLM 主动选中还是 RAG fallback。
 
 ---
 
@@ -747,12 +768,21 @@ asyncio.run(main())
 - **临时绕过**：审核员人工核对
 - **修复建议**：在贡献 POST 端点加去重检查，相似度 ≥ 0.90 时返回 200 + `duplicate_warning`，由前端弹"已存在相似模板，是否仍提交"
 
-### B.4 后端不强制 confidence_threshold
+### B.4 后端不强制 confidence_threshold + confidence 显示语义混乱
 - **位置**：`pipeline.py` 全文 grep 无 `confidence_threshold` 引用，[config.py:35](../backend/app/core/config.py#L35) 的常量只在 preflight 用
-- **现状**：低置信度（如 0.1）仍正常返回 200 + 代码
-- **影响**：用户看到的代码可能完全错误但前端只显示橙色置信度数字（[GeneratePage.tsx:145](../frontend/src/pages/Generate/GeneratePage.tsx)）
-- **临时绕过**：用户自己看置信度判断
-- **修复建议**：confidence < 0.5 时前端弹 Modal 警告，confidence < 0.3 时后端返回 422 + 提示文本
+- **现状 1**：低置信度（如 0.1）仍正常返回 200 + 代码
+- **现状 2（实测发现）**：前端显示的 "置信度" 数值在不同路径下含义不同：
+  - LLM Step1 主动选中 → confidence = **0.9**（固定值，[openai_compat_client.py:78](../backend/app/services/llm/openai_compat_client.py#L78)）
+  - LLM Step1 失败 fallback 到 RAG[0] → confidence = **rag_candidates[0]["score"]**（可达 1.0）
+  - intent_cache_hit → confidence = 历史记录值（默认 1.0）
+  - 即"100% 置信度"可能是 **RAG 排序分数** 而非 LLM 真实判断分数 → 选错模板时反而 confidence 更高（误导用户）
+- **影响**：用户看到 100% 绿色高置信度，以为模板选对了，实际是 fallback 路径硬塞 RAG[0]
+- **复现案例**：测试手册 §2.5-A v1 输入（"数据寄存器在写使能 wr_en 无效期间保持稳定"）→ confidence 100% 但选错为 sva_handshake_stable_v1
+- **临时绕过**：除了看 confidence，还要核对前端显示的"模板"字段是否符合预期；后端日志的 `[GLM Step1] selected=...` 与 `LLM selected '...', fallback to: ...` 区分了主动选中 vs fallback
+- **修复建议**：
+  1. 区分前端显示：LLM 选中显示 confidence，fallback 路径显示 "RAG 推荐（无 LLM 信心）"
+  2. confidence < 0.5 时前端弹 Modal 警告
+  3. confidence < 0.3 时后端返回 422 + 提示文本
 
 ### B.5 ColBERT Stage2 当前实质退化
 - **位置**：[backend/app/services/rag/stage1_hybrid.py](../backend/app/services/rag/stage1_hybrid.py) 不再请求 `with_vectors=["colbert"]`
