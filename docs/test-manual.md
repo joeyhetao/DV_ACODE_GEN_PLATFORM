@@ -200,23 +200,38 @@ git add docs/test-manual.md
 | 1.9 | `cov_transition_coverage_v1` | FSM IDLE→FETCH→DECODE→EXECUTE 转换覆盖率 | coverage |
 | 1.10 | `cov_value_coverage_v1` | 4 位状态信号 0-15 全部取值覆盖率 | coverage |
 
-### 通用操作步骤（所有 §1.x 都按这个流程）
+### 通用操作步骤（方案 3 两步式工作流，所有 §1.x 都按这个流程）
 
 1. 浏览器访问 `http://localhost/`，用 `admin` 登录
 2. 左菜单点 **生成代码** → 进入 generate 页
 3. **功能描述** 框：copy 用例输入文本
 4. **代码类型** 下拉：选用例对应的 code_type
-5. 时钟 / 复位 / 信号列表保持默认（除非用例特别说明）
-6. 点 **生成代码** 按钮 → 等 5-15 秒（GLM-4-Plus）或 60-150 秒（GLM-4.7）
+5. 时钟 / 复位保持默认；**信号列表按用例描述填**（assertion 模板务必填）
+6. 点 **「分析意图」** 按钮（注意：不是"生成代码"）→ 等 5-30 秒（GLM-4-Plus）或 60-150 秒（GLM-4.7）
+7. 出现 **确认面板**：
+   - 检查推荐模板是否符合预期（应 = 用例期望 template_id）
+   - 检查 confidence_source 标签：`llm_step1`（绿）= LLM 主动选中，`rag_fallback`（橙）= 兜底
+   - 检查参数表单的 5 色徽标：🟢 信号列表 / 🟡 正则 / 🟠 LLM / ⚪ 默认 / 🔴 占位符（**红色必须改**）
+   - 如有 🔴 红色徽标 → 「确认并生成代码」按钮 disabled，按提示修正
+   - 如要切换模板 → 用模板下拉切到 RAG 候选，参数表单自动重新映射
+8. 点 **「确认并生成代码」** → 等 < 1 秒（仅 Jinja2 渲染）→ 看到代码
+
+> ⚠️ **意图缓存命中时**：步骤 7 的确认面板被跳过，从"分析意图"直接到"看到代码"（< 2 秒）。这是 D2 决策的预期行为。
 
 ### 通用期望结果（所有 §1.x 都该看到）
 
-- 右侧面板出现：
-  - **置信度**：≥ 90.0%（绿色）
-  - **模板**：等于用例的期望 template_id
-  - **缓存命中**：第一次跑显示「否」，相同输入再跑显示「是」
-  - **生成代码** 区域：包含用例描述的 SystemVerilog 关键句
-  - **RAG 候选模板 (Top 3)**：用例期望模板排第一
+**确认面板阶段（步骤 7）**：
+- **推荐模板**：等于用例期望 template_id
+- **confidence_source**：`llm_step1`（绿色 Tag）— 表示 LLM 主动选中（如果是 `rag_fallback` 橙色，说明 LLM 没选对，但用户可在面板里手动切换）
+- **置信度数值**：在 0.85 - 1.0 之间
+- **参数 5 色徽标**：assertion 用例应见到 🟢 signal_list（来自填充的信号列表）+ 🟡 regex（如 module_name）+ ⚪ default（clk/rst_n）；coverage 用例多见 🟡 regex；**不应见 🔴 placeholder**（若见到 → 用例触发条件不充分，按 §0.6 走修补流程）
+- **「确认并生成代码」按钮**：可点击（未 disabled）
+
+**结果阶段（步骤 8）**：
+- **置信度**：≥ 85%（绿色）
+- **confidence_source Tag**：和确认面板一致
+- **缓存命中**：第一次跑显示「否」，相同输入再跑显示「是」
+- **生成代码**：包含用例描述的 SystemVerilog 关键句
 
 ### 通用后端验证（每个用例都该在日志看到）
 
@@ -879,7 +894,12 @@ asyncio.run(main())
 - **临时绕过**：审核员人工核对
 - **修复建议**：在贡献 POST 端点加去重检查，相似度 ≥ 0.90 时返回 200 + `duplicate_warning`，由前端弹"已存在相似模板，是否仍提交"
 
-### B.4 后端不强制 confidence_threshold + confidence 显示语义混乱
+### B.4 后端不强制 confidence_threshold + confidence 显示语义混乱（**已部分修复**）
+
+> **修复进展（方案 3 落地）**：preview 端点新增 `confidence_source` 字段（`llm_step1` / `rag_fallback` / `intent_cache`），前端确认面板用彩色 Tag 显示 → 用户能直接看到"100% confidence"是 LLM 主动选中（绿色）还是 RAG fallback（橙色）。
+>
+> 仍未修：后端 `confidence_threshold` 阈值仍不强制阻断（低置信度仍返回 200），但方案 3 的红色徽标 + 模板切换面板已经让用户有充分手段在生成前发现并修正问题。
+
 - **位置**：`pipeline.py` 全文 grep 无 `confidence_threshold` 引用，[config.py:35](../backend/app/core/config.py#L35) 的常量只在 preflight 用
 - **现状 1**：低置信度（如 0.1）仍正常返回 200 + 代码
 - **现状 2（实测发现）**：前端显示的 "置信度" 数值在不同路径下含义不同：

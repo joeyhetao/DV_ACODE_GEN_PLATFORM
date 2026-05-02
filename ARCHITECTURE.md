@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.12  
+**版本**：v2.13  
 **状态**：已确认  
-**日期**：2026-05-01  
+**日期**：2026-05-02  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -17,6 +17,7 @@
 - v2.9 → v2.10：模板查重机制优化——步骤 B 从 Stage1 Hybrid RRF 检索改为 dense-only 余弦相似度检索（§3.8），解决 RRF 分数缺乏可解释单位的问题；补充说明框（关键词重叠 ≠ 语义重复，dense-only 与生成链路 hybrid 两套查询独立）；更新 TEMPLATE_DEDUP_THRESHOLD 环境变量注释（§8.4）
 - v2.10 → v2.11：初始实现对齐——API v1 端点平铺于 api/v1/（删除 endpoints/ 子目录），贡献者与管理员审核端点合并为单文件（§3.10.4）；code-types 端点路径更正为 /api/v1/generate/code-types（§3.14.4、§5.1）；流水线接口类更名为 PipelineInput/PipelineResult，Step 1 改为 IntentNormalize（§3.15.2、§3.15.3）；备份 volume 更正为 backend_backups（§3.13.2）；迁移文件合并为 001_initial_schema.py（§7）
 - v2.11 → v2.12：流水线鲁棒性与 thinking 模型支持——OpenAI 兼容客户端拆为"选模板 + 填参数"两步纯文本调用，规避 GLM-4.7 等 thinking 模型 reasoning_tokens 截断问题，max_tokens 提升至 4096（§3.12.2、§3.12.3）；Pipeline 在 RAG 后增加关键词补充召回、意图正则参数提取、LLM 失败 fallback 三层兜底（§3.15.3）；lib_manager 用 `uuid.uuid5(NAMESPACE_DNS, template.id)` 派生确定性 Qdrant point ID，修复 rebuild 重复 point bug（§3.8）；新增 docker-compose.hotreload.yml 开发 overlay（§8.2）；nginx 入口启用 Docker 内置 resolver `127.0.0.11 valid=10s` + 变量化 proxy_pass，解决 backend 容器重启后 nginx 缓存旧 IP 导致 502 的问题（§8.3）；前端容器 nginx 对 index.html 强制 `no-cache` 响应头，确保 hash 化 bundle 升级后浏览器立即拉新（§8.3）
+- v2.12 → v2.13：方案 3 两步式 UI 落地——`run_pipeline` 拆为 `pipeline_preview` + `pipeline_render`（§3.15.3），新增 `/api/v1/generate/preview` 端点 + 增强 `/api/v1/generate/render` 端点（§5.1）；`_map_params` 重写为 `_map_params_with_source`，每参数标注 5 类来源（signal_list / regex / llm / default / placeholder）（§3.15.4）；新增 `confidence_source` 字段区分 LLM 主动选中 vs RAG fallback vs 意图缓存命中（§3.15.5）；前端引入 ConfirmationPanel + ParametersForm 两步式确认面板（§3.16），意图缓存命中走 `quick_render=true` 路径自动跳过确认；既有 `/generate` 端点改为内部调 preview+render，对 batch_tasks 调用方零变更
 
 ---
 

@@ -10,6 +10,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **方案 3 两步式 UI 确认面板**（核心 UX 重构）：
+  - 后端：`run_pipeline` 拆为 `pipeline_preview` + `pipeline_render` 两段；新增 `/api/v1/generate/preview` 端点（返回模板推荐 + 参数预填充含来源标识）；增强 `/api/v1/generate/render` 端点（用户确认参数后渲染 + 写 GenerationRecord + 写缓存）
+  - `_map_params_with_source` 替代 `_map_params`，每参数标 5 类源（`signal_list` / `regex` / `llm` / `default` / `placeholder`）
+  - 新增 `confidence_source` 字段（`llm_step1` / `rag_fallback` / `intent_cache`），解决附录 B.4 的 confidence 显示陷阱
+  - 前端：新增 `ConfirmationPanel` + `ParametersForm` + `SourceBadge` 组件，意图缓存命中（`quick_render=true`）时自动跳过确认面板；红色占位符徽标禁用「生成代码」按钮强制用户填值；切换 RAG 候选模板自动重映射参数
+  - 既有 `/generate` 端点保留兼容（内部调 preview+render），batch_tasks 零变更
+  - 新增 4 个 pipeline_render 集成测试 + 8 个 `_map_params_with_source` 单测，共 12 测全过
 - **正则参数提取扩展**（pipeline.py `_extract_params_from_intent`）：从只覆盖 5 个 coverage 字段扩展到额外覆盖 11 个 assertion 参数（module_name / max_cycles / max_delay / init_value / enable / data / valid / ready / target / start_event / end_event / state_sig），让"模块名为 X，使能信号为 Y"这类半结构化句式不再依赖 LLM Step2 语义映射
 - **首份单元测试** `backend/tests/test_extract_params.py`：22 个测试覆盖既有 coverage 提取（回归保护）+ 新增 assertion 提取 + 反例（避免误提取）+ §1.1/§1.4/§1.6 完整集成场景。容器内跑 `docker compose exec backend pytest tests/test_extract_params.py -v`
 - 部署文档拆分为两份独立分册：
