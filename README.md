@@ -50,6 +50,7 @@ docker compose up --build
 | [docs/deployment.md](docs/deployment.md) | 部署索引（场景对比 + 跳转分册） |
 | [docs/deployment-dev-windows.md](docs/deployment-dev-windows.md) | Win11 本机开发部署（hot reload + bind mount） |
 | [docs/deployment-prod-linux.md](docs/deployment-prod-linux.md) | Linux 公司内网生产部署（受限外网 + GPU + 安全加固） |
+| [docs/test-manual.md](docs/test-manual.md) | 平台功能测试手册（11 章 + 2 附录，含 10 模板触发用例 / 易混淆对照 / 低置信度兜底 / 贡献闭环 / 已知 gap） |
 
 ## 项目状态
 

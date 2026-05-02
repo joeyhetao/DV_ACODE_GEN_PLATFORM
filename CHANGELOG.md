@@ -13,10 +13,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - 部署文档拆分为两份独立分册：
   - `docs/deployment-dev-windows.md`：Win11 本机开发部署（含 .wslconfig 优化、hot reload、bind mount、Docker daemon 崩溃处置、HF 模型 VHDX 路径等）
   - `docs/deployment-prod-linux.md`：Linux 公司内网生产部署（含受限外网 mirror 配置、模型预下载与 bind mount、备份与恢复演练、安全加固清单 11 项）
+- 平台功能测试手册 `docs/test-manual.md`（11 章 + 2 附录）：
+  - 10 个模板逐一的高置信度命中用例（含输入文本 / 期望模板 / 期望代码片段 / 后端验证）
+  - 4 对易混淆模板对照测试（握手 stable vs timeout、断言 vs 覆盖率等）
+  - 6 个低置信度兜底场景（无关意图 / 极简输入 / 英文 / code_type 不匹配 / 必填参数缺失 / RAG 召回 0）
+  - 缓存层 3 个用例 + 模板贡献 3 个完整流程 + 批量生成 + 意图构建器 + 用户/LLM/通知管理
+  - **附录 B：5 项已知功能-UI gap 清单**（贡献无去重、切换 LLM 不清缓存、删默认 LLM 无防呆、后端不强制 confidence_threshold、ColBERT Stage2 实质退化）
 
 ### Changed
 - `docs/deployment.md` 由 680 行重写为 ~50 行索引文档，仅承载场景对比表与跳转
-- README.md 文档索引表新增三条 deployment 子文档链接
+- README.md 文档索引表新增 4 条文档链接（3 份 deployment + test-manual）
 
 ---
 
