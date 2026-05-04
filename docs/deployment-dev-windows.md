@@ -143,6 +143,17 @@ cd ..
 
 ### 3.4 启动完整栈
 
+**有 NVIDIA GPU（推荐，BGE-M3 + GPU 推理 ~50ms/次）**：
+
+```powershell
+docker compose `
+  -f docker-compose.yml `
+  -f docker-compose.hotreload.yml `
+  up -d
+```
+
+**无 GPU（叠加 dev overlay 切到 CPU 小模型）**：
+
 ```powershell
 docker compose `
   -f docker-compose.yml `
@@ -151,13 +162,15 @@ docker compose `
   up -d
 ```
 
+> ⚠️ **关键：dev.yml 与 base 的 Qdrant collection 不兼容**。dev.yml 用 `bge-small-zh-v1.5`（512 维），base 用 `BAAI/bge-m3`（1024 维）。两套混用会触发 `Vector dimension error: expected dim: 1024, got 512`。一旦选定一个 overlay 路径，**不要中途换**；如果必须换，需要先 `lib_manager.py rebuild` 重建 Qdrant collection（参考 ARCHITECTURE §3.8）。
+
 三个 overlay 的作用：
 
-- `docker-compose.yml`：基础栈（9 个服务）+ `restart: unless-stopped`
-- `docker-compose.dev.yml`：embedding 用 CPU 小模型 `bge-small-zh-v1.5`（200 MB）替代 BGE-M3（2 GB），加速首次启动
+- `docker-compose.yml`：基础栈（9 个服务）+ `restart: unless-stopped` + BGE-M3 1024 维 + GPU
+- `docker-compose.dev.yml`：embedding 切 CPU 小模型 `bge-small-zh-v1.5`（512 维，~100MB），适合**完全无 GPU 的开发机**
 - `docker-compose.hotreload.yml`：后端 `--reload`、源码挂载、前端 dist bind mount
 
-首次启动 5-10 分钟（拉镜像 + build + 下载小模型）。
+首次启动 5-10 分钟（拉镜像 + build + 下载模型）。
 
 ### 3.5 等待服务就绪
 
@@ -206,7 +219,7 @@ docker compose exec backend python lib_manager.py import
 
 ```powershell
 docker compose restart backend                       # 单服务
-docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose.hotreload.yml up -d --force-recreate backend  # 重建
+docker compose -f docker-compose.yml -f docker-compose.hotreload.yml up -d --force-recreate backend  # 重建（默认 GPU 路径）
 ```
 
 ### 4.5 完全停止 / 完全启动
@@ -215,7 +228,6 @@ docker compose -f docker-compose.yml -f docker-compose.dev.yml -f docker-compose
 docker compose down                                  # 保留 volume 数据
 docker compose `
   -f docker-compose.yml `
-  -f docker-compose.dev.yml `
   -f docker-compose.hotreload.yml `
   up -d
 ```
