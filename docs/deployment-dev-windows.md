@@ -4,6 +4,8 @@
 **适用环境**：Windows 11 + Docker Desktop（WSL2 后端）
 **适用读者**：本机日常开发、单人测试、给项目改代码的人
 
+> 📌 **2026-05 起项目已迁移到 WSL2 内部（`/root/DV_ACODE_GEN_PLATFORM`），推荐 WSL 内开发**：见 [startup-wsl.md](startup-wsl.md)。本文保留 Windows 原生路径流程作为对照参考。
+>
 > 生产环境（Linux 服务器）部署请看 [deployment-prod-linux.md](deployment-prod-linux.md)。
 > 团队协作流程（分支、commit 规范）看 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 
@@ -97,8 +99,11 @@ docker run --rm alpine sh -c "cat /proc/meminfo | head -1"
 
 ### 3.1 克隆仓库
 
+> 推荐 clone 到 WSL2 内部（I/O 比 `\\wsl.localhost\...` 快 10×），见 [startup-wsl.md](startup-wsl.md)。下面给的是 Windows 原生路径方案。
+
 ```powershell
-cd D:\tools\github
+# 选一个开发目录（避开 OneDrive / 同步盘）
+cd D:\dev
 git clone <repo-url> DV_ACODE_GEN_PLATFORM
 cd DV_ACODE_GEN_PLATFORM
 ```
@@ -375,7 +380,8 @@ ls frontend/dist/assets/
 
 # 2. 确认 bind mount 是否生效
 docker inspect dv_acode_gen_platform-frontend-1 --format "{{range .Mounts}}{{.Source}} → {{.Destination}}{{`\n`}}{{end}}"
-# 应显示 D:\tools\github\DV_ACODE_GEN_PLATFORM\frontend\dist → /usr/share/nginx/html
+# 应显示 <你的项目路径>/frontend/dist → /usr/share/nginx/html
+# （WSL 内开发为 /root/DV_ACODE_GEN_PLATFORM/frontend/dist；Windows 原生为 D:\dev\DV_ACODE_GEN_PLATFORM\frontend\dist）
 
 # 3. 浏览器 Ctrl+F5 / 无痕窗口
 ```
