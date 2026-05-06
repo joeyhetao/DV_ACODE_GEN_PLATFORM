@@ -4,7 +4,7 @@
 **适用环境**：Windows 11 + Docker Desktop（WSL2 后端）
 **适用读者**：本机日常开发、单人测试、给项目改代码的人
 
-> 📌 **2026-05 起项目已迁移到 WSL2 内部（`/root/DV_ACODE_GEN_PLATFORM`），推荐 WSL 内开发**：见 [startup-wsl.md](startup-wsl.md)。本文保留 Windows 原生路径流程作为对照参考。
+> 📌 **2026-05 起项目已迁移到 WSL2 内部（`/home/Administrator/DV_ACODE_GEN_PLATFORM`），推荐 WSL 内开发**：见 [startup-wsl.md](startup-wsl.md)。本文保留 Windows 原生路径流程作为对照参考。
 >
 > 生产环境（Linux 服务器）部署请看 [deployment-prod-linux.md](deployment-prod-linux.md)。
 > 团队协作流程（分支、commit 规范）看 [CONTRIBUTING.md](../CONTRIBUTING.md)。
@@ -381,7 +381,7 @@ ls frontend/dist/assets/
 # 2. 确认 bind mount 是否生效
 docker inspect dv_acode_gen_platform-frontend-1 --format "{{range .Mounts}}{{.Source}} → {{.Destination}}{{`\n`}}{{end}}"
 # 应显示 <你的项目路径>/frontend/dist → /usr/share/nginx/html
-# （WSL 内开发为 /root/DV_ACODE_GEN_PLATFORM/frontend/dist；Windows 原生为 D:\dev\DV_ACODE_GEN_PLATFORM\frontend\dist）
+# （WSL 内开发为 /home/Administrator/DV_ACODE_GEN_PLATFORM/frontend/dist；Windows 原生为 D:\dev\DV_ACODE_GEN_PLATFORM\frontend\dist）
 
 # 3. 浏览器 Ctrl+F5 / 无痕窗口
 ```

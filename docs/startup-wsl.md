@@ -1,10 +1,10 @@
 # 开机登录手册（WSL 路径版）
 
 **适用版本**：v1.0.0
-**适用场景**：项目已从 `D:\tools\github\DV_ACODE_GEN_PLATFORM` 迁移到 WSL Ubuntu-22.04 内部
+**适用场景**：项目位于 D 盘 WSL Ubuntu-22.04 发行版内部
 **项目位置**：
-- WSL 内部：`/root/DV_ACODE_GEN_PLATFORM`
-- Windows UNC：`\\wsl.localhost\Ubuntu-22.04\root\DV_ACODE_GEN_PLATFORM`
+- WSL 内部：`/home/Administrator/DV_ACODE_GEN_PLATFORM`
+- Windows UNC：`\\wsl.localhost\Ubuntu-22.04\home\Administrator\DV_ACODE_GEN_PLATFORM`
 
 > 本手册只覆盖"开机 → 进入开发环境"。环境初装看 [deployment-dev-windows.md](deployment-dev-windows.md)，开发协作流程看 [CONTRIBUTING.md](../CONTRIBUTING.md)。
 
@@ -22,7 +22,7 @@
    B. Windows Terminal → wsl      ← 纯命令行习惯
    C. 文件资源管理器 \\wsl.localhost\... ← 只看/拷贝文件
    ↓
-进入 /root/DV_ACODE_GEN_PLATFORM
+进入 /home/Administrator/DV_ACODE_GEN_PLATFORM
    ↓
 docker compose ... up -d
    ↓
@@ -68,49 +68,90 @@ exit   # 拉起后退出，让它在后台保持 Running
 
 ### 方式 A — VS Code + Remote-WSL（**推荐**）
 
-这是开发体验最好的方式，编辑器、终端、Git 全部跑在 Linux 端，磁盘 I/O 最快。
+这是开发体验最好的方式，编辑器、终端、Git、Docker CLI 全部跑在 Linux 端，磁盘 I/O 最快，inotify hot reload 可靠，git 也不会出现 Windows 侧的 "dubious ownership" 问题。
 
-**前置一次性安装**：VS Code 装扩展 `Remote - WSL`（Microsoft 官方，ID `ms-vscode-remote.remote-wsl`）。
+**前置一次性安装**（Windows 侧 VS Code）：
 
-**每次开机后**：
+- 扩展 `Remote - WSL`（ID `ms-vscode-remote.remote-wsl`，Microsoft 官方）
 
-1. 打开 PowerShell：
+**每次开机后的进入流程**：
+
+1. 打开 PowerShell 进 WSL：
 
    ```powershell
    wsl -d Ubuntu-22.04
    ```
 
-2. 进入项目并启动 VS Code：
+2. 进项目并拉起 VS Code：
 
    ```bash
-   cd /root/DV_ACODE_GEN_PLATFORM
+   cd /home/Administrator/DV_ACODE_GEN_PLATFORM
    code .
    ```
 
-   首次会自动下载 VS Code Server 到 WSL 端（30 秒）。
+   首次会自动下载 VS Code Server 到 WSL 端（约 30 秒，仅一次）。
 
-3. VS Code 左下角应显示 **`WSL: Ubuntu-22.04`** 绿色徽标。在 VS Code 终端里直接是 `bash`，已在 `/root/DV_ACODE_GEN_PLATFORM`。
+3. VS Code 左下角出现 **`WSL: Ubuntu-22.04`** 绿色徽标 = 已处于 Remote-WSL 模式。
 
-> 也可以直接在 PowerShell 里跑 `code "\\wsl.localhost\Ubuntu-22.04\root\DV_ACODE_GEN_PLATFORM"`，VS Code 会自动检测到 UNC 路径并提示切换到 Remote-WSL 模式。
+**进入 VS Code 后怎么开发**：
+
+- **打开集成终端**（Ctrl + 反引号 `` ` ``）→ 默认就是 WSL bash，已在项目根目录。所有 `docker compose`、`git push`、`pytest`、`npm run build` 都在这个终端里跑，不要切回 PowerShell。
+- **编辑文件** → 直接 Ctrl+S 保存即可，后端 `--reload` + 前端 `dist` bind mount 会自动反映变化。
+- **Git push** → 第一次会提示输入凭据，参考下面 [方式 B 的"首次 git push"](#方式-b--windows-terminal--wsl-bash) 配置一次即可；之后所有 WSL 终端（含 VS Code 集成终端）共用同一份凭据。
+- **推荐在 WSL 端装的扩展**（侧栏 Extensions → 搜到扩展后选 "Install in WSL: Ubuntu-22.04"）：`Python`、`Pylance`、`ESLint`、`Prettier`、`Docker`。Windows 端装的扩展默认不会同步到 WSL 端，必须手动勾。
+- **关闭窗口下次打开** → VS Code 会记住最近的 Remote-WSL 工作区，File → Open Recent 直接选回项目，不用每次跑 `code .`。
+
+> 也可以直接在 PowerShell 里跑 `code "\\wsl.localhost\Ubuntu-22.04\home\Administrator\DV_ACODE_GEN_PLATFORM"`，VS Code 会自动检测到 UNC 路径并提示切换到 Remote-WSL 模式。
 
 ### 方式 B — Windows Terminal + WSL bash
 
-适合"只想跑命令"的场景。
+适合"只想跑命令"的场景：git 操作、docker compose、跑测试、看日志。落到 WSL bash 后是 Linux 用户视角，git 不会再报 dubious ownership。
+
+**方案 A — 在当前 PowerShell 直接进 WSL bash**：
 
 ```powershell
-wsl -d Ubuntu-22.04 --cd /root/DV_ACODE_GEN_PLATFORM
+wsl -d Ubuntu-22.04 --cd /home/Administrator/DV_ACODE_GEN_PLATFORM
 ```
 
-落到 bash 后已在项目根，可以直接 `git status` / `docker compose ...`。
+落到 bash 后已在项目根，可以直接 `git status` / `git push` / `docker compose ...`。
 
-> 把这条命令保存到 Windows Terminal 的 profile 里，下次直接选 profile 一键进入。
+**方案 B — 在 Windows Terminal 新开独立标签**：
+
+```powershell
+wt -w 0 new-tab --title "DV_ACODE_GEN" wsl -d Ubuntu-22.04 --cd /home/Administrator/DV_ACODE_GEN_PLATFORM
+```
+
+`-w 0` 表示在已有 Windows Terminal 窗口里新开标签；不带就开新窗口。
+
+> **入口固化**：Windows Terminal → Settings → Add new profile → Command line 粘 `wsl.exe -d Ubuntu-22.04 --cd /home/Administrator/DV_ACODE_GEN_PLATFORM`，命名为 `DV_ACODE_GEN`，下次下拉一键进入。
+
+**首次 git push 必做：配置 GitHub 凭据**
+
+WSL 里 remote 是 HTTPS（`https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM.git`），第一次 push 会被问账号密码。GitHub 已经不接受密码，必须用 **Personal Access Token (PAT)**。二选一：
+
+```bash
+# 方案 1（推荐）：GitHub CLI 自动配凭据
+sudo apt update && sudo apt install -y gh
+gh auth login
+# 选 GitHub.com → HTTPS → Login with a web browser
+# 按提示在浏览器粘 one-time code，授权后自动写入 git credential helper
+# 此后 git push 静默通过，所有 WSL 终端共享
+
+# 方案 2：手动 PAT
+# 在 https://github.com/settings/tokens 生成 classic PAT（勾 repo 权限）
+git config --global credential.helper store
+git push     # username 填 GitHub 账号；password 粘 PAT（不是 GitHub 密码）
+             # 之后 ~/.git-credentials 明文存盘，后续不再问
+```
+
+> 不要在 PowerShell（即 Windows 侧 Git for Windows）里对 UNC 路径 `\\wsl.localhost\...` 跑 git——会触发 dubious ownership 报错；即使加 `safe.directory` 例外，9P 协议也会比 WSL 内部慢 10×。统一在 WSL bash 里操作。
 
 ### 方式 C — 文件资源管理器（只看文件）
 
 地址栏粘贴：
 
 ```
-\\wsl.localhost\Ubuntu-22.04\root\DV_ACODE_GEN_PLATFORM
+\\wsl.localhost\Ubuntu-22.04\home\Administrator\DV_ACODE_GEN_PLATFORM
 ```
 
 适合查看日志、拷贝 Excel 模板等。**不要在这里跑构建命令**——经过 Windows ↔ WSL 的 9P 协议，I/O 慢 10-50 倍，且 `npm install` 之类操作会触发权限问题。
@@ -155,7 +196,7 @@ docker ps --format "table {{.Names}}\t{{.Status}}"
 
 ## 4. 日常工作流速查
 
-| 操作 | 命令（在 `/root/DV_ACODE_GEN_PLATFORM` 下） |
+| 操作 | 命令（在 `/home/Administrator/DV_ACODE_GEN_PLATFORM` 下） |
 |---|---|
 | 改后端 Python | 直接保存，hot reload 自动生效 |
 | 改前端 TSX | `cd frontend && npm run build`（dist bind mount） |
@@ -206,7 +247,7 @@ wsl --shutdown
 | `\\wsl.localhost\...` 在资源管理器打不开 | WSL 没启动 | `wsl -d Ubuntu-22.04 -- echo ok` 拉起一次 |
 | 文件保存但 hot reload 没触发 | 用 Windows IDE 编辑 UNC 路径文件，inotify 跨 9P 不可靠 | 换成 VS Code Remote-WSL 编辑（方式 A） |
 | `git status` 显示一堆权限/换行变更 | 跨 Windows ↔ WSL 复制过文件 | 在 WSL 内 `git config --global core.autocrlf input` 后重新 clone，或 `git checkout .` 复位 |
-| `npm install` 在 UNC 路径跑超慢 | 走 9P 协议 | 必须在 WSL bash 内（`/root/...` 路径）执行，不能在 PowerShell 里对 UNC 路径执行 |
+| `npm install` 在 UNC 路径跑超慢 | 走 9P 协议 | 必须在 WSL bash 内（`/home/Administrator/...` 路径）执行，不能在 PowerShell 里对 UNC 路径执行 |
 
 ---
 
@@ -225,4 +266,4 @@ wsl --shutdown
 
 ---
 
-**最后修改**：2026-05-04
+**最后修改**：2026-05-06
