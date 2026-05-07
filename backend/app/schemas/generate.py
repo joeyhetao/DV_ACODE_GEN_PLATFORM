@@ -84,6 +84,9 @@ class ParamWithSource(BaseModel):
     required: bool = True
     description: str = ""
     type: str = "string"                     # 模板里声明的 type（用于前端校验）
+    sanitized: bool = False                  # 后端做过 SV 标识符规范化清洗（前端可显示提示）
+    expr_type: str | None = None             # 来自模板 YAML 的语法类型声明（前端按此 dispatch 校验）
+    validation_error: str | None = None      # 表达式校验失败时的错误描述（sv_boolean_expr / sv_bins_expr）
 
 
 class RAGCandidateWithParams(BaseModel):

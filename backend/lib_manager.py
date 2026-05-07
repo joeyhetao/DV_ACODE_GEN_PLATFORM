@@ -79,6 +79,22 @@ async def _import(lib_dir: Path, force: bool):
                         skipped_dup += 1
                         continue
 
+                # expr_type lint：检查 parameters 是否声明了 expr_type，未声明的输出 warn
+                # （不阻断导入，仅提示团队补全以适配未来加入的新参数名）
+                from app.services.core.identifier import IDENTIFIER_PARAMS
+                missing_expr_type: list[str] = []
+                for p in (data.get("parameters") or []):
+                    pname = p.get("name")
+                    if not pname or "expr_type" in p:
+                        continue
+                    fallback = "sv_identifier" if pname in IDENTIFIER_PARAMS else "(无校验)"
+                    missing_expr_type.append(f"{pname} → fallback {fallback}")
+                if missing_expr_type:
+                    click.echo(
+                        f"  [WARN] {name}: 参数未声明 expr_type，按 fallback 处理: "
+                        + ", ".join(missing_expr_type)
+                    )
+
                 from datetime import datetime, timezone
                 template = Template(
                     id=template_id,

@@ -177,3 +177,340 @@ def test_section_1_6_timing_max_delay_full():
     assert p["start_event"] == "req_sig"
     assert p["end_event"] == "ack_sig"
     assert p["max_delay"] == 8
+
+
+# ── identifier sanitize 单元测试（test-bug #003 修复）────────────────────
+
+from app.services.core.identifier import (
+    IDENTIFIER_PARAMS,
+    construct_group_name,
+    is_sv_identifier,
+    sanitize_sv_identifier,
+)
+
+
+def test_sanitize_legal_passthrough():
+    """合法 identifier 直通，不改、不标 changed"""
+    cleaned, changed = sanitize_sv_identifier("awvalid_awready_cov")
+    assert cleaned == "awvalid_awready_cov"
+    assert changed is False
+
+
+def test_sanitize_chinese_only():
+    """全中文 → 全部转 _ 后被去掉，加 fallback_prefix 前缀"""
+    cleaned, changed = sanitize_sv_identifier("覆盖率组", fallback_prefix="group_name")
+    assert changed is True
+    assert is_sv_identifier(cleaned)
+    assert cleaned == "group_name"   # 全非法时回退到纯前缀
+
+
+def test_sanitize_mixed_chinese_and_ascii():
+    """实战场景：'AXI valid-ready握手场景覆盖率' → 'AXI_valid_ready_cov' 风格"""
+    cleaned, changed = sanitize_sv_identifier(
+        "AXI valid-ready握手场景覆盖率", fallback_prefix="group_name"
+    )
+    assert changed is True
+    assert is_sv_identifier(cleaned)
+    # 中文/空格/连字符应统一变 _，多 _ 合并，去首尾 _
+    assert cleaned == "AXI_valid_ready"
+
+
+def test_sanitize_digits_first():
+    """数字开头 → 加 fallback_prefix 前缀"""
+    cleaned, changed = sanitize_sv_identifier("123abc", fallback_prefix="signal")
+    assert changed is True
+    assert is_sv_identifier(cleaned)
+    assert cleaned == "signal_123abc"
+
+
+def test_sanitize_empty_string():
+    """空串 → 退化为 fallback_prefix 本身"""
+    cleaned, changed = sanitize_sv_identifier("", fallback_prefix="module_name")
+    assert changed is True
+    assert cleaned == "module_name"
+
+
+def test_sanitize_pure_punctuation():
+    """纯标点 → 全部转 _ 被剥光 → 退化为 fallback_prefix"""
+    cleaned, changed = sanitize_sv_identifier("---!!!", fallback_prefix="group_name")
+    assert changed is True
+    assert cleaned == "group_name"
+
+
+def test_construct_group_name_from_module():
+    """有合法 module_name → 优先 module_name + _cov"""
+    result = {
+        "module_name": {"value": "axi_master", "source": "regex"},
+        "valid": {"value": "awvalid", "source": "llm"},
+        "ready": {"value": "awready", "source": "llm"},
+    }
+    assert construct_group_name(result) == "axi_master_cov"
+
+
+def test_construct_group_name_from_valid_ready():
+    """无 module_name，有 valid+ready → valid_ready_cov"""
+    result = {
+        "valid": {"value": "awvalid", "source": "llm"},
+        "ready": {"value": "awready", "source": "llm"},
+    }
+    assert construct_group_name(result) == "awvalid_awready_cov"
+
+
+def test_construct_group_name_from_signal():
+    """只有 signal → signal_cov"""
+    result = {"signal": {"value": "cur_state", "source": "regex"}}
+    assert construct_group_name(result) == "cur_state_cov"
+
+
+def test_construct_group_name_skips_illegal_candidates():
+    """候选自身不合法时跳过，不会用非法值拼接"""
+    result = {
+        "module_name": {"value": "中文模块", "source": "llm"},  # 非法，跳过
+        "valid": {"value": "awvalid", "source": "llm"},
+        "ready": {"value": "awready", "source": "llm"},
+    }
+    assert construct_group_name(result) == "awvalid_awready_cov"
+
+
+def test_construct_group_name_returns_none_when_empty():
+    """全无可用候选 → None，让调用方退到纯 sanitize"""
+    assert construct_group_name({}) is None
+    assert construct_group_name({"max_cycles": {"value": 8, "source": "regex"}}) is None
+
+
+def test_identifier_params_match_frontend():
+    """与 frontend/src/utils/validateParam.ts 的 SIGNAL_PARAM_NAMES 完全一致"""
+    expected = {
+        "enable", "data", "valid", "ready", "signal", "state_sig",
+        "target", "start_event", "end_event", "module_name", "group_name",
+        "clk", "rst", "rst_n",
+        "from_state", "to_state",
+    }
+    assert set(IDENTIFIER_PARAMS) == expected
+
+
+def test_sanitize_from_state_chinese():
+    """from_state/to_state 也属于 IDENTIFIER_PARAMS，中文输入会被清洗。
+
+    验证场景：FSM 模板 template_body 把 from_state/to_state 拼进 property 名，
+    若用户/LLM 给中文枚举值，渲染会产生非法 SV，必须先 sanitize。
+    """
+    assert "from_state" in IDENTIFIER_PARAMS
+    assert "to_state" in IDENTIFIER_PARAMS
+
+    cleaned, changed = sanitize_sv_identifier("空闲状态", fallback_prefix="from_state")
+    assert changed is True
+    assert is_sv_identifier(cleaned)
+    assert cleaned == "from_state"   # 全中文 → 退化为 fallback_prefix
+
+    cleaned, changed = sanitize_sv_identifier("IDLE 状态", fallback_prefix="from_state")
+    assert changed is True
+    assert is_sv_identifier(cleaned)
+    assert cleaned == "IDLE"          # 中英混排，保留 ASCII 部分
+
+
+# ── _map_params_with_source sanitize 集成测试 ────────────────────────────
+
+from app.services.core.pipeline import PipelineInput, _map_params_with_source
+
+
+class _FakeTemplate:
+    def __init__(self, parameters):
+        self.parameters = parameters
+
+
+# ── expr_validator 单元测试（metadata-driven 系统）─────────────────────
+
+from app.services.core.expr_validator import (
+    EXPR_TYPE_DISPATCH,
+    validate_sv_bins_expr,
+    validate_sv_boolean_expr,
+    validate_sv_identifier_list,
+)
+
+
+def test_validate_sv_boolean_expr_legal():
+    assert validate_sv_boolean_expr("awvalid && awready") is None
+    assert validate_sv_boolean_expr("!busy || done") is None
+    assert validate_sv_boolean_expr("(a == b) && (c < d)") is None
+
+
+def test_validate_sv_boolean_expr_double_op():
+    err = validate_sv_boolean_expr("awvalid && && ready")
+    assert err is not None and "重复" in err
+
+
+def test_validate_sv_boolean_expr_unbalanced_paren():
+    err = validate_sv_boolean_expr("(a && b")
+    assert err is not None and "括号" in err
+
+
+def test_validate_sv_boolean_expr_chinese():
+    err = validate_sv_boolean_expr("awvalid 且 awready")
+    assert err is not None and "非法字符" in err
+
+
+def test_validate_sv_identifier_list_legal():
+    assert validate_sv_identifier_list("IDLE, FETCH, DECODE, EXECUTE") is None
+
+
+def test_validate_sv_identifier_list_invalid_member():
+    err = validate_sv_identifier_list("IDLE, 123BAD, EXECUTE")
+    assert err is not None and "123BAD" in err
+
+
+def test_validate_sv_identifier_list_too_short():
+    err = validate_sv_identifier_list("IDLE")
+    assert err is not None and "至少需要 2" in err
+
+
+def test_validate_sv_bins_expr_legal():
+    assert validate_sv_bins_expr("{0:255}") is None
+    assert validate_sv_bins_expr("{1, 2, 4, 8, 16}") is None
+    assert validate_sv_bins_expr("{[10:100], 200}") is None
+
+
+def test_validate_sv_bins_expr_no_braces():
+    err = validate_sv_bins_expr("0:255")
+    assert err is not None and "{...}" in err
+
+
+def test_validate_sv_bins_expr_illegal_char():
+    err = validate_sv_bins_expr("{0:255, 中文}")
+    assert err is not None and "非法字符" in err
+
+
+def test_expr_type_dispatch_completeness():
+    """EXPR_TYPE_DISPATCH 必须覆盖三个表达式类型"""
+    assert "sv_boolean_expr" in EXPR_TYPE_DISPATCH
+    assert "sv_identifier_list" in EXPR_TYPE_DISPATCH
+    assert "sv_bins_expr" in EXPR_TYPE_DISPATCH
+
+
+# ── pipeline dispatch 集成测试（expr_type vs fallback）───────────────────
+
+def test_pipeline_dispatches_by_explicit_expr_type():
+    """模板 parameters 声明 expr_type 时按 dispatch 走，不依赖参数名"""
+    # 用一个不在 IDENTIFIER_PARAMS 白名单的参数名 'addr_bus' 配 expr_type=sv_identifier
+    template = _FakeTemplate(parameters=[
+        {"name": "addr_bus", "type": "string", "required": True,
+         "expr_type": "sv_identifier"},  # ← 非白名单，但显式声明
+    ])
+    inp = PipelineInput(original_intent="dummy", code_type="assertion", signals=[])
+    llm_mapping = {"addr_bus": "AXI 地址总线"}  # ← 中文非法值
+
+    result = _map_params_with_source(template, inp, regex_mapping={}, llm_mapping=llm_mapping)
+
+    # expr_type 透传到前端
+    assert result["addr_bus"]["expr_type"] == "sv_identifier"
+    # sanitize 命中（即使参数名不在 IDENTIFIER_PARAMS）
+    assert is_sv_identifier(result["addr_bus"]["value"])
+    assert result["addr_bus"]["sanitized"] is True
+
+
+def test_pipeline_falls_back_to_identifier_params_for_legacy_templates():
+    """旧模板没声明 expr_type，按 IDENTIFIER_PARAMS 白名单 fallback"""
+    template = _FakeTemplate(parameters=[
+        {"name": "valid", "type": "string", "required": True},  # 无 expr_type，但 valid ∈ IDENTIFIER_PARAMS
+    ])
+    inp = PipelineInput(original_intent="dummy", code_type="assertion", signals=[])
+    llm_mapping = {"valid": "中文信号名"}
+
+    result = _map_params_with_source(template, inp, regex_mapping={}, llm_mapping=llm_mapping)
+
+    # 没声明 expr_type → meta 不带 expr_type 字段
+    assert "expr_type" not in result["valid"]
+    # 但因为名字在 IDENTIFIER_PARAMS，仍然 sanitize
+    assert is_sv_identifier(result["valid"]["value"])
+    assert result["valid"]["sanitized"] is True
+
+
+def test_pipeline_skips_unknown_params_without_expr_type():
+    """新参数名 + 无 expr_type → 不校验（保持后向兼容）"""
+    template = _FakeTemplate(parameters=[
+        {"name": "addr_bus", "type": "string", "required": True},  # 无 expr_type 且不在白名单
+    ])
+    inp = PipelineInput(original_intent="dummy", code_type="assertion", signals=[])
+    llm_mapping = {"addr_bus": "AXI 地址总线"}
+
+    result = _map_params_with_source(template, inp, regex_mapping={}, llm_mapping=llm_mapping)
+
+    # 完全不动：没 sanitize、没 validation_error、没 expr_type
+    assert result["addr_bus"]["value"] == "AXI 地址总线"
+    assert "sanitized" not in result["addr_bus"]
+    assert "validation_error" not in result["addr_bus"]
+    assert "expr_type" not in result["addr_bus"]
+
+
+def test_pipeline_validates_sv_boolean_expr():
+    """expr_type=sv_boolean_expr 时 validator 触发，invalid 时打 validation_error 不修改值"""
+    template = _FakeTemplate(parameters=[
+        {"name": "condition", "type": "string", "required": True,
+         "expr_type": "sv_boolean_expr"},
+    ])
+    inp = PipelineInput(original_intent="dummy", code_type="assertion", signals=[])
+    llm_mapping = {"condition": "awvalid && && ready"}  # 双 &&
+
+    result = _map_params_with_source(template, inp, regex_mapping={}, llm_mapping=llm_mapping)
+
+    # 值不变（validator 不修改）
+    assert result["condition"]["value"] == "awvalid && && ready"
+    # 但带 validation_error
+    assert "validation_error" in result["condition"]
+    assert "重复" in result["condition"]["validation_error"]
+
+
+def test_pipeline_sanitizes_sv_identifier_list():
+    """expr_type=sv_identifier_list 时逐项 sanitize"""
+    template = _FakeTemplate(parameters=[
+        {"name": "state_list", "type": "string", "required": True,
+         "expr_type": "sv_identifier_list"},
+    ])
+    inp = PipelineInput(original_intent="dummy", code_type="coverage", signals=[])
+    llm_mapping = {"state_list": "IDLE, 中文状态, EXECUTE"}
+
+    result = _map_params_with_source(template, inp, regex_mapping={}, llm_mapping=llm_mapping)
+
+    # 中文项被 sanitize
+    assert result["state_list"]["sanitized"] is True
+    assert "中文" not in result["state_list"]["value"]
+    # 其他合法项保留
+    assert "IDLE" in result["state_list"]["value"]
+    assert "EXECUTE" in result["state_list"]["value"]
+
+
+def test_map_params_sanitizes_llm_chinese_group_name():
+    """重现 test-bug #003：LLM 返回中文 group_name → 智能构造为 awvalid_awready_cov"""
+    template = _FakeTemplate(parameters=[
+        {"name": "group_name", "type": "string", "required": True, "description": "覆盖率组名"},
+        {"name": "clk", "type": "string", "required": True, "default": "clk"},
+        {"name": "rst_n", "type": "string", "required": True, "default": "rst_n"},
+        {"name": "valid", "type": "string", "required": True, "role_hint": "valid"},
+        {"name": "ready", "type": "string", "required": True, "role_hint": "ready"},
+    ])
+    inp = PipelineInput(
+        original_intent="dummy",
+        code_type="coverage",
+        signals=[],
+    )
+    llm_mapping = {
+        "group_name": "AXI valid-ready握手场景覆盖率",  # ← LLM 给的非法值
+        "valid": "awvalid",
+        "ready": "awready",
+        "clk": "clk",
+        "rst_n": "rst_n",
+    }
+
+    result = _map_params_with_source(template, inp, regex_mapping={}, llm_mapping=llm_mapping)
+
+    # group_name 应该被智能构造为 awvalid_awready_cov（valid+ready 命中分支）
+    assert is_sv_identifier(result["group_name"]["value"])
+    assert result["group_name"]["value"] == "awvalid_awready_cov"
+    assert result["group_name"]["sanitized"] is True
+    assert result["group_name"]["source"] == "default"  # 智能构造改源为 default
+
+    # 其他参数没动
+    assert result["valid"]["value"] == "awvalid"
+    assert result["ready"]["value"] == "awready"
+    assert "sanitized" not in result["valid"]
+    assert "sanitized" not in result["ready"]

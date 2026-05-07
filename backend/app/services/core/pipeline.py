@@ -11,6 +11,13 @@ from app.services.core.cache import (
     get_intent_cache,
     set_intent_cache,
 )
+from app.services.core.expr_validator import EXPR_TYPE_DISPATCH
+from app.services.core.identifier import (
+    IDENTIFIER_PARAMS,
+    construct_group_name,
+    is_sv_identifier,
+    sanitize_sv_identifier,
+)
 from app.services.core.renderer import render_template
 from app.services.intent.normalizer import normalize_intent
 from app.services.intent.history import lookup_history, save_history
@@ -532,5 +539,65 @@ def _map_params_with_source(
         name = param_def.get("name")
         if name and name not in result and param_def.get("required"):
             _set(name, name, "placeholder")
+
+    # 7. expr_type-driven 校验/sanitize（最后一道防线，覆盖所有源）
+    #    优先按模板 YAML 的 parameters[].expr_type 分发；旧模板未声明时回落到
+    #    IDENTIFIER_PARAMS 白名单（按参数名判断），保持后向兼容。
+    #
+    #    分发规则：
+    #      sv_identifier        → sanitize_sv_identifier（修改值，标 sanitized=True）
+    #      sv_identifier_list   → 逐项 sanitize（修改值，标 sanitized=True）
+    #      sv_boolean_expr / sv_bins_expr → validator（不修改值，invalid 时标 validation_error）
+    #      integer / free_text / 未知 → 跳过（由 Pydantic / 前端覆盖）
+    gn_meta = result.get("group_name")
+    if gn_meta and not is_sv_identifier(gn_meta.get("value")):
+        constructed = construct_group_name(result)
+        if constructed:
+            gn_meta["value"] = constructed
+            gn_meta["source"] = "default"
+            gn_meta["sanitized"] = True
+
+    for name, meta in result.items():
+        param_def = param_meta.get(name, {})
+        declared_expr_type = param_def.get("expr_type")
+
+        # 透传 expr_type 让前端能拿到（None 不透传）
+        if declared_expr_type is not None:
+            meta["expr_type"] = declared_expr_type
+
+        # 实际校验用的 type：声明的 or fallback 到 IDENTIFIER_PARAMS
+        effective_type = declared_expr_type or (
+            "sv_identifier" if name in IDENTIFIER_PARAMS else None
+        )
+        if effective_type is None:
+            continue
+
+        value = meta.get("value")
+        if isinstance(value, list):  # signal_list 多匹配 → 跳过（渲染层会处理）
+            continue
+
+        if effective_type == "sv_identifier":
+            cleaned, changed = sanitize_sv_identifier(str(value), fallback_prefix=name)
+            if changed:
+                meta["value"] = cleaned
+                meta["sanitized"] = True
+        elif effective_type == "sv_identifier_list":
+            # 逐项 sanitize 后重组
+            items = [p.strip() for p in str(value).split(",") if p.strip()]
+            cleaned_items: list[str] = []
+            any_changed = False
+            for item in items:
+                cleaned_item, item_changed = sanitize_sv_identifier(item, fallback_prefix="state")
+                cleaned_items.append(cleaned_item)
+                any_changed = any_changed or item_changed
+            if any_changed and cleaned_items:
+                meta["value"] = ", ".join(cleaned_items)
+                meta["sanitized"] = True
+        elif effective_type in EXPR_TYPE_DISPATCH:
+            # sv_boolean_expr / sv_bins_expr：纯 validator，不修改值
+            err = EXPR_TYPE_DISPATCH[effective_type](str(value))
+            if err:
+                meta["validation_error"] = err
+        # 其他（integer / free_text / 未知 expr_type）跳过
 
     return result

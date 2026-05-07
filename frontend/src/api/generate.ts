@@ -33,6 +33,9 @@ export interface ParamWithSource {
   required: boolean
   description: string
   type: string
+  sanitized?: boolean              // 后端做过 SV 标识符清洗
+  expr_type?: string               // 模板 YAML 声明的语法类型（驱动前端 dispatch 校验）
+  validation_error?: string        // sv_boolean_expr / sv_bins_expr 校验失败时的错误描述
 }
 
 export interface RAGCandidateWithParams {

@@ -19,34 +19,41 @@ description: |
 parameters:
   - name: module_name
     type: string
+    expr_type: sv_identifier
     required: true
     description: 模块名
   - name: clk
     type: string
+    expr_type: sv_identifier
     required: true
     description: 时钟信号
     default: clk
   - name: rst_n
     type: string
+    expr_type: sv_identifier
     required: true
     description: 复位信号
     default: rst_n
   - name: state_sig
     type: string
+    expr_type: sv_identifier
     required: true
     description: 状态信号名
     role_hint: state
   - name: from_state
     type: string
+    expr_type: sv_identifier
     required: true
     description: 初始状态枚举值
     default: IDLE
   - name: condition
     type: string
+    expr_type: sv_boolean_expr
     required: true
     description: 触发转换的条件表达式
   - name: to_state
     type: string
+    expr_type: sv_identifier
     required: true
     description: 目标状态枚举值
     default: ACTIVE

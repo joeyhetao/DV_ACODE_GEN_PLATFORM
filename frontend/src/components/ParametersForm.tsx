@@ -40,7 +40,9 @@ export default function ParametersForm({ params, onChange }: Props) {
     <Form layout="vertical" size="small">
       {entries.map(([name, meta]) => {
         const valueStr = Array.isArray(meta.value) ? meta.value.join(', ') : String(meta.value)
-        const errorMsg = validateParamValue(name, meta.type, meta.value)
+        // 优先：后端 expr_validator 已经报错（sv_boolean_expr / sv_bins_expr），直接显示
+        // 次之：前端按 expr_type / 白名单走本地校验
+        const errorMsg = meta.validation_error || validateParamValue(name, meta.type, meta.value, meta.expr_type)
         const isPlaceholder = meta.source === 'placeholder'
 
         return (
