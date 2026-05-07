@@ -9,7 +9,7 @@ IC验证辅助代码生成平台 — 输入结构化需求表，确定性输出 
 - **确定性生成**：相同输入必然产生相同输出（Redis缓存 → 算法匹配引擎 → Jinja2渲染三层保障）
 - **LLM 仅做参数提取**：temperature=0 + JSON Schema，不参与代码生成
 - **双表格输入**：SVA需求表 + 功能覆盖率需求表（Excel格式）
-- **智能置信度**：>85% 自动生成，≤85% 展示 Top-3 候选供确认
+- **两步式确认面板**：preview 返回 RAG Top-3 候选 + 参数预填值（5 类来源徽标），用户切换候选/编辑参数后再 render；意图缓存命中自动短路
 - **三级权限**：普通用户 / 库管理员 / 超管
 - **批量处理**：Excel 批量导入，打包下载生成结果
 
@@ -56,19 +56,20 @@ docker compose up --build
 
 当前阶段：**核心功能实现完成，待 Alpha 测试**
 
-- [x] PRD 确认（v2.7）
-- [x] 架构设计
+- [x] PRD 确认（v2.9）
+- [x] 架构设计（ARCHITECTURE v2.14）
 - [x] 后端骨架搭建
-- [x] 确定性引擎核心实现（pipeline / renderer / dedup / cache）
-- [x] 三阶段 RAG 检索流水线（混合检索 → ColBERT 精排 → Cross-Encoder 重排）
-- [x] 前端框架搭建（生成页、意图构建器、模板库、批量处理、管理控制台）
+- [x] 确定性引擎核心实现（pipeline / renderer / dedup / cache + expr_type 校验/规范化层）
+- [x] 三阶段 RAG 检索流水线（混合检索 → ColBERT 精排 → Cross-Encoder 重排，含关键词补充召回兜底）
+- [x] 两步式 UI 确认面板（preview + render，5 类参数源徽标，意图缓存短路）
+- [x] 前端框架搭建（生成页、意图构建器、模板库、批量处理、管理控制台、登录/注册）
 - [x] 模板库初始化（SVA 断言 6 个 + 功能覆盖率 4 个）
 - [x] 批量处理 & Celery 任务队列
-- [x] LLM 多模型配置管理（Anthropic / OpenAI 兼容 / GLM / DeepSeek / Ollama）
+- [x] LLM 多模型配置管理（Anthropic / OpenAI 兼容 / GLM / DeepSeek / Ollama，含 thinking-model 两步纯文本调用）
 - [x] 独立嵌入服务（BGE-M3 + BGE Reranker，支持 GPU/CPU）
 - [x] Docker Compose 完整栈（含开发热重载、GPU 部署 overlay）
-- [x] 部署手册（[docs/deployment.md](docs/deployment.md)）
-- [ ] 单元测试与集成测试
+- [x] 部署手册（[dev-windows](docs/deployment-dev-windows.md) / [prod-linux](docs/deployment-prod-linux.md) / [WSL 启动](docs/startup-wsl.md)）
+- [x] 单元测试基础落地（pipeline preview/render + 正则参数提取）
 - [ ] Alpha 测试
 
 ## License

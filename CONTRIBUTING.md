@@ -34,18 +34,26 @@ DV_ACODE_GEN_PLATFORM/
 │   │   ├── models/                      # SQLAlchemy ORM 模型
 │   │   ├── schemas/                     # Pydantic 请求/响应 Schema
 │   │   ├── services/
-│   │   │   ├── core/                   # 确定性生成引擎（pipeline/renderer/dedup/cache）
+│   │   │   ├── core/                   # 确定性生成引擎（pipeline/renderer/dedup/cache + identifier/expr_validator）
 │   │   │   ├── intent/                 # 意图提取（normalizer/preflight/builder/history）
 │   │   │   ├── llm/                    # LLM 适配层（Anthropic + OpenAI 兼容工厂）
-│   │   │   ├── parser/                 # Excel 需求表解析
+│   │   │   ├── parser/                 # Excel 需求表解析（schema 驱动）
 │   │   │   ├── platform/               # 审计日志、备份、贡献审核
-│   │   │   └── rag/                    # 三阶段 RAG（stage1_hybrid/stage2_colbert/stage3_reranker）
+│   │   │   ├── rag/                    # 三阶段 RAG（stage1_hybrid/stage2_colbert/stage3_reranker）
+│   │   │   ├── registry.py             # CodeTypeRegistry（启动时加载 data/code_types/*.yaml）
+│   │   │   └── embedding_client.py     # 嵌入服务 HTTP 客户端
 │   │   ├── tasks/                       # Celery 异步任务（celery_app/batch_tasks）
 │   │   └── main.py
+│   ├── data/                            # 代码类型注册配置（扩展新类型只需改 YAML）
+│   │   ├── code_types/                 # 类型定义（assertion / coverage 等）
+│   │   ├── schemas/                    # Excel 列规范（schema 驱动解析器）
+│   │   └── scenarios/                  # 场景构建器句式模板
+│   ├── migrations/                      # Alembic 数据库迁移（001_initial_schema 起）
+│   ├── tests/                           # 后端单元/集成测试（pytest）
 │   ├── template_library/                # YAML 模板库（受版本控制）
 │   │   ├── assertions/                 # SVA 断言模板
 │   │   └── coverage/                   # 功能覆盖率模板
-│   ├── lib_manager.py                   # 模板库管理 CLI（导入/同步 Qdrant）
+│   ├── lib_manager.py                   # 模板库管理 CLI（导入/校验/重建 Qdrant/导出 YAML）
 │   ├── Dockerfile
 │   └── requirements.txt
 ├── embedding_service/                   # 独立嵌入服务（BGE-M3 + Reranker，GPU/CPU 可选）
@@ -70,11 +78,12 @@ DV_ACODE_GEN_PLATFORM/
 ├── docker-compose.gpu-linux.yml         # Linux GPU overlay（CUDA passthrough）
 ├── docker-compose.gpu-windows.yml       # Windows GPU overlay（WSL2 GPU）
 ├── nginx.conf                           # 入口反向代理（前端 + /api 路由）
-├── docs/                                # 补充文档（deployment.md 等）
+├── docs/                                # 补充文档（deployment-{dev-windows,prod-linux}.md / startup-wsl.md / test-manual.md / deployment.md 索引）
 ├── PRD.md                               # 产品需求文档
 ├── ARCHITECTURE.md                      # 架构设计文档
 ├── CONTRIBUTING.md                      # 本文件
 ├── CHANGELOG.md                         # 变更日志
+├── CLAUDE.md                            # Claude Code 项目级指南（架构契约 + 速记 + house rules）
 └── README.md                            # 项目入口
 ```
 
