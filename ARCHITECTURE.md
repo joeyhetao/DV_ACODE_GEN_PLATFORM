@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.13  
+**版本**：v2.14  
 **状态**：已确认  
-**日期**：2026-05-02  
+**日期**：2026-05-07  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -18,6 +18,7 @@
 - v2.10 → v2.11：初始实现对齐——API v1 端点平铺于 api/v1/（删除 endpoints/ 子目录），贡献者与管理员审核端点合并为单文件（§3.10.4）；code-types 端点路径更正为 /api/v1/generate/code-types（§3.14.4、§5.1）；流水线接口类更名为 PipelineInput/PipelineResult，Step 1 改为 IntentNormalize（§3.15.2、§3.15.3）；备份 volume 更正为 backend_backups（§3.13.2）；迁移文件合并为 001_initial_schema.py（§7）
 - v2.11 → v2.12：流水线鲁棒性与 thinking 模型支持——OpenAI 兼容客户端拆为"选模板 + 填参数"两步纯文本调用，规避 GLM-4.7 等 thinking 模型 reasoning_tokens 截断问题，max_tokens 提升至 4096（§3.12.2、§3.12.3）；Pipeline 在 RAG 后增加关键词补充召回、意图正则参数提取、LLM 失败 fallback 三层兜底（§3.15.3）；lib_manager 用 `uuid.uuid5(NAMESPACE_DNS, template.id)` 派生确定性 Qdrant point ID，修复 rebuild 重复 point bug（§3.8）；新增 docker-compose.hotreload.yml 开发 overlay（§8.2）；nginx 入口启用 Docker 内置 resolver `127.0.0.11 valid=10s` + 变量化 proxy_pass，解决 backend 容器重启后 nginx 缓存旧 IP 导致 502 的问题（§8.3）；前端容器 nginx 对 index.html 强制 `no-cache` 响应头，确保 hash 化 bundle 升级后浏览器立即拉新（§8.3）
 - v2.12 → v2.13：方案 3 两步式 UI 落地——`run_pipeline` 拆为 `pipeline_preview` + `pipeline_render`（§3.15.3），新增 `/api/v1/generate/preview` 端点 + 增强 `/api/v1/generate/render` 端点（§5.1）；`_map_params` 重写为 `_map_params_with_source`，每参数标注 5 类来源（signal_list / regex / llm / default / placeholder）（§3.15.4）；新增 `confidence_source` 字段区分 LLM 主动选中 vs RAG fallback vs 意图缓存命中（§3.15.5）；前端引入 ConfirmationPanel + ParametersForm 两步式确认面板（§3.16），意图缓存命中走 `quick_render=true` 路径自动跳过确认；既有 `/generate` 端点改为内部调 preview+render，对 batch_tasks 调用方零变更
+- v2.13 → v2.14：参数 expr_type 元数据 + 标识符规范化层落地——模板 YAML 的 `parameters[].expr_type` 字段声明参数语法类型（`sv_identifier` / `sv_identifier_list` / `sv_boolean_expr` / `sv_bins_expr`）；新增 `services/core/identifier.py`（SV 标识符 sanitize + IDENTIFIER_PARAMS 兜底白名单 + `construct_group_name`）和 `services/core/expr_validator.py`（轻量手写状态机校验布尔/列表/bins 表达式）；`_map_params_with_source` 末尾追加 expr_type-driven Step 7（覆盖所有 5 类源，sv_identifier 类参数被静默清洗、布尔/bins 类校验失败仅打 `validation_error`）（§3.15.5 新增）；`PreviewResponse.params` schema 新增 `sanitized` / `expr_type` / `validation_error` 三字段供前端徽标提示；前端镜像 `frontend/src/utils/exprValidators.ts`（§7）；§5.1 端点表补齐 `/api/v1/generate/preview`、`/api/v1/auth/register`、`/api/v1/auth/me`、`/api/health`，移除不存在的 `/api/v1/auth/refresh`；`lib_manager.py import` 在参数缺 `expr_type` 时输出 WARN 提示
 
 ---
 
@@ -1212,6 +1213,7 @@ class PipelineInput:
 
 @dataclass
 class PipelineResult:
+    """legacy 一步式返回（run_pipeline / batch_tasks 用）。"""
     status: str            # "success"
     code: str
     template_id: str
@@ -1224,7 +1226,40 @@ class PipelineResult:
     params_used: dict
     cache_hit: bool
     intent_cache_hit: bool
+
+@dataclass
+class PreviewResult:
+    """两步式第一步：仅返回模板候选 + 参数预填，不渲染、不写代码缓存。"""
+    template_id: str
+    template_name: str
+    template_version: str
+    confidence: float
+    confidence_source: str         # "llm_step1" | "rag_fallback" | "intent_cache"
+    rag_candidates: list[dict]     # 含每候选的 parameters 供前端切换
+    params: dict[str, dict]        # {name: {value, source, required, description, type,
+                                   #          sanitized?, expr_type?, validation_error?}}
+    intent_hash: str
+    normalized_intent: str
+    quick_render: bool = False     # intent_cache 命中 → True，前端跳确认面板
+
+@dataclass
+class RenderInput:
+    """两步式第二步：用户在确认面板编辑后回传的最终参数。"""
+    template_id: str
+    template_version: str
+    params: dict                   # value-only dict
+    intent_hash: str | None = None # 透传以关联意图历史
+    confidence: float = 0.0
+    normalized_intent: str = ""
 ```
+
+**入口对照**：
+
+| 入口 | 调用方 | 行为 |
+|---|---|---|
+| `pipeline_preview(PipelineInput, db) → PreviewResult` | `/api/v1/generate/preview` | 跑 Step 1–6（含参数 5 源标注）；不渲染、不写缓存 |
+| `pipeline_render(RenderInput, db) → (code, cache_hit)` | `/api/v1/generate/render` | 跑 Step 7–8；写代码缓存与意图历史（`intent_hash` 非空时） |
+| `run_pipeline(PipelineInput, db) → PipelineResult` | `/api/v1/generate`（legacy）+ Celery batch | 内部串行调上面两步，对调用方零变更 |
 
 #### 3.15.3 流水线步骤（含兜底链）
 
@@ -1290,7 +1325,49 @@ Step 8: CacheWrite
 
 #### 3.15.4 端点层变薄
 
-端点层仅负责：HTTP 请求解析 → 构造 `GenerationRequest` → 调用 `pipeline.run()` → HTTP 响应序列化，不含任何业务逻辑。批量任务（Celery）的每行处理也调用同一个 `pipeline.run()`，与单条生成共享完全相同的代码路径。
+端点层仅负责：HTTP 请求解析 → 构造 `PipelineInput` / `RenderInput` → 调用 `pipeline_preview` / `pipeline_render`（或 legacy `run_pipeline`）→ HTTP 响应序列化，不含任何业务逻辑。批量任务（Celery）每行处理仍走 `run_pipeline`，与单条生成共享完全相同的代码路径。
+
+#### 3.15.5 expr_type 驱动的校验与规范化层
+
+`_map_params_with_source` 末尾追加一道独立 pass，对前面 5 类源（llm / regex / signal_list / default / placeholder）产出的参数值统一做语法兜底，确保任何来源的"脏值"都不会污染 Jinja2 渲染。
+
+**模板侧契约**：YAML 的每个 `parameters[]` 元素声明 `expr_type`：
+
+| expr_type | 语义 | Pass 行为 |
+|---|---|---|
+| `sv_identifier` | 单个 SV 标识符（信号名 / 模块名 / 状态枚举值等） | 过 `sanitize_sv_identifier`：剥离非法字符、首字符必须是字母或下划线、空值回退为 `<参数名>_default`；修改后置 `meta["sanitized"] = true` |
+| `sv_identifier_list` | 逗号分隔的标识符列表（如 `IDLE, FETCH, DECODE`） | 逐项 sanitize 后重组；任一项被改动则置 `sanitized = true` |
+| `sv_boolean_expr` | SV 布尔表达式（如 `awvalid && ready`） | 过 `validate_sv_boolean_expr`：检查字符集、括号配对、不出现重复算子；不修改值，仅在失败时置 `meta["validation_error"]` |
+| `sv_bins_expr` | covergroup bins 表达式（如 `{0:255}`、`{[10:100], 200}`） | 过 `validate_sv_bins_expr`：花括号配对、范围语法、整数字面量；不修改值，仅在失败时置 `validation_error` |
+| `integer` / `free_text` / 未声明 / 未知 | 按 Pydantic / 前端 / 模板默认行为 | 跳过 |
+
+**后向兼容**：旧模板未声明 `expr_type` 时，pass 按参数名落入 `IDENTIFIER_PARAMS` 白名单（`enable / data / valid / ready / signal / state_sig / target / start_event / end_event / module_name / group_name / clk / rst / rst_n / from_state / to_state`），按 `sv_identifier` 处理；不在白名单的参数跳过校验，行为与历史一致。`lib_manager.py import` 在导入时对每个未声明 `expr_type` 的参数输出 `WARN` 行，引导团队补齐元数据。
+
+**模块拆分**：
+
+```
+backend/app/services/core/
+├── identifier.py        # sanitize_sv_identifier / construct_group_name / IDENTIFIER_PARAMS
+└── expr_validator.py    # validate_sv_boolean_expr / validate_sv_identifier_list /
+                         # validate_sv_bins_expr / EXPR_TYPE_DISPATCH 路由表
+```
+
+`_map_params_with_source` 内部从 `EXPR_TYPE_DISPATCH[expr_type]` 取出对应 validator；新增 expr_type 时只需在 dispatch 表加一行，pipeline 主流程零变更。
+
+**前端镜像**：`frontend/src/utils/exprValidators.ts` 实现同名函数，用于 ConfirmationPanel 在用户编辑参数时即时反馈，避免空跑后端 `/render`。后端 pass 是确定性最终防线——前端校验仅作 UX 优化。
+
+**与确定性契约的关系**：本 pass 不改变"LLM 不写代码"的根本约束，只把"模板渲染前的输入空间"从"任意字符串"收紧为"模板声明允许的语法形式"。Jinja2 `StrictUndefined` 仍是兜底，但许多 LLM 失误（在标识符位置塞入空格、注释、CJK 字符等）现在会在此 pass 静默修正或被 `validation_error` 拦截，前端 ConfirmationPanel 据此呈现提示徽标（见 §3.16）。
+
+#### 3.16 两步式确认面板（前端方案 3）
+
+`/api/v1/generate/preview` 返回的 `params` 字典每项含 `value` + `source` + 可选的 `sanitized` / `expr_type` / `validation_error`，前端 `ConfirmationPanel` + `ParametersForm` 组件据此呈现：
+
+- **5 色徽标**对应 5 类源：`llm`（蓝） / `regex`（绿） / `signal_list`（青） / `default`（灰） / `placeholder`（红警示）
+- **sanitized 标记** → 灰色"已规范化"角标，鼠标悬停展示原始值
+- **validation_error** → 红色错误条 + 错误原文（来自 expr_validator）
+- **候选模板切换**：`rag_candidates[]` 每项含 `parameters` 子段，用户切换候选时前端直接套用对应模板的参数预填，无需再调后端
+
+**quick_render 短路**：意图缓存命中时 preview 返回 `quick_render=true`，前端跳过确认面板直接调 `/render` 输出代码；其余情况一律展示确认面板，用户编辑后再调 `/render`。
 
 ---
 
@@ -1596,8 +1673,9 @@ WHERE is_default = true;
 | 方法 | 路径 | 描述 | 权限 |
 |------|------|------|------|
 | GET | `/api/v1/generate/code-types` | 获取已注册代码类型列表（前端动态读取，无需硬编码） | 普通用户+ |
-| POST | `/api/v1/generate` | 单条代码生成（完整 RAG 链路） | 普通用户+ |
-| POST | `/api/v1/generate/render` | 参数变更后重新渲染（不走 LLM/RAG） | 普通用户+ |
+| POST | `/api/v1/generate` | 单条代码生成（legacy 一步式，内部串行调 preview+render） | 普通用户+ |
+| POST | `/api/v1/generate/preview` | 两步式第一步：返回模板候选 + 参数预填（含 5 类源标识与 sanitized/validation_error） | 普通用户+ |
+| POST | `/api/v1/generate/render` | 两步式第二步：用户确认参数后渲染 + 写代码缓存（`intent_hash` 非空时也写 GenerationRecord） | 普通用户+ |
 | POST | `/api/v1/batch/upload` | 上传 Excel 创建批量任务 | 普通用户+ |
 | POST | `/api/v1/batch/preflight` | 上传后前置信度预检（轻量，仅Stage1） | 普通用户+ |
 | GET | `/api/v1/batch/{job_id}` | 查询批量任务状态 | 普通用户+ |
@@ -1613,7 +1691,9 @@ WHERE is_default = true;
 | GET | `/api/v1/admin/users` | 用户列表 | 超管 |
 | PUT | `/api/v1/admin/users/{id}/role` | 修改用户角色 | 超管 |
 | POST | `/api/v1/auth/login` | 登录获取 JWT | 公开 |
-| POST | `/api/v1/auth/refresh` | 刷新 Token | 认证用户 |
+| POST | `/api/v1/auth/register` | 自助注册账号（默认 role=user） | 公开 |
+| GET | `/api/v1/auth/me` | 获取当前登录用户信息 | 登录用户+ |
+| GET | `/health`、`/api/health` | 健康检查（容器探针 + 反代探活） | 公开 |
 | GET | `/api/v1/admin/llm/configs` | 获取所有模型配置（api_key 只返回掩码） | 超管 |
 | POST | `/api/v1/admin/llm/configs` | 新增模型配置 | 超管 |
 | PUT | `/api/v1/admin/llm/configs/{id}` | 更新配置（api_key 留空则不覆盖） | 超管 |
@@ -1844,11 +1924,13 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   └── notification.py           # 通知响应 Schema
 │   │   ├── services/
 │   │   │   │                             # ── 三层服务子包结构 ──
-│   │   │   ├── core/                     # 核心算法层（代码类型无感知，纯函数级）
-│   │   │   │   ├── pipeline.py           # GenerationPipeline 8步编排器（新增）
+│   │   │   ├── core/                     # 核心算法层（代码类型无感知，纯函数级，禁调 LLM）
+│   │   │   │   ├── pipeline.py           # 流水线编排器（pipeline_preview / pipeline_render / run_pipeline）
 │   │   │   │   ├── cache.py              # Redis 缓存读写（原 cache_service.py）
 │   │   │   │   ├── renderer.py           # Jinja2 渲染 + StrictUndefined（原 renderer/jinja_renderer.py）
-│   │   │   │   └── dedup.py              # 模板查重逻辑（精确名称 + 语义向量）
+│   │   │   │   ├── dedup.py              # 模板查重逻辑（精确名称 + 语义向量）
+│   │   │   │   ├── identifier.py         # SV 标识符 sanitize + IDENTIFIER_PARAMS 兜底白名单（§3.15.5）
+│   │   │   │   └── expr_validator.py     # sv_boolean_expr / sv_identifier_list / sv_bins_expr 校验 + EXPR_TYPE_DISPATCH（§3.15.5）
 │   │   │   ├── rag/                      # RAG 检索层（结构不变）
 │   │   │   │   ├── stage1_hybrid.py      # Qdrant 混合检索（dense+sparse RRF）
 │   │   │   │   ├── stage2_colbert.py     # ColBERT MaxSim 精排
@@ -1949,6 +2031,9 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   ├── contributionApi.ts        # 贡献 API 封装
 │   │   │   ├── intentBuilderApi.ts       # 场景构建器 API 封装
 │   │   │   └── llmConfigApi.ts           # LLM 配置管理 API 封装（新增）
+│   │   ├── utils/
+│   │   │   ├── validateParam.ts          # 参数表单基础校验（前端）
+│   │   │   └── exprValidators.ts         # 后端 expr_validator 的前端镜像（§3.15.5）
 │   │   ├── hooks/
 │   │   ├── types/
 │   │   └── App.tsx
