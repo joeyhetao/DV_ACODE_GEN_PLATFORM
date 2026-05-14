@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
+from app.core.config import get_settings
 from app.services.core.cache import (
     get_generation_cache,
     set_generation_cache,
@@ -21,8 +22,25 @@ from app.services.core.identifier import (
 from app.services.core.renderer import render_template
 from app.services.intent.normalizer import normalize_intent
 from app.services.intent.history import lookup_history, save_history
-from app.services.rag.engine import rag_retrieve
+from app.services.rag.engine import rag_retrieve, dense_top1_score
 from app.services.llm.factory import get_default_llm_client
+
+
+class OffTopicIntentError(ValueError):
+    """输入与 IC 验证域无关——由 RAG 之后的 dense 余弦阈值闸触发。
+
+    判定信号：原文 → bge-m3 dense embedding → Qdrant top1 余弦 < 阈值。
+    用 original_intent（不是 normalized）做 embedding——normalized 会被 LLM 改写成
+    "无法判断类型"之类元说明，意外抬高 off-topic 段分数；原文保留了"远离 IC 域"语义。
+
+    继承 ValueError 让 generate.py 旧的 except ValueError 兜底，
+    但端点应优先 catch 本异常以返回结构化 detail。
+    """
+    def __init__(self, top_dense_score: float = 0.0, threshold: float = 0.0):
+        self.top_dense_score = top_dense_score
+        self.threshold = threshold
+        self.detector = "rag_dense_threshold"
+        super().__init__("输入似乎与 IC 验证需求无关")
 
 
 @dataclass
@@ -85,6 +103,24 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
     不渲染、不写代码缓存。意图缓存命中时返回 quick_render=True 让前端直接调 render。
     """
     from app.models.template import Template
+
+    # Off-topic 早返：用原文（不是 normalized）做 dense 余弦判定，跳过后续整条流水线。
+    # 用原文的理由：LLM normalize 会把 off-topic 输入改写成"无法判断类型"之类元说明，
+    # 那串字符的 embedding 反而抬高了 off-topic 段分数；原文保留"远离 IC 域"语义。
+    # 阈值经 calibrate_offtopic_threshold.py 在 offtopic_corpus.yaml 上校准得出。
+    settings = get_settings()
+    if settings.offtopic_gate_enabled:
+        top_dense = await dense_top1_score(inp.original_intent, code_type=inp.code_type)
+        if top_dense < settings.offtopic_dense_threshold:
+            print(
+                f"[Pipeline] off-topic dense gate: top1={top_dense:.4f} "
+                f"< threshold={settings.offtopic_dense_threshold}",
+                flush=True,
+            )
+            raise OffTopicIntentError(
+                top_dense_score=top_dense,
+                threshold=settings.offtopic_dense_threshold,
+            )
 
     # Step 1: Intent Normalize
     normalized, intent_hash = await normalize_intent(inp.original_intent, db)
@@ -163,7 +199,13 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
     if selection.template_id and selection.template_id.lower() not in ("none", "", "null"):
         template = await db.get(Template, selection.template_id)
 
-    # Fallback: LLM 选不到时取 RAG 第一名
+    # Off-topic 检测的唯一信号是 normalize_intent 的 sentinel 输出（在本函数早期已检查并早返）。
+    # 这里**不**再用 RAG cross-encoder 分数作为闸——实测发现 reranker 对不同 code_type 子语料
+    # 的绝对分数分布完全不一致（assertion 给 0.833、coverage 直接给 1.0），无法跨语料校准；
+    # 用任何阈值都会误伤 marginal 真请求（如"4 位 state_reg 0-15 覆盖率"被打到 0.833）。
+
+    # Fallback: LLM 选不到时取 RAG 第一名（marginal 真请求；保留 LLM 上报的 confidence，
+    # 不再用 RAG 分数覆盖——RAG cross-encoder 分数是排序指标，不是"确信度"指标）。
     if not template:
         fallback_id = rag_candidates[0]["template_id"]
         template = await db.get(Template, fallback_id)
@@ -173,7 +215,7 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
             selection = TemplateSelectionOutput(
                 template_id=fallback_id,
                 param_mapping=selection.param_mapping,
-                confidence=float(rag_candidates[0]["score"]),
+                confidence=selection.confidence,
             )
             confidence_source = "rag_fallback"
 

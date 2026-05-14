@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.services.core.pipeline import (
+    OffTopicIntentError,
     PipelineInput,
     PreviewResult,
     RenderInput,
@@ -18,6 +19,7 @@ from app.services.core.pipeline import (
     pipeline_preview,
     pipeline_render,
 )
+from app.schemas.intent import TemplateSelectionOutput
 
 
 # ── _map_params_with_source 单测（纯函数，最易测）───────────────────────
@@ -270,3 +272,175 @@ async def test_pipeline_render_template_not_found_raises():
     req = RenderInput(template_id="nonexistent", template_version="1.0.0", params={})
     with pytest.raises(ValueError, match="模板不存在"):
         await pipeline_render(req, fake_db)
+
+
+# ── pipeline_preview 双信号合议闸单测 ────────────────────────────────
+
+def _make_rag_candidate(template_id: str, score: float, parameters=None):
+    """构造 rag_retrieve 返回结构：每条 candidate 含 template_id/name/description/score/template。"""
+    fake_template = MagicMock()
+    fake_template.parameters = parameters or []
+    fake_template.id = template_id
+    fake_template.name = f"Template {template_id}"
+    fake_template.version = "1.0.0"
+    return {
+        "template_id": template_id,
+        "name": f"Template {template_id}",
+        "description": f"desc-{template_id}",
+        "score": score,
+        "template": fake_template,
+    }
+
+
+def _make_preview_inp():
+    return PipelineInput(
+        original_intent="some user input",
+        code_type="assertion",
+        clk="clk",
+        rst="rst_n",
+        rst_polarity="低有效",
+        signals=[],
+    )
+
+
+def _patch_preview_deps(rag_candidates, llm_selection, db_get_return_value=None, dense_score=0.9):
+    """统一 patch pipeline_preview 上游。
+
+    dense_score 默认 0.9（高于阈值），off-topic 闸不触发；
+    需要测 off-topic 行为时传低值（< 0.44）。
+    """
+    from contextlib import ExitStack
+    stack = ExitStack()
+    stack.enter_context(patch(
+        "app.services.core.pipeline.dense_top1_score",
+        new=AsyncMock(return_value=dense_score),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.normalize_intent",
+        new=AsyncMock(return_value=("normalized text", "hash_abc")),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.lookup_history",
+        new=AsyncMock(return_value=None),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.rag_retrieve",
+        new=AsyncMock(return_value=rag_candidates),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline._keyword_supplement",
+        new=AsyncMock(return_value=[]),
+    ))
+    fake_llm = MagicMock()
+    fake_llm.select_template = AsyncMock(return_value=llm_selection)
+    stack.enter_context(patch(
+        "app.services.core.pipeline.get_default_llm_client",
+        new=AsyncMock(return_value=fake_llm),
+    ))
+    fake_db = MagicMock()
+    fake_db.get = AsyncMock(return_value=db_get_return_value)
+    return stack, fake_db
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_off_topic_dense_threshold_early_returns():
+    """dense_top1_score < threshold → 在 normalize/RAG/LLM 之前就早返 OffTopicIntentError。
+
+    校准结果决定 threshold=0.44；mock dense=0.30 < 0.44，应当抛 OffTopicIntentError。
+    detector="rag_dense_threshold"，携带 top_dense_score 和 threshold 给前端。
+    """
+    rag = [_make_rag_candidate("any_id", score=0.9)]
+    llm_sel = TemplateSelectionOutput(template_id="any_id", param_mapping={}, confidence=0.9)
+    stack, fake_db = _patch_preview_deps(rag, llm_sel, dense_score=0.30)
+    with stack, pytest.raises(OffTopicIntentError) as excinfo:
+        await pipeline_preview(_make_preview_inp(), fake_db)
+
+    assert excinfo.value.detector == "rag_dense_threshold"
+    assert excinfo.value.top_dense_score == 0.30
+    assert excinfo.value.threshold == 0.44  # 跟 config.py 默认一致
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_marginal_intent_falls_back_with_llm_confidence():
+    """LLM step1 没选出 template（marginal 真请求）→ 走 rag_fallback；
+    且 confidence 保留 LLM 上报的 0.0，不再被 RAG cross-encoder 分数覆盖。
+
+    这是真 IC 请求但表述简略的常见路径。即便 RAG top1 分数较低（如 0.7），
+    也不应当被拒——这是 normalize_intent 信任路径（sentinel 没触发）。
+    """
+    rag = [
+        _make_rag_candidate("sva_handshake_timeout_v1", score=0.7),
+        _make_rag_candidate("sva_data_integrity_v1", score=0.3),
+    ]
+    llm_refused = TemplateSelectionOutput(template_id="", param_mapping={}, confidence=0.0)
+
+    fake_db_template = MagicMock()
+    fake_db_template.parameters = []
+    fake_db_template.id = "sva_handshake_timeout_v1"
+    fake_db_template.name = "Template sva_handshake_timeout_v1"
+    fake_db_template.version = "1.0.0"
+
+    stack, fake_db = _patch_preview_deps(rag, llm_refused, db_get_return_value=fake_db_template)
+    with stack:
+        result = await pipeline_preview(_make_preview_inp(), fake_db)
+
+    assert result.template_id == "sva_handshake_timeout_v1"
+    assert result.confidence_source == "rag_fallback"
+    # 关键断言：confidence 是 LLM 上报的 0.0，不再被 RAG 0.95 覆盖
+    assert result.confidence == 0.0
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_off_topic_gate_disabled_skips_check():
+    """offtopic_gate_enabled=False → 即使 dense 分数低于阈值，也跳过闸继续走老路径。
+    紧急逃生通道：若阈值校准误调或语料缺失导致大面积误拒，可立即关闸。"""
+    fake_db_template = MagicMock()
+    fake_db_template.parameters = []
+    fake_db_template.id = "sva_data_integrity_v1"
+    fake_db_template.name = "Template sva_data_integrity_v1"
+    fake_db_template.version = "1.0.0"
+    rag = [_make_rag_candidate("sva_data_integrity_v1", score=0.5)]
+    llm_refused = TemplateSelectionOutput(template_id="", param_mapping={}, confidence=0.0)
+
+    from app.core.config import get_settings
+    settings = get_settings()
+    original = settings.offtopic_gate_enabled
+    settings.offtopic_gate_enabled = False
+    try:
+        # dense=0.10 远低于阈值，但闸关掉 → 不应抛异常
+        from contextlib import ExitStack
+        stack = ExitStack()
+        stack.enter_context(patch(
+            "app.services.core.pipeline.dense_top1_score",
+            new=AsyncMock(return_value=0.10),
+        ))
+        stack.enter_context(patch(
+            "app.services.core.pipeline.normalize_intent",
+            new=AsyncMock(return_value=("normalized text", "hash_abc")),
+        ))
+        stack.enter_context(patch(
+            "app.services.core.pipeline.lookup_history",
+            new=AsyncMock(return_value=None),
+        ))
+        stack.enter_context(patch(
+            "app.services.core.pipeline.rag_retrieve",
+            new=AsyncMock(return_value=rag),
+        ))
+        stack.enter_context(patch(
+            "app.services.core.pipeline._keyword_supplement",
+            new=AsyncMock(return_value=[]),
+        ))
+        fake_llm = MagicMock()
+        fake_llm.select_template = AsyncMock(return_value=llm_refused)
+        stack.enter_context(patch(
+            "app.services.core.pipeline.get_default_llm_client",
+            new=AsyncMock(return_value=fake_llm),
+        ))
+        fake_db = MagicMock()
+        fake_db.get = AsyncMock(return_value=fake_db_template)
+        with stack:
+            result = await pipeline_preview(_make_preview_inp(), fake_db)
+        assert result.template_id == "sva_data_integrity_v1"
+        assert result.confidence_source == "rag_fallback"
+    finally:
+        settings.offtopic_gate_enabled = original

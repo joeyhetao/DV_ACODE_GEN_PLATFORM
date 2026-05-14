@@ -37,6 +37,13 @@ class Settings(BaseSettings):
     rag_stage2_top_k: int = 20
     rag_stage3_top_k: int = 3
 
+    # Off-topic intent gate：原文 → bge-m3 dense → Qdrant top1 余弦 < 阈值 → 422 早返。
+    # 阈值由 backend/scripts/calibrate_offtopic_threshold.py 在 offtopic_corpus.yaml 上校准得出。
+    # 0.44 当前校准结果：off_max=0.4315 / marg_min=0.4516，gap=0.02。
+    # OFFTOPIC_GATE_ENABLED=false 一键关闸退回老行为（紧急逃生通道）。
+    offtopic_gate_enabled: bool = True
+    offtopic_dense_threshold: float = 0.44
+
     # Celery
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"

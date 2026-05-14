@@ -1,0 +1,204 @@
+# ============================================================================
+# Off-topic 闸契约语料
+# ----------------------------------------------------------------------------
+# 本文件是系统对"什么算无关意图、什么算 marginal 真请求"的契约声明。
+# 由 backend/tests/test_offtopic_corpus_mocked.py（每次 PR 跑）和
+# backend/tests/test_offtopic_corpus_real_llm.py（手动 / 未来 CI）共同消费。
+#
+# ── 增长流程（必读）─────────────────────────────────────────────────────────
+#
+# 触发点 A：用户报告误判（最高频）
+#   1. 拿到原文：用户报"真请求被错拒"或"无关请求过了"
+#   2. 复现并定位失效信号（通常是 normalizer sentinel 没触发/误触发）
+#   3. 把原文加进对应段（off_topic 或 marginal_ic），写明 source / reason
+#   4. 先跑 mock 测——预期是 fail（红灯证明语料抓住了真问题）
+#   5. 改 prompt / 代码使其变绿 → PR → CI 永守
+#
+# 触发点 B：新增 code_type 或重大模板库变更（中频）
+#   PR 前 checklist：
+#     □ 新 code_type 至少补 1 条 marginal_ic 边界样本（语料覆盖）
+#     □ 新模板若引入了以前没法生成的场景，补一条对应输入
+#
+# 触发点 C：LLM 模型 / Prompt 重大改动（低频但风险高）
+#   1. 本地跑 `pytest tests/test_offtopic_corpus_real_llm.py --real-llm -v`
+#   2. 看分类率：off_topic 全 422、marginal_ic 全 200
+#   3. 若分类率下降，先修 prompt 而不是改语料
+#   4. 实在无法修就标 flaky: true 并在 reason 里写明原因——保留历史
+#
+# ── 字段约定 ────────────────────────────────────────────────────────────────
+#   id            必填，蛇形命名，唯一
+#   input         必填，用户原文
+#   code_types    off_topic 用；列表，会对每个 code_type 跑一次
+#   code_type     marginal_ic 用；单个字符串
+#   signals       marginal_ic 可选；信号列表
+#   added         必填，添加日期 "YYYY-MM-DD"
+#   source        必填，来源（"initial seed" / "user report 2026-XX-XX" / "code_type 新增" 等）
+#   reason        必填，6 个月后能看懂"这条为啥在这"
+#   flaky         可选，true 表示真 LLM 测可能不稳定，real-llm 套件会 warn 但不 fail
+#
+# ── 维护准则 ────────────────────────────────────────────────────────────────
+#   - append-only 优先：除非彻底改设计契约，不要删除已有样本——它们是历史回归的疫苗
+#   - 测试断言保持松散：不绑具体 template_id（避免模板改名破测）
+# ============================================================================
+
+off_topic:
+  - id: poem_chinese_classical
+    input: "帮我写一首七言律诗咏春"
+    code_types: [assertion, coverage]
+    added: "2026-05-13"
+    source: "initial seed (user report)"
+    reason: "中文古典诗词——纯文学，零 IC 词汇，应被 sentinel 拦下"
+
+  - id: cooking_recipe
+    input: "推荐一道适合冬天的菜谱给我"
+    code_types: [assertion, coverage]
+    added: "2026-05-13"
+    source: initial seed
+    reason: "生活闲聊——食谱与硬件验证无关"
+
+  - id: weather_query
+    input: "今天北京天气怎么样"
+    code_types: [assertion, coverage]
+    added: "2026-05-13"
+    source: initial seed
+    reason: "天气查询——典型非 IC 日常问题"
+
+  - id: math_problem
+    input: "求解方程 x^2 + 3x - 4 = 0 的根"
+    code_types: [assertion, coverage]
+    added: "2026-05-13"
+    source: initial seed
+    reason: "纯数学题——虽然涉及方程，但与 IC 信号/协议/覆盖率无关"
+
+  - id: novel_writing
+    input: "帮我写一个科幻短篇小说，主角是 AI"
+    code_types: [assertion, coverage]
+    added: "2026-05-13"
+    source: initial seed
+    reason: "文学创作——小说不是验证需求"
+
+  - id: ppt_help
+    input: "请帮我做一份产品介绍 PPT"
+    code_types: [assertion, coverage]
+    added: "2026-05-13"
+    source: initial seed
+    reason: "办公文档求助——与代码生成无关"
+
+  - id: news_briefing
+    input: "今天有什么科技新闻"
+    code_types: [assertion, coverage]
+    added: "2026-05-13"
+    source: initial seed
+    reason: "新闻聚合——信息查询而非验证生成"
+
+  - id: web_dev_question
+    input: "用 React 写一个登录表单组件"
+    code_types: [assertion, coverage]
+    added: "2026-05-13"
+    source: initial seed
+    reason: "代码请求但属软件开发，非 IC 验证（关键边界：含\"写\"\"组件\"等技术词但非硬件）"
+
+  - id: ad_copy
+    input: "帮我写一段产品广告文案，主打省电环保"
+    code_types: [assertion, coverage]
+    added: "2026-05-13"
+    source: initial seed
+    reason: "广告文案——市场材料，非验证需求"
+
+  - id: greeting_smalltalk
+    input: "你好，今天过得怎么样"
+    code_types: [assertion, coverage]
+    added: "2026-05-13"
+    source: initial seed
+    reason: "纯闲聊——无任何任务意图"
+
+marginal_ic:
+  - id: valid_ready_stable_short
+    input: "valid 信号在 ready 拉高前必须保持稳定"
+    code_type: assertion
+    signals:
+      - {name: valid, width: 1, role: valid}
+      - {name: ready, width: 1, role: ready}
+    added: "2026-05-13"
+    source: initial seed
+    reason: "AXI 风格短表述——含明确信号 valid/ready，应当走通进确认面板"
+
+  - id: state_reg_value_coverage
+    input: "4 位状态信号 state_reg 的 0-15 全部取值覆盖率统计"
+    code_type: coverage
+    signals:
+      - {name: state_reg, width: 4, role: state}
+    added: "2026-05-13"
+    source: initial seed
+    reason: "覆盖率请求——明确位宽和取值范围，pipeline 应当落 cov_value_coverage_v1"
+
+  - id: handshake_timeout_brief
+    input: "握手超时检测，最多等 8 个周期"
+    code_type: assertion
+    signals: []
+    added: "2026-05-13"
+    source: initial seed
+    reason: "断言意图清晰但信号列表为空——pipeline 应当 fallback 而非拒"
+
+  - id: fsm_transition_terse
+    input: "FSM 从 IDLE 跳到 ACTIVE 必须经过 PREP"
+    code_type: assertion
+    signals: []
+    added: "2026-05-13"
+    source: initial seed
+    reason: "FSM 状态转换断言——口语化但含明确状态名"
+
+  - id: data_integrity_protect
+    input: "wr_en 为低时 data_reg 不能被改"
+    code_type: assertion
+    signals:
+      - {name: wr_en, width: 1, role: enable}
+      - {name: data_reg, width: 32, role: data}
+    added: "2026-05-13"
+    source: initial seed
+    reason: "数据完整性常见场景——口语化但 IC 词汇密集"
+
+  - id: cross_coverage_brief
+    input: "axi 读写通道的 burst type 和 size 交叉覆盖"
+    code_type: coverage
+    signals: []
+    added: "2026-05-13"
+    source: initial seed
+    reason: "交叉覆盖率——含协议术语 burst/AXI，应走 cov_cross_coverage_v1"
+
+  - id: reset_behavior_short
+    input: "复位释放后寄存器初值应该是 0"
+    code_type: assertion
+    signals: []
+    added: "2026-05-13"
+    source: initial seed
+    reason: "复位行为断言——含明确语义但缺信号名"
+
+  - id: transition_coverage_terse
+    input: "fsm_state 的所有状态转移采样"
+    code_type: coverage
+    signals:
+      - {name: fsm_state, width: 3, role: state}
+    added: "2026-05-13"
+    source: initial seed
+    reason: "状态转移覆盖率——口语化但语义清晰"
+
+  - id: max_delay_short
+    input: "req 拉高到 ack 返回不超过 16 拍"
+    code_type: assertion
+    signals:
+      - {name: req, width: 1, role: req}
+      - {name: ack, width: 1, role: ack}
+    added: "2026-05-13"
+    source: initial seed
+    reason: "最大延迟时序断言——含信号名 + 周期数"
+
+  - id: protocol_handshake_coverage
+    input: "valid/ready 握手成功率覆盖"
+    code_type: coverage
+    signals:
+      - {name: valid, width: 1, role: valid}
+      - {name: ready, width: 1, role: ready}
+    added: "2026-05-13"
+    source: initial seed
+    reason: "协议握手覆盖率——明确属于 IC 验证范畴"

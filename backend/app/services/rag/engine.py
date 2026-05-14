@@ -1,12 +1,43 @@
 from __future__ import annotations
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+from qdrant_client.models import Filter, FieldCondition, MatchValue
 
 from app.core.config import get_settings
+from app.core.vector_store import get_qdrant
 from app.services.embedding_client import get_embedding_client
 from app.services.rag.stage1_hybrid import stage1_hybrid_search
 from app.services.rag.stage2_colbert import stage2_colbert_rerank
 from app.services.rag.stage3_reranker import stage3_rerank
+
+
+async def dense_top1_score(query_text: str, code_type: str | None = None) -> float:
+    """专为 off-topic 阈值闸用：单独发一次 dense-only Qdrant 查询，取 top1 余弦分数。
+
+    返回的是 bge-m3 dense L2 归一化点积（绝对相似度），跨语料稳定，可固定阈值。
+    与 stage1_hybrid 的 RRF 融合分数不同——RRF 是 rank 融合产物，不可校准。
+    """
+    embed_client = get_embedding_client()
+    qdrant = get_qdrant()
+    settings = get_settings()
+
+    embed_result = await embed_client.embed([query_text], modes=["dense"])
+    dense_vec = embed_result["dense"][0]
+
+    query_filter = None
+    if code_type:
+        query_filter = Filter(
+            must=[FieldCondition(key="code_type", match=MatchValue(value=code_type))]
+        )
+
+    res = await qdrant.query_points(
+        collection_name=settings.qdrant_collection,
+        query=dense_vec,
+        using="dense",
+        limit=1,
+        query_filter=query_filter,
+    )
+    return float(res.points[0].score) if res.points else 0.0
 
 
 async def rag_retrieve(

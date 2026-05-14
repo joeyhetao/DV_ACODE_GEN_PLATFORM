@@ -19,12 +19,23 @@ from app.schemas.generate import (
     RAGCandidateWithParams,
 )
 from app.services.core.pipeline import (
+    OffTopicIntentError,
     PipelineInput,
     RenderInput,
     run_pipeline,
     pipeline_preview,
     pipeline_render,
 )
+
+
+def _off_topic_detail(e: OffTopicIntentError) -> dict:
+    return {
+        "type": "off_topic",
+        "message": "输入似乎与 IC 验证需求无关。请描述要验证的信号、协议或具体属性。",
+        "detector": e.detector,
+        "top_dense_score": round(e.top_dense_score, 4),
+        "threshold": e.threshold,
+    }
 from app.services.core.renderer import render_template
 from app.services.registry import get_registry
 
@@ -53,6 +64,8 @@ async def generate(
 
     try:
         result = await run_pipeline(inp, db)
+    except OffTopicIntentError as e:
+        raise HTTPException(status_code=422, detail=_off_topic_detail(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
@@ -117,6 +130,8 @@ async def preview(
 
     try:
         result = await pipeline_preview(inp, db)
+    except OffTopicIntentError as e:
+        raise HTTPException(status_code=422, detail=_off_topic_detail(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
