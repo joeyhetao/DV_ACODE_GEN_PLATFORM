@@ -25,19 +25,27 @@ class CodeTypeRegistry:
 
     def _load(self) -> None:
         code_types_dir = _DATA_DIR / "code_types"
+        # 单文件失败不影响整体启动：YAML 损坏 / 必填字段缺失 → 跳过该文件并打日志，
+        # 已加载的 code_types 仍生效。避免一处手抖整个 backend 起不来。
         for yaml_path in sorted(code_types_dir.glob("*.yaml")):
-            raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
-            ct = CodeTypeDefinition(
-                id=raw["id"],
-                display_name=raw["display_name"],
-                excel_sheet_name=raw["excel_sheet_name"],
-                excel_schema_file=raw["excel_schema_file"],
-                signal_roles=raw.get("signal_roles", []),
-                normalization_pattern=raw["normalization_pattern"],
-                scenario_templates_file=raw["scenario_templates_file"],
-                subcategories=raw.get("subcategories", []),
-            )
-            self._types[ct.id] = ct
+            try:
+                raw = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+                ct = CodeTypeDefinition(
+                    id=raw["id"],
+                    display_name=raw["display_name"],
+                    excel_sheet_name=raw["excel_sheet_name"],
+                    excel_schema_file=raw["excel_schema_file"],
+                    signal_roles=raw.get("signal_roles", []),
+                    normalization_pattern=raw["normalization_pattern"],
+                    scenario_templates_file=raw["scenario_templates_file"],
+                    subcategories=raw.get("subcategories", []),
+                )
+                self._types[ct.id] = ct
+            except (yaml.YAMLError, KeyError, TypeError) as e:
+                print(
+                    f"[WARN] registry: skipping {yaml_path.name} due to {type(e).__name__}: {e}",
+                    flush=True,
+                )
 
     def get(self, code_type_id: str) -> CodeTypeDefinition:
         if code_type_id not in self._types:
