@@ -1,7 +1,7 @@
 services:
   embedding_service:
     environment:
-      - EMBED_MODEL=BAAI/bge-small-zh-v1.5
+      - EMBED_MODEL=BAAI/bge-m3
       - RERANK_MODEL=BAAI/bge-reranker-v2-m3
       - DEVICE=cpu
     deploy: {}
