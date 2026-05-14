@@ -523,6 +523,18 @@ docker compose exec backend pytest tests/test_offtopic_corpus_mocked.py -v
 docker compose exec backend pytest tests/test_offtopic_corpus_real_llm.py --real-llm -v
 ```
 
+### 11.4 周期性语料增量（建议运维节奏）
+
+`触发点 A` 是被动的——只有用户报告才补。为防"沉默漂移"（用户误拒不上报，accuracy 在统计层面下降），建议每 4 周做一次主动 sampling：
+
+1. 从最近 4 周 `generation_records` 表里筛 `confidence < 0.5` 或返 422 的 intent_hash
+2. 拉对应原文（运维需提前确认日志合规：原文是否可保留 / 是否需要脱敏）
+3. 每段抽 10 条人工评判 `off_topic` vs `marginal_ic`
+4. 把"模型判错的"按 §11.1 流程加进 `offtopic_corpus.yaml`
+5. 跑校准脚本看分布；偏移大就重新调阈值并跟一次真 LLM 套件
+
+**不要在代码里硬编码这条流程的频率**。这是数据工程职责，进 ops runbook 即可——本节作为一份"未来想到再做"的备忘。
+
 详细 schema 字段约定见 `backend/tests/data/offtopic_corpus.yaml` 文件头注释。
 
 ---

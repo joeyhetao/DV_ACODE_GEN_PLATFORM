@@ -30,7 +30,7 @@ Entrypoints: frontend `http://localhost/`, API `http://localhost/api/`, OpenAPI 
 cd backend
 python -m venv .venv && source .venv/bin/activate   # or .venv\Scripts\activate on Windows
 pip install -r requirements.txt
-docker compose up -d postgres redis qdrant          # infra only
+docker compose up -d postgres redis qdrant embedding_service   # infra only; embedding_service is a separate container (bge-m3), required for RAG
 alembic upgrade head
 uvicorn app.main:app --reload --port 8000
 ```
@@ -47,11 +47,13 @@ docker compose exec backend pytest tests/test_pipeline_preview_render.py::test_n
 # Or host-native
 cd backend && pytest tests/ -v
 
-# Off-topic regression corpus — real-LLM mode (requires llm_configs default row)
+# Off-topic regression corpus — mocked (CI default; tests pipeline routing logic only)
+docker compose exec backend pytest tests/test_offtopic_corpus_mocked.py -v
+# Off-topic regression corpus — real-LLM mode (requires llm_configs default row; tests bge-m3 classification accuracy end-to-end)
 docker compose exec backend pytest tests/test_offtopic_corpus_real_llm.py --real-llm -v
 ```
 
-`tests/data/offtopic_corpus.yaml` is the contract for "what counts as off-topic vs marginal IC". When you hit a misclassification, add a sample and let the mock suite enforce it forever. See `CONTRIBUTING.md` §11 for the growth workflow.
+`tests/data/offtopic_corpus.yaml` is the contract for "what counts as off-topic vs marginal IC". The mocked suite (`test_offtopic_corpus_mocked.py`) is the always-on regression — when you hit a misclassification, add a sample and let it enforce the routing forever. The real-LLM suite is the periodic accuracy probe against the live embedding model. See `CONTRIBUTING.md` §11 for the growth workflow.
 
 ### Template library CLI (`backend/lib_manager.py`)
 
@@ -81,10 +83,12 @@ npm run lint     # ESLint with --max-warnings 0
 
 **Off-topic inputs are explicitly rejected with HTTP 422**, not silently fall back to placeholder code. The gate lives at the top of `pipeline_preview`: `dense_top1_score(original_intent, code_type) < offtopic_dense_threshold` → `OffTopicIntentError`. Threshold is calibrated empirically against `backend/tests/data/offtopic_corpus.yaml`; rerun `backend/scripts/calibrate_offtopic_threshold.py` after major template-library changes.
 
+**RAG 检索为空 ≠ off-topic**. 通过了 dense 闸但三阶段检索仍返空 → `EmptyRetrievalError` → **HTTP 503**（基础设施异常，让 SRE 排查 Qdrant / embedding service）。不要把这种情况降级为 422，那是用户问题；503 才是系统问题。两条错误路径都在 [api/v1/generate.py](backend/app/api/v1/generate.py) 的 except 链里独立处理，不要泛化为 `except ValueError`。
+
 Four-layer determinism guard:
 
-1. **Cache** — Redis `cache:{sha256(template_id|version|sorted_params)}` short-circuits everything (TTL 90d).
-2. **Retrieval** — `bge-m3` (pinned model) + Qdrant 3-stage RRF/ColBERT/cross-encoder.
+1. **Cache** — Redis `gen:{llm_config_id}:{template_id}:{version}:{sha256(sorted_params)}` short-circuits everything (TTL 90d). intent_cache 同样按 `llm_config_id` 分桶（`intent_cache:{llm_config_id}:{intent_hash}`，TTL 30d），并存 `params_fingerprint` —— 命中时 pipeline 用 `template_params_fingerprint(current_template.parameters)` 与缓存值比对，schema 漂移就 bypass 缓存走完整流水线。空 config_id 用 `"_"` 占位（测试 mock 兼容）。
+2. **Retrieval** — `bge-m3` (pinned model) + Qdrant hybrid stage1 (dense+sparse RRF) + stage3 cross-encoder rerank. **Stage2 ColBERT 当前实际 bypass**：[main.py `_init_qdrant_collection`](backend/app/main.py) 只 provisions `dense` + `sparse` 两个命名向量，[stage1_hybrid.py:62](backend/app/services/rag/stage1_hybrid.py#L62) 读 `r.vector.get("colbert")` 永远为 None，[stage2_colbert.py:25-27](backend/app/services/rag/stage2_colbert.py#L25-L27) 见 None 时透传 RRF 分数。代码和 embedding service 都还在生产 colbert 向量，重启 ColBERT 只需补齐 Qdrant collection schema + reindex（成本高，故未做）。改 RAG 逻辑前务必看 stage1 → stage2 → stage3 三个文件的实际行为，不要假设 ColBERT 在 work。
 3. **Parsing** — `temperature=0` + tool-calling / 2-step text + Pydantic schema.
 4. **Rendering** — Jinja2 `StrictUndefined`; missing params raise, never silently render `''`.
 
@@ -143,7 +147,7 @@ Every LLM call emits `[Timing] llm=<name> ms=<n> reasoning_tokens=<n> thinking=<
 
 API keys are AES-256-GCM encrypted with `LLM_KEY_ENCRYPTION_SECRET`. GET only returns a hint; PUT with empty `api_key` keeps the existing ciphertext.
 
-Switching the default model **flushes both `intent_cache:*` and `cache:*`** because new models can return different `(template_id, params)` for the same input — this is intentional for determinism.
+Switching / 创建 / 删除 / 修改 default 配置的 LLM 都会**主动 flush 两层缓存** (`gen:*` + `intent_cache:*`) —— 实现在 [admin_llm.py](backend/app/api/v1/admin_llm.py) 的 set_default / create_config / update_config / delete_config 端点 commit 后调用 [`invalidate_all_llm_caches()`](backend/app/services/core/cache.py)。即便不同 LLM 的缓存通过 `llm_config_id` 维度天然分桶，flush 仍然必要：保证切换后新写入的缓存不会与旧条目并存 30/90 天。`llm_configs.is_default` 有 partial unique index（migration 004）兜底，防止多行同时 True 把 `factory.get_default_llm_client` 打成 500。
 
 ## Data layout
 
