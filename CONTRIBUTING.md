@@ -36,10 +36,10 @@ DV_ACODE_GEN_PLATFORM/
 │   │   ├── schemas/                     # Pydantic 请求/响应 Schema
 │   │   ├── services/
 │   │   │   ├── core/                   # 确定性生成引擎（pipeline/renderer/dedup/cache + identifier/expr_validator）
-│   │   │   ├── intent/                 # 意图提取（normalizer/preflight/builder/history）
+│   │   │   ├── intent/                 # 意图提取（normalizer/preflight/builder/history/conversation/session）
 │   │   │   ├── llm/                    # LLM 适配层（Anthropic + OpenAI 兼容工厂）
 │   │   │   ├── parser/                 # Excel 需求表解析（schema 驱动）
-│   │   │   ├── platform/               # 审计日志、备份、贡献审核
+│   │   │   ├── platform/               # 审计日志、备份、贡献审核、parameter_extractor（LLM 反推参数）
 │   │   │   ├── rag/                    # 三阶段 RAG（stage1_hybrid/stage2_colbert/stage3_reranker）
 │   │   │   ├── registry.py             # CodeTypeRegistry（启动时加载 data/code_types/*.yaml）
 │   │   │   └── embedding_client.py     # 嵌入服务 HTTP 客户端

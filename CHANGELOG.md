@@ -9,17 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+> 正在按 PRD v3.0 起草稿实现：意图构建器（IntentBuilder）改为 RAG-grounded 多轮对话；模板贡献向导简化为"name+description+代码示例"由后端 LLM 反推 `parameters` 与 `template_body`；新增 `under_specified` / `code_type_mismatch` 两道 422 闸（详 v2.13 草稿），错误响应附 `redirect_to` 让前端无脑跳转。代码进行中，落地后归集到 [0.7.0]。
+
+---
+
+## [0.6.0] - 2026-05-14
+
 ### Added
 - **缓存 key 按 LLM 配置分桶**：`cache:{sha256(...)}` → `gen:{llm_config_id}:{template_id}:{version}:{sha256(sorted_params)}`；`intent_cache:{intent_hash}` → `intent_cache:{llm_config_id}:{intent_hash}`，TTL 30d。`template_id` 与 `version` 从单一复合 hash 中拆出，使 `invalidate_template_cache(tid)` 能用 `gen:*:{tid}:*` 通配跨所有配置桶精准失效单模板（旧 schema 只能整库 FLUSH）。Admin LLM CRUD / set-default 时仍调用 `invalidate_all_llm_caches()` 全清两个前缀——分桶不是为了"切换后保留旧缓存"，而是支撑单模板维度的精准失效。空 `llm_config_id` 用 `_` 占位（保留测试 mock 路径）
 - **intent_cache schema-drift 兜底**：`services/intent/history.py::template_params_fingerprint()` 对 `parameters[].name / required / expr_type` 三字段稳定 hash 写入缓存条目；命中时 pipeline 用当前 `template.parameters` 重算指纹比对，**漂移即 bypass 缓存走完整流水线**，避免模板参数改名/增删后旧 mapping 被短路返回
 - **`EmptyRetrievalError` 独立错误路径 → HTTP 503**：通过 off-topic dense 闸但 RAG 三阶段返空时抛出，端点结构化 detail（`type=empty_retrieval` / `code_type` / `hint`）映射 503 让 SRE 排查 Qdrant/embedding service，**不与 off-topic 422 共用错误流**；该异常继承 `RuntimeError` 而非 `ValueError`，避免被泛化 `except ValueError` 兜底降级
 - **DB 端 `llm_configs.is_default` 部分唯一索引**（迁移 `004_unique_default_llm.py`）：`CREATE UNIQUE INDEX ... WHERE is_default=true`，并发 set-default 或事务回滚遗留多行 True 时由 DB 拦截，防止 `factory.get_default_llm_client.scalar_one_or_none()` 抛 `MultipleResultsFound` → 500
+- **`EMBEDDING_DIM` 设置 + Qdrant 维度告警**：换 embedding 模型（bge-m3=1024 ↔ Qwen3-Embedding-4B=2560）时硬编码 1024 不再生效；`main.py:_init_qdrant_collection` 在 collection 已存在时读取实际 `dense.size` 与 `settings.embedding_dim` 比对，错配打 WARN 提示跑 `lib_manager.py rebuild`；`.env.example` 补 `OFFTOPIC_GATE_ENABLED` / `OFFTOPIC_DENSE_THRESHOLD` 两个之前没文档化的环境变量
+- **lib_manager `dedup-check` 子命令**：按当前 `TEMPLATE_DEDUP_THRESHOLD`（可 `--threshold` 临时覆盖）扫一遍 active 模板列出潜在重复对——dedup 在 import 时只对"新模板 vs 历史"判定一次，阈值改了不会回溯，本命令补一份事后审计能力；仅打印不删除。Import 完成后自动调 `invalidate_all_intent_cache()`：批量导入可能整体替换模板库，30 天 TTL 内的旧 intent → (template_id, params) 映射可能指向已不存在/schema 已改的模板
+- **Anthropic 客户端 `[Timing]` 打点对齐 OpenAI-compat**：`_anthropic_thinking_tokens(msg)` 兼容不同 SDK 版本的 `thinking_tokens` / `reasoning_tokens` 字段名；`normalize_intent` / `select_template` 调用前后包夹 `time.perf_counter()`，与 OpenAI-compat 日志格式一致便于跨 provider 对比
+- **`calibrate_offtopic_threshold.py` 输出推荐 `.env` 行**：跑完分布表后直接根据 off-topic 最大值与 marginal-ic 最小值的中点推荐一行 `OFFTOPIC_DENSE_THRESHOLD=<value>` 配置，能直接粘贴生效；gap ≤ 0 时回退 `marg_min - 0.02` 保守值
 
 ### Fixed
-- **`sync_status_enum` 值与 ORM 错位**（迁移 `003_align_sync_status_enum.py`）：migration 001 旧声明 `('pending','synced','error')` 与 ORM/`lib_manager.py` 长期写入的 `('ok','syncing','sync_error')` 错位，导致纯 alembic 路径升级的 DB 首次 import 模板报 `invalid input value for enum`。迁移**幂等**实现：兼容三种状态（旧值 / 新值 / 混合），考虑到 `app/main.py:_init_db` 的 `create_all` 先于 alembic 跑，大多数 dev DB 实际已经是 ORM 值
+- **`sync_status_enum` 值与 ORM 错位**（迁移 `003_align_sync_status_enum.py`）：migration 001 旧声明 `('pending','synced','error')` 与 ORM/`lib_manager.py` 长期写入的 `('ok','syncing','sync_error')` 错位，导致纯 alembic 路径升级的 DB 首次 import 模板报 `invalid input value for enum`。迁移**幂等**实现：兼容三种状态（旧值 / 新值 / 混合）；同步把 `templates.py` 三处 `create/update` 路径 `sync_status="pending"` 改成 `"syncing"`
+- **registry YAML 加载单文件错误容忍**：之前 `registry._load` 单文件失败（YAML 损坏 / 必填字段缺失）直接抛异常让整个 backend 起不来；新增 code_type 时一次手抖就把生产打挂。改为 try/except 捕获 `yaml.YAMLError / KeyError / TypeError`，命中即跳过该文件并打 `[WARN]` 日志，已加载的 code_types 仍生效
 
 ### Changed
 - CLAUDE.md：补齐 cache key 结构与 schema-drift 契约 §（"Four-layer determinism guard" 第 1 条）、`EmptyRetrievalError` vs `OffTopicIntentError` 的 422/503 分流说明、Stage2 ColBERT 实际 bypass 的代码位点（`stage1_hybrid.py:62` / `stage2_colbert.py:25-27`，main.py 只 provisions dense+sparse 命名向量）——后者是已存在行为的文档化，不是代码变更
+- ARCHITECTURE v2.16 → v2.17 / PRD v2.11 → v2.12：补齐 cache key 新结构、`EmptyRetrievalError` 503 路径与 off-topic 422 在 §6.1 的错误模式分流
+- `.claude/commands/commit.md`：`/commit` skill 改为"默认全自主模式"——0a/0b/Phase 2 等"等用户确认"门改为自动分档/执行前公告，保留绝对禁止 + 硬阻止四类硬停红线；`.claude/settings.json` 新增项目级 Bash/MCP 工具 allowlist
+- CONTRIBUTING §11.4：增加"周期性语料增量"运维节奏建议（每 4 周从 `generation_records` 抽 `confidence<0.5`/422 样本人工评判补语料防沉默漂移）
 
 ---
 
@@ -131,7 +145,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.5.0...HEAD
+[Unreleased]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.6.0...HEAD
+[0.6.0]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.2.0...v0.3.0

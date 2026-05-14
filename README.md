@@ -58,8 +58,8 @@ docker compose up --build
 
 当前阶段：**核心功能实现完成，待 Alpha 测试**
 
-- [x] PRD 确认（v2.11）
-- [x] 架构设计（ARCHITECTURE v2.16）
+- [x] PRD 确认（v2.12，v3.0 起草中：IntentBuilder 多轮对话改造 + under_specified/code_type_mismatch 两道 422 闸 + 错误响应 `redirect_to` 跳转）
+- [x] 架构设计（ARCHITECTURE v2.17）
 - [x] 后端骨架搭建
 - [x] 确定性引擎核心实现（pipeline / renderer / dedup / cache + identifier 规范化 + expr_validator 校验）
 - [x] 三阶段 RAG 检索流水线（混合检索 → ColBERT 精排 → Cross-Encoder 重排，含关键词补充召回兜底）
