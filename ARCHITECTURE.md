@@ -1,6 +1,6 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.17  
+**版本**：v2.18  
 **状态**：已确认  
 **日期**：2026-05-14  
 **变更**：
@@ -22,6 +22,17 @@
 - v2.14 → v2.15：契约修订 + RAG 原生 off-topic 闸——"always produce code" 契约**收窄为仅对域内 IC 输入**（§1.1）；新增 `services/rag/engine.py::dense_top1_score` helper 复用 Qdrant dense 通道；`pipeline_preview` 头部插入 dense 阈值闸（用 `original_intent` 而非 `normalized`——后者会被 LLM 改写成"无法判断类型"等元说明意外抬高 off-topic 分数），低于 `OFFTOPIC_DENSE_THRESHOLD`（校准默认 0.44）抛 `OffTopicIntentError` 返 HTTP 422；`generate.py` 端点结构化 detail（`type=off_topic` + `detector` + `top_dense_score` + `threshold`）让前端弹专属 Modal；`OFFTOPIC_GATE_ENABLED=false` 紧急 kill-switch；删除前一轮的 normalizer sentinel 注入式临时方案（恢复 `normalize_intent` 提示词为纯改写）；新增 `backend/scripts/calibrate_offtopic_threshold.py` 经验校准脚本；回归语料 `backend/tests/data/offtopic_corpus.yaml` + mock/real-LLM 双套件保留
 - v2.15 → v2.16：thinking 控制由全局硬编码改为**按 LLM 调用分档 + 按配置可调**（§3.12.2、§3.12.3）——`llm_configs` 表新增 `step2_disable_thinking` BOOLEAN 列（NOT NULL，默认 true；迁移 `002_step2_disable_thinking.py`）（§4.1）；`normalize_intent` 与 `_step1_select_id` 硬编码禁 thinking 且收紧 `max_tokens`（512 / 64），`_step2_fill_params` 由 `llm_configs.step2_disable_thinking` 运行时切换（true→`max_tokens=2048` 禁 thinking，false→`max_tokens=1024` 保留 thinking）；所有 OpenAI-compat 调用打点 `[Timing] llm=<name> ms=<n> reasoning_tokens=<n> thinking=<on/off>` 便于验证 `extra_body` 是否被模型实际识别；`LLMConfigCreate/Update/Out` 三个 Schema 透出新字段，Admin UI 加 Switch（§5.1）；前端 `/generate` 与 `/generate/preview` 客户端超时由 180s 提升至 300s（thinking ON 模式下三步累加可达 ~4min）
 - v2.16 → v2.17：缓存结构按 LLM 配置分桶 + intent_cache schema-drift 兜底 + RAG 空召回独立错误路径——`gen:{llm_config_id}:{template_id}:{version}:{params_hash}` 替换旧 `cache:{sha256(...)}` 复合 hash；`intent_cache:{llm_config_id}:{intent_hash}` 同样按配置分桶，TTL 30d（§3.6）；`services/intent/history.py::template_params_fingerprint()` 对 `parameters[].name/required/expr_type` 三字段取稳定指纹随 intent_cache 条目写入，命中时与当前模板指纹比对，漂移即 bypass 走完整流水线（§3.15.3 Step 2）；新增 `EmptyRetrievalError`（继承 `RuntimeError` 而非 `ValueError`，避免被泛化 `except ValueError` 兜底）—— off-topic 闸通过但关键词补充召回后仍返空时抛出，端点结构化 detail（`type=empty_retrieval` / `code_type` / `hint`）映射 **HTTP 503**，与 off-topic 422 分流（§3.15.3 Step 4 / §5.1）；缓存失效原语拆为 `invalidate_template_cache(tid)`（用 `gen:*:{tid}:*` 通配跨所有配置桶删除单模板）+ `invalidate_all_intent_cache()`（lib_manager 批量重导 hook）+ `invalidate_all_llm_caches()`（admin LLM CRUD/set-default 时仍全清两个前缀，分桶不是为了切换后保留旧缓存，而是为了 update 单模板时能跨配置精准失效）；迁移 `003_align_sync_status_enum.py` 幂等修正 `sync_status_enum` 旧值 `('pending','synced','error')` 到 ORM 值 `('ok','syncing','sync_error')`（兼容 `app/main.py:_init_db` 的 `create_all` 先于 alembic 跑、dev DB 已是 ORM 值的情况）；迁移 `004_unique_default_llm.py` 把 §4.1 已声明的部分唯一索引 `WHERE is_default=true` 落到 alembic 树上（兜底并发 set-default 留多行 True 导致 `MultipleResultsFound` → 500）
+- v2.17 → v2.18：**对齐 PRD v3.0 用户旅程重构**——新增两道 422 闸 + IntentBuilder 多轮对话 + 贡献机制 LLM 反推 + 错误响应 `redirect_to` 字段：
+  - **`CodeTypeMismatchError`（HTTP 422 `code_type_mismatch`）**（§3.15.3）：通过 off-topic 闸后插入 `_detect_code_type_mismatch`，对所有注册 code_type 逐一算 dense top-1 score，若某非当前 code_type 的得分高于当前 ≥ `CODE_TYPE_MISMATCH_MARGIN`（默认 0.10）则抛错，结构化 detail 含 `current_code_type` / `suggested_code_type` / `current_score` / `suggested_score`，前端原页面 Modal 引导切换类型；可关闸 `CODE_TYPE_MISMATCH_GATE_ENABLED=false`（off-topic 关时本闸也自动跳）
+  - **`UnderSpecifiedIntentError`（HTTP 422 `under_specified`）**（§3.15.3、§3.15.5）：Step 6 参数映射后插入 `_detect_under_specified`，识别"必填但只有低置信源"参数（source ∈ {placeholder, semantic_fallback}，或 LLM 返"trivial 值"如空串/0/字面参数名），抛错带 `missing_params: [{name, description, expr_type, role_hint}]` 列表 + `redirect_to: /intent-builder?prefill=...&missing=...`，前端 `handleApiError` 读到 `redirect_to` 直接 `router.push` 跳 IntentBuilder 精修；可关闸 `UNDER_SPECIFIED_GATE_ENABLED=false`
+  - **第 6 类参数源 `semantic_fallback`**（§3.15.5）：原 `default` 拆分为两类——`default`（模板设计者声明的默认 / 用户在前端编辑过的值）vs `semantic_fallback`（系统按语义规则猜的值：`group_name` 用 `construct_group_name` 合成、`state_list="IDLE, ACTIVE, DONE"`、`bins_expr=f"{{[0:{2**width-1}]}}"`）。同时 group_name 被 sanitize/construct 改写后 source 自动升级到 `semantic_fallback`，避免"系统猜的值被规范化后伪装成 user 给的"
+  - **`/api/v1/intent-builder/chat` 多轮对话端点**（§3.11、§5.1）：替换原 `/scenarios` + `/build`（两者改返 HTTP 410 Gone + 提示语）；新增 `services/intent/conversation.py::run_one_turn`（每轮跑一次 RAG 把 top-3 模板 description 喂回 prompt 引导用户往已存在模板靠拢）+ `services/intent/session.py`（Redis key `intent_builder_session:{user_id}:{session_id}`，TTL 24h，未登录禁用，按用户隔离）；LLM 沿用 `llm_configs.is_default`
+  - **`LLMClient.chat(messages, max_tokens, temperature)` 通用多轮接口**（§3.12）：在 `base.py` 抽象方法添加，Anthropic / OpenAICompat 两条实现都补齐；供 IntentBuilder 与贡献机制 LLM 反推共用，默认不打 thinking 开关
+  - **模板贡献机制 LLM 反推**（§3.10）：新增 `services/platform/parameter_extractor.py::derive_parameters_from_demo`——用户只填 `name + code_type + description + demo_code` 时，后端 LLM 反推 `parameter_defs` + Jinja2 化的 `template_body` + `keywords` + `subcategory` + `protocol`；用户也可手动传 `parameter_defs` 走旧路径（contributions.py 内部分支）。审核员在 AdminContributionsPage 三栏（原始代码 / 反推模板 / 反推参数）任意修改后批准
+  - **PipelineInput `source: "intent_builder" | "direct" = "direct"`**（§3.15.2）：仅供日志/统计区分入口，不影响路由逻辑
+  - **`normalize_intent` 角色降级**（§3.11）：从"四层标准化机制核心"降为"弃权信号载体 + cache key 稳定器"，sentinel "无法判断类型，输出原文"保留但下游不再用它做兜底——sentinel 之后参数仍是低置信源时 `under_specified` 闸照常拦
+  - **`redirect_to` 字段约定**（§5.1）：仅 `under_specified` 返 `/intent-builder?prefill=...&missing=...`；`off_topic` / `empty_retrieval` / `code_type_mismatch` 返 `None`（前者 IntentBuilder 救不了真离题；中间是基础设施问题；后者前端在原页面 Modal 切换类型）
+  - **环境变量**（§8.4）：新增 `CODE_TYPE_MISMATCH_GATE_ENABLED` / `CODE_TYPE_MISMATCH_MARGIN` / `UNDER_SPECIFIED_GATE_ENABLED`
 
 ---
 
@@ -47,7 +58,7 @@ LLM 本质上是概率性的，但平台要求输出是确定性的。完整 RAG
 │  temperature=0                         ↓                             │
 │  工具调用强制输出              Pydantic 验证 + 归一化                  │
 │                                        ↓                             │
-│                               Redis 缓存（绝对确定性兜底）             │
+│                               Redis 缓存（同输入命中即返）             │
 │                                        ↓                             │
 │                               Jinja2 渲染（100% 确定性）              │
 │                                        ↓                             │
@@ -755,19 +766,30 @@ Admin 提交编辑
 
 ### 3.10 模板贡献服务
 
-#### 3.10.1 贡献提交
+#### 3.10.1 贡献提交（v3.0 LLM 反推路径）
+
+v3.0 把贡献向导简化为"用户只填 `name + code_type + description + 代码示例`"——v2 要求用户手填参数定义表 + Demo 编辑器里塞占位符（`{{ valid_sig }}` 等）的 Step 2/3 退役。后端由 `services/platform/parameter_extractor.py::derive_parameters_from_demo()` 调 `LLMClient.chat()` 反推 `parameter_defs` + Jinja2 化的 `template_body` + `keywords` + `subcategory` + `protocol`。
 
 ```
 POST /api/v1/contributions
   ↓
 ContributionCreate Schema 验证（Pydantic）
-  - demo_code：Jinja2 语法预检（只检查语法，不验证参数完整性）
+  - 必填：name, code_type, description, demo_code
+  - 可选：parameter_defs（传则走旧路径，不调 LLM 反推；不传则走 v3.0 反推路径）
   - description 非空校验（RAG 向量化依赖此字段）
   ↓
-写入 template_contributions（status=pending_review）
+分支：
+  parameter_defs 已提供 → 沿用用户原 demo_code 作 template_body（旧路径）
+  parameter_defs 未提供 → 调 derive_parameters_from_demo(demo_code, description, code_type)：
+      LLMClient.chat([{system: "你是 SV 模板反推专家"}, {user: <demo+description+contract>}])
+      返回 ExtractedTemplate(parameter_defs, jinja_body, keywords, subcategory, protocol)
+  ↓
+写入 template_contributions（status=pending_review，存反推/原始两份）
   ↓
 返回 contribution_id + status
 ```
+
+审核员在 AdminContributionsPage 看到**三栏对照**：用户原始 demo_code / 反推后的 jinja_body / 反推后的 parameter_defs；任意修改后批准走 §3.10.2 入库流水线。
 
 #### 3.10.2 批准入库流水线
 
@@ -838,12 +860,19 @@ backend/app/
 ├── api/v1/
 │   └── contributions.py         # 贡献者端点（提交/查看/修改）及管理员审核端点（合并单文件）
 └── services/platform/
-    └── contribution_service.py  # 贡献入库流水线（调用 create_template()）
+    ├── contribution_service.py  # 贡献入库流水线（调用 create_template()）
+    └── parameter_extractor.py   # v3.0 LLM 反推 parameter_defs + Jinja2 template_body（调 LLMClient.chat）
 ```
 
 > **注**：贡献者端点与管理员审核端点合并在同一 `contributions.py` 文件中，通过 `require_role` 依赖注入区分权限。所有表结构均在 `migrations/versions/001_initial_schema.py` 初始迁移中统一建立。
 
-### 3.11 验证意图标准化服务
+### 3.11 验证意图标准化服务 + IntentBuilder 多轮对话（v3.0）
+
+#### 3.11.0 v3.0 角色重定位
+
+`normalize_intent`（原"四层标准化机制"核心）在 v3.0 **角色降级为"弃权信号载体 + cache key 稳定器"**：sentinel "无法判断类型，输出原文"保留，但**下游不再用它做兜底**——sentinel 之后参数仍是低置信源时，§3.15.3 的 `under_specified` 闸照常拦。同义改写仍跑（保 `intent_hash` 稳定让 `intent_cache:*` 命中率不退化），但**不再承担"我替你猜你想说什么"的职责**。
+
+"猜用户意图"的职责改由新增的 **IntentBuilder 多轮对话（§3.11.5）** 承担：用户被 `under_specified_required_param` 拦下后通过 `redirect_to` 跳到 `/intent-builder`，与 LLM 多轮交互逐步明确意图，最后再回 Generate 页提交（`PipelineInput.source="intent_builder"`）。
 
 #### 3.11.1 四层协作流程
 
@@ -944,19 +973,32 @@ TTL:   无（历史知识库为知识积累，永久有效，由 allkeys-lru 策
   未命中 → 走完整 RAG 链路 → 成功后写入 Redis
 ```
 
-#### 3.11.5 场景构建器 API
+#### 3.11.5 IntentBuilder 多轮对话端点（v3.0，替换原场景构建器）
+
+v3.0 用 RAG-grounded 多轮 LLM 对话取代原"场景模板填空"——后者要求用户预知场景类型，对模板库已覆盖但用户语言风格不同的场景无能为力。多轮对话每轮跑一次 RAG 把库内 top-3 模板 `description` 喂回 prompt 引导用户往已存在模板靠拢；N 轮后所有候选都明显不匹配 → 引导用户跳转到 §3.10 贡献新模板。
 
 ```
-GET  /api/v1/intent-builder/scenarios
-     响应：SVA 和 Coverage 的场景类型列表及各场景的参数字段定义
+POST /api/v1/intent-builder/chat
+     请求：{ "session_id": "<uuid4>" or "",   # 空 → 后端 mint 新 session_id
+             "user_message": "<用户本轮输入>",
+             "code_type": "assertion" | "coverage" }
+     响应：{ "session_id": "<始终回填>",
+             "assistant_message": "<LLM 回复>",
+             "rag_candidates": [{template_id, name, description, score}, ...top-3],
+             "should_contribute": bool }  # 多轮后仍无 close match → true 提示用户贡献新模板
 
-POST /api/v1/intent-builder/generate
-     请求：{ "scenario_type": "handshake_stable",
-             "params": { "valid": "awvalid", "ready": "awready", "data": "awaddr" } }
-     响应：{ "intent_text": "当 awvalid 有效且 awready 未响应时，awaddr 必须保持稳定" }
+GET  /api/v1/intent-builder/scenarios   # v2 残留，v3.0 退役 → HTTP 410 Gone
+POST /api/v1/intent-builder/build       # v2 残留，v3.0 退役 → HTTP 410 Gone
 ```
 
-场景构建器完全确定性（字符串模板填充），无 LLM 调用。
+**Session 存储**（`services/intent/session.py`）：
+- Key: `intent_builder_session:{user_id}:{session_id}`，按用户隔离，未登录用户禁用
+- TTL: 24h（多轮对话本质 ephemeral）；每轮写都刷新 TTL；用户点"关闭对话"可手动 delete，常规依赖 TTL 兜底
+- Value: 完整 message 列表 + `code_type` + `last_rag_candidates`
+
+**对话编排**（`services/intent/conversation.py::run_one_turn`）：每轮先用本轮 user_message 跑一次 RAG → 把 top-3 模板 description 注入 system prompt → 调 `LLMClient.chat(messages)` → 返回 assistant 回复 + 同一批 RAG 结果。LLM 沿用 `llm_configs.is_default`（不分独立配置）。
+
+场景构建器（v2 的 §3.11.5 内容）**已退役**——`/scenarios` `/build` 端点改返 HTTP 410 Gone + 提示语指向 `/chat`；`services/intent/builder.py` 保留代码但不再被路由层引用。
 
 #### 3.11.6 文件位置（服务层重组后）
 
@@ -964,10 +1006,12 @@ POST /api/v1/intent-builder/generate
 backend/app/
 ├── services/
 │   ├── intent/                  # 意图相关服务聚合子包（新结构）
-│   │   ├── normalizer.py        # LLM标准化服务（第1层，读 registry 获取句式）
-│   │   ├── builder.py           # 场景构建器（第2层，纯字符串模板，读 registry 获取场景）
+│   │   ├── normalizer.py        # LLM 标准化服务（v3.0 角色降级为弃权信号载体 + cache key 稳定器）
+│   │   ├── builder.py           # v2 场景构建器（v3.0 退役保留，端点改 410 Gone）
 │   │   ├── preflight.py         # 上传预检服务（第3层）
-│   │   └── history.py           # 历史意图库读写（第4层）
+│   │   ├── history.py           # 历史意图库读写（v3.0 含 template_params_fingerprint helper）
+│   │   ├── conversation.py      # v3.0 多轮对话编排（run_one_turn：每轮跑 RAG + LLMClient.chat）
+│   │   └── session.py           # v3.0 Redis-backed session（key=intent_builder_session:{uid}:{sid}, TTL 24h）
 │   └── registry.py              # CodeTypeRegistry（启动时加载 data/code_types/*.yaml）
 ├── api/v1/endpoints/
 │   ├── batch.py                 # /batch/preflight 端点
@@ -1000,6 +1044,9 @@ services/llm/
 │   ├── normalize_intent(original_intent, rules) → str
 │   ├── select_template(normalized_intent, signal_context, candidates,
 │   │                   original_intent="") → TemplateSelectionOutput
+│   ├── chat(messages, max_tokens=1024, temperature=None) → str    # v3.0 通用多轮接口
+│   │   供 IntentBuilder 与贡献机制 LLM 反推共用；messages 与 OpenAI/Anthropic SDK
+│   │   原生格式一致（role: system/user/assistant），默认不打 thinking 开关
 │   └── test_basic() → str                   # 连通性自检
 ├── anthropic_client.py       # Anthropic 原生 SDK 实现（tool_calling 单步返回）
 ├── openai_compat_client.py   # openai SDK + base_url 实现（两步纯文本，见下）
@@ -1228,6 +1275,7 @@ class PipelineInput:
     rst: str               # 复位信号（默认 "rst_n"）
     rst_polarity: str      # 复位极性（默认 "低有效"）
     signals: list[dict]    # [{name, width, role}, ...]
+    source: str = "direct" # "intent_builder" | "direct"；v3.0 仅供日志/统计区分入口，不影响路由
 
 @dataclass
 class PipelineResult:
@@ -1296,9 +1344,19 @@ Step 2: IntentCacheLookup
       双重命中 → 直接返回（intent_cache_hit=True, cache_hit=True），流水线结束
   未命中 → 进入 Step 3
 
-Step 0 (preview 前置)：off-topic dense 闸（详见 §1.1）
+Step 0a (preview 前置)：off-topic dense 闸（详见 §1.1）
   dense_top1_score(original_intent, code_type) < OFFTOPIC_DENSE_THRESHOLD
-    → 抛 OffTopicIntentError → 端点映射 HTTP 422
+    → 抛 OffTopicIntentError → 端点映射 HTTP 422（redirect_to=None）
+
+Step 0b (preview 前置, off-topic 通过后)：code_type_mismatch 闸
+  当 OFFTOPIC_GATE_ENABLED && CODE_TYPE_MISMATCH_GATE_ENABLED 时启用。
+  _detect_code_type_mismatch(original_intent, current_code_type, current_score,
+                              margin=CODE_TYPE_MISMATCH_MARGIN)：
+    对所有 registry 注册的 code_type 逐一算 dense top-1，
+    若某非当前 code_type 的得分 - 当前得分 ≥ margin（默认 0.10）→ 抛
+    CodeTypeMismatchError → 端点映射 HTTP 422（redirect_to=None，
+    前端在原页面 Modal 引导切换 code_type）
+  无显著更优 code_type → 进入 Step 3
 
 Step 3+4: Embed + RAGRetrieve
   rag_retrieve(normalized_intent, db, code_type)
@@ -1350,7 +1408,19 @@ Step 8: CacheWrite
   save_history(intent_hash, template_id, params, confidence, code)（历史意图库）
 ```
 
-**兜底链总览**：RAG 召回失败 → 关键词补充召回 → LLM 选不出 → 取 RAG 第一候选 → LLM 填不出参数 → 取意图正则提取 → 仍缺失 → 用参数名占位。每一层都为"系统总能产出代码"提供保障，**置信度则在合并 LLM 结果时按 RAG/LLM 来源不同记录真实分数**，前端可基于置信度提示用户。
+**Recovery 链总览（v2.13 反转后）**：RAG 召回失败 → 关键词补充召回 → LLM 选不出 → 取 RAG 第一候选 → LLM 填不出参数 → 取意图正则提取 → 仍缺失 → 用模板 default → 仍缺失 → 系统经验式 semantic_fallback（仅给可观察值供闸判定，不再当作"完成"）。
+
+**契约反转关键点**：步骤 6 末尾的 `placeholder`（参数名字面量）和步骤 5 的 `semantic_fallback`（"IDLE, ACTIVE, DONE"等系统瞎猜值）**不再视为合法终态**。`pipeline_preview` 在 `_map_params_with_source` 返回后调用 `_detect_under_specified`，任一 required 参数源落在 `{placeholder, semantic_fallback}` 或 LLM 返 trivial 值（空串/0/字面参数名）→ 抛 `UnderSpecifiedIntentError` → HTTP 422 `under_specified`，detail 含：
+- `missing_params: [{name, description, expr_type, role_hint}, ...]` —— 每个缺失参数的语义信息，供前端组织提示语
+- `redirect_to: "/intent-builder?prefill=<urlencoded original_intent>&missing=<csv param names>"` —— 前端 `handleApiError` 读到 `redirect_to` 直接 `router.push` 跳 IntentBuilder 精修，不在 Generate 页弹 dead-end Modal
+
+**LLM 不允许编参数兜底**——这是 v2.13 契约相对 v2.12 之前最大的策略转向，目的是让用户看到"系统不知道你要什么"而不是"系统给了一堆生造的默认"。
+
+**错误响应 `redirect_to` 约定**（v3.0，§5.1 端点错误响应规范）：仅 `under_specified` 带 `redirect_to` 指向 IntentBuilder；`off_topic`（IntentBuilder 救不了真离题）、`empty_retrieval`（基础设施问题）、`code_type_mismatch`（前端原页面 Modal 切换类型即可）均返 `redirect_to=None`。
+
+**置信度记录**：合并 LLM/RAG 结果时按来源分别记录真实分数 (`confidence_source ∈ {llm_step1, rag_fallback, keyword_supplement, intent_cache}`)。
+
+**Env 关闸**：`UNDER_SPECIFIED_GATE_ENABLED=false` 临时退回到 v2.12 之前的"始终产出"行为，仅用于线上误拦应急。
 
 #### 3.15.4 端点层变薄
 
@@ -1358,7 +1428,7 @@ Step 8: CacheWrite
 
 #### 3.15.5 expr_type 驱动的校验与规范化层
 
-`_map_params_with_source` 末尾追加一道独立 pass，对前面 5 类源（llm / regex / signal_list / default / placeholder）产出的参数值统一做语法兜底，确保任何来源的"脏值"都不会污染 Jinja2 渲染。
+`_map_params_with_source` 末尾追加一道独立 pass，对前面 6 类源（llm / regex / signal_list / default / semantic_fallback / placeholder）产出的参数值统一做语法兜底，确保任何来源的"脏值"都不会污染 Jinja2 渲染。注意 sanitize 是为 Jinja2 渲染做的最后清洗，**不**改变源标签——例如 group_name 经 `construct_group_name` 改写后仍保留 `semantic_fallback` 标签，以便 under_specified 闸正确拒绝。
 
 **模板侧契约**：YAML 的每个 `parameters[]` 元素声明 `expr_type`：
 
@@ -1710,8 +1780,9 @@ WHERE is_default = true;
 | POST | `/api/v1/batch/preflight` | 上传后前置信度预检（轻量，仅Stage1） | 普通用户+ |
 | GET | `/api/v1/batch/{job_id}` | 查询批量任务状态 | 普通用户+ |
 | GET | `/api/v1/batch/{job_id}/download` | 下载批量生成结果 | 普通用户+ |
-| GET | `/api/v1/intent-builder/scenarios` | 获取场景构建器场景类型列表 | 普通用户+ |
-| POST | `/api/v1/intent-builder/generate` | 场景参数→生成标准化意图文本 | 普通用户+ |
+| POST | `/api/v1/intent-builder/chat` | v3.0 多轮 RAG-grounded 对话；首轮 `session_id=""` 由后端 mint，TTL 24h | 登录用户+ |
+| GET | `/api/v1/intent-builder/scenarios` | **v3.0 退役**：返 HTTP 410 Gone，提示改用 `/chat` | — |
+| POST | `/api/v1/intent-builder/build` | **v3.0 退役**：返 HTTP 410 Gone，提示改用 `/chat` | — |
 | GET | `/api/v1/templates` | 模板列表（支持搜索/筛选/分页） | 普通用户+ |
 | GET | `/api/v1/templates/{id}` | 模板详情 | 普通用户+ |
 | POST | `/api/v1/admin/templates` | 新建模板（同步写 PG + Qdrant）；先执行查重，相似度 ≥ 阈值返回 `duplicate_warning`；附加 `?force=true` 跳过语义查重 | 库管理员+ |
@@ -2238,6 +2309,12 @@ location ~* \.(js|css|png|jpg|ico|svg|woff2?)$ {
 | `RAG_STAGE3_TOP_K` | Stage3 Reranker 最终候选数（默认 `3`） |
 | `CELERY_CONCURRENCY` | Celery Worker 并发数（默认 `10`） |
 | `TEMPLATE_DEDUP_THRESHOLD` | 模板入库查重阈值（默认 `0.90`）；单位为 bge-m3 dense 向量余弦相似度（0.90 = 语义 90% 相似），超过此值触发 duplicate_warning |
+| `EMBEDDING_DIM` | embedding 模型输出维度（默认 `1024`，bge-m3）；启动时与 Qdrant collection 现有维度比对，错配打 WARN（详 §3.6 / `main.py:_init_qdrant_collection`） |
+| `OFFTOPIC_GATE_ENABLED` | off-topic dense 闸总开关（默认 `true`）；设 `false` 时退回 v2.9 之前"始终生成代码"行为 |
+| `OFFTOPIC_DENSE_THRESHOLD` | off-topic dense top-1 阈值（默认 `0.44`，由 `backend/scripts/calibrate_offtopic_threshold.py` 校准；换 embedding 模型 / 模板库大改后必须重跑） |
+| `CODE_TYPE_MISMATCH_GATE_ENABLED` | code_type 一致性闸总开关（默认 `true`）；`OFFTOPIC_GATE_ENABLED=false` 时本闸自动跳 |
+| `CODE_TYPE_MISMATCH_MARGIN` | 别类 code_type dense 得分超过当前类多少时判定 mismatch（默认 `0.10`） |
+| `UNDER_SPECIFIED_GATE_ENABLED` | under_specified 闸总开关（默认 `true`）；设 `false` 时退回 v2.12 之前"系统编参数兜底总能产出代码"行为 |
 | `BACKUP_RETAIN_DAYS` | `7` | PostgreSQL 备份文件保留天数，超期自动删除 |
 | `QDRANT_SNAPSHOT_ENABLED` | `false` | 是否启用 Qdrant 每周快照（false 时只依赖 rebuild-index 恢复） |
 
