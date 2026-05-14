@@ -44,11 +44,13 @@ class OpenAICompatLLMClient(LLMClient):
 
     async def normalize_intent(self, original_intent: str, rules: str) -> str:
         system = f"你是IC验证领域专家。将用户提供的验证意图改写为标准句式。\n\n规则：\n{rules}"
-        # 同 Step1/Step2，GLM-4.7 thinking 模型需要更大 max_tokens 缓冲 reasoning。
+        # 纯句式改写不需要 chain-of-thought：thinking={"type":"disabled"} 跳过 reasoning_tokens，
+        # max_tokens 收回到 512（实测输出 ≤ 200 tokens）。非 thinking 模型忽略 extra_body 字段。
         resp = await self._client.chat.completions.create(
             model=self._model,
-            max_tokens=4096,
+            max_tokens=512,
             temperature=self._temperature,
+            extra_body={"thinking": {"type": "disabled"}},
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": original_intent},
@@ -69,7 +71,7 @@ class OpenAICompatLLMClient(LLMClient):
         template_id = await self._step1_select_id(normalized_intent, candidates)
         print(f"[GLM Step1] selected={template_id!r}", flush=True)
 
-        # ── Step 2：填参数（max_tokens=512，仅针对已选模板）──────────────────
+        # ── Step 2：填参数（max_tokens=1024，保留 thinking，仅针对已选模板）──────────────────
         selected = next((c for c in candidates if c["template_id"] == template_id), None)
         param_mapping: dict = {}
         if selected:
@@ -110,13 +112,14 @@ class OpenAICompatLLMClient(LLMClient):
             f"只返回 template_id："
         )
 
-        # GLM-4.7 是 thinking 模型，会在输出前消耗大量 reasoning_tokens（实测 ~650 tokens）；
-        # max_tokens 同时限制 reasoning+output 总和，不足则 finish_reason=length 且 content=''。
-        # 给 4096 留足 thinking 缓冲，最终答案 ~10 tokens 可以稳定输出。
+        # Step1 是 pick-from-list 分类，依赖 system prompt 里的 FSM/handshake/value/cross 规则即可，
+        # 无需 chain-of-thought：thinking={"type":"disabled"} 跳过 reasoning_tokens，
+        # max_tokens=64 容纳 ~10 token 的 template_id 输出。误判由 pipeline.py 的 RAG fallback 兜底。
         resp = await self._client.chat.completions.create(
             model=self._model,
-            max_tokens=4096,
+            max_tokens=64,
             temperature=0.0,
+            extra_body={"thinking": {"type": "disabled"}},
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
@@ -155,10 +158,11 @@ class OpenAICompatLLMClient(LLMClient):
             f'输出示例：{{"group_name": "cur_state", "signal": "cur_state", "signal_width": "3"}}'
         )
 
-        # 同 Step1，GLM-4.7 thinking 消耗大量 tokens；JSON 输出可能 ~50 tokens，但需 4096 缓冲。
+        # Step2 保留 thinking：FSM state_list / bins_expr 等边界场景靠推理填出正确值，禁了会掉准。
+        # max_tokens 从 4096 收回到 1024：实测 reasoning ≤ 600 tokens + JSON 输出 ~150 tokens 足够。
         resp = await self._client.chat.completions.create(
             model=self._model,
-            max_tokens=4096,
+            max_tokens=1024,
             temperature=0.0,
             messages=[
                 {"role": "system", "content": system},
