@@ -79,7 +79,7 @@ DV_ACODE_GEN_PLATFORM/
 ├── docker-compose.gpu-linux.yml         # Linux GPU overlay（CUDA passthrough）
 ├── docker-compose.gpu-windows.yml       # Windows GPU overlay（WSL2 GPU）
 ├── nginx.conf                           # 入口反向代理（前端 + /api 路由）
-├── docs/                                # 补充文档（deployment-{dev-windows,prod-linux}.md / startup-wsl.md / test-manual.md / deployment.md 索引）
+├── docs/                                # 补充文档（deployment-{dev-windows,prod-linux}.md / startup-wsl.md / test-manual.md / deployment.md 索引 / platform-bug.md / test-bug.md）
 ├── PRD.md                               # 产品需求文档
 ├── ARCHITECTURE.md                      # 架构设计文档
 ├── CONTRIBUTING.md                      # 本文件

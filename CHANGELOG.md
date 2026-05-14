@@ -11,6 +11,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.5.0] - 2026-05-14
+
+### Added
+- **无关意图 RAG dense 余弦闸**（核心契约修订）：`pipeline_preview` 头部插入 dense 阈值闸，对 `original_intent`（非 normalized，避免 LLM 改写抬高 off-topic 分数）做 Qdrant dense 通道 top-1 比对，低于 `OFFTOPIC_DENSE_THRESHOLD`（默认 0.44）抛 `OffTopicIntentError` → HTTP 422 + 结构化 detail（`type=off_topic` / `detector` / `top_dense_score` / `threshold`）；前端弹"检测到非验证请求"专属 Modal，不再退化生成全 placeholder；`OFFTOPIC_GATE_ENABLED=false` 紧急 kill-switch；新增 `services/rag/engine.py::dense_top1_score` helper 复用 Qdrant dense 通道
+- **off-topic 校准与回归基础设施**：`backend/scripts/calibrate_offtopic_threshold.py` 经验校准脚本（输出阈值候选 + 召回/拒绝率曲线）；`backend/tests/data/offtopic_corpus.yaml` 双标签语料；`tests/test_offtopic_corpus_mocked.py`（CI 默认，always-on 路由回归）+ `tests/test_offtopic_corpus_real_llm.py --real-llm`（活模型精度探针）双套件
+- **per-config thinking-disable 开关**：`llm_configs` 表新增 `step2_disable_thinking` BOOLEAN 列（NOT NULL DEFAULT true，迁移 `002_step2_disable_thinking.py`），Admin UI 加 Switch；`normalize_intent` 与 `_step1_select_id` 硬编码禁 thinking 收紧 `max_tokens`（512 / 64），`_step2_fill_params` 由配置切换（true → `max_tokens=2048` 禁 thinking，false → `max_tokens=1024` 保留 thinking）；GLM-4.7 实测单次推理由 12-249s 降至 ~3s
+- **LLM 调用 per-stage 延迟与 thinking 状态打点**：每次 OpenAI-compat 调用打点 `[Timing] llm=<name> ms=<n> reasoning_tokens=<n> thinking=<on/off>`，便于运行时验证 `extra_body={"thinking":{"type":"disabled"}}` 是否真正被模型识别（`reasoning_tokens=0` 确认生效）
+- **expr_type 驱动的标识符规范化 + 表达式校验**：模板 YAML 的 `parameters[].expr_type` 字段声明语法类型（`sv_identifier` / `sv_identifier_list` / `sv_boolean_expr` / `sv_bins_expr`）；新增 `services/core/identifier.py`（SV 标识符 sanitize + IDENTIFIER_PARAMS 兜底白名单 + `construct_group_name`）和 `services/core/expr_validator.py`（轻量手写状态机校验布尔/列表/bins 表达式）；`_map_params_with_source` 末尾追加 expr_type-driven Step 7，覆盖所有 5 类源（sv_identifier 类静默清洗并标 `sanitized=True`，布尔/bins 类校验失败仅附 `validation_error`）；`PreviewResponse.params` schema 新增 `sanitized` / `expr_type` / `validation_error` 三字段供前端徽标提示，前端镜像 `frontend/src/utils/exprValidators.ts` 做同款实时校验
+- **客户端 / SDK 超时延长至 300s**：前端 `/generate` 与 `/generate/preview` 客户端超时 180s → 300s；后端 `OpenAICompatClient` 显式设 read=300s，避免默认 60s 在 thinking ON 模式下被前端 abort
+- **平台与测试 bug 跟踪日志**：`docs/platform-bug.md` + `docs/test-bug.md`，配合 v1.0.0 alpha 阶段缺陷追踪闭环
+
+### Changed
+- ARCHITECTURE v2.14 → v2.16、PRD v2.9 → v2.11：补齐 §1.1 "always produce code" 契约**收窄为仅对域内 IC 输入**、§3.12.2 per-call thinking/`max_tokens` 矩阵、§4.1 `llm_configs.step2_disable_thinking` 列；PRD §3.5.1 新增"Step2 禁用 thinking"开关、§4.3 性能分档刷新（默认配置回到 < 10s）
+- CLAUDE.md：新增 GLM-4.7 thinking-disable 策略章节 + step2 thinking ablation 矩阵 + off-topic 闸契约说明
+- normalize_intent 提示词回退为纯句式改写（撤掉前一轮临时的 sentinel 注入式 off-topic 检测方案）
+
+### Fixed
+- dev overlay (`docker-compose.dev.yml`) 之前误用小尺寸 embedding model 与 Qdrant 1024-dim collection 维度冲突导致生成全链路失败，统一回 bge-m3
+- Admin LLM 配置 GET 接口在新增 `step2_disable_thinking` 列后未在 `_to_config_out` 透出该字段，导致 Pydantic schema 校验失败返 500
+
+---
+
 ## [0.4.0] - 2026-05-07
 
 ### Added
@@ -97,7 +119,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-[Unreleased]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/joeyhetao/DV_ACODE_GEN_PLATFORM/compare/v0.1.0...v0.2.0

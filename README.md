@@ -6,10 +6,12 @@ IC验证辅助代码生成平台 — 输入结构化需求表，确定性输出 
 
 ## 核心特性
 
-- **确定性生成**：相同输入必然产生相同输出（Redis缓存 → 算法匹配引擎 → Jinja2渲染三层保障）
+- **确定性生成**：相同输入必然产生相同输出（Redis缓存 → 算法匹配引擎 → Jinja2渲染三层保障），仅对域内 IC 验证输入承诺
 - **LLM 仅做参数提取**：temperature=0 + JSON Schema，不参与代码生成
 - **双表格输入**：SVA需求表 + 功能覆盖率需求表（Excel格式）
-- **两步式确认面板**：preview 返回 RAG Top-3 候选 + 参数预填值（5 类来源徽标），用户切换候选/编辑参数后再 render；意图缓存命中自动短路
+- **两步式确认面板**：preview 返回 RAG Top-3 候选 + 参数预填值（5 类来源徽标 + expr_type 校验/清洗结果），用户切换候选/编辑参数后再 render；意图缓存命中自动短路
+- **无关意图拒绝**：RAG dense 余弦阈值闸（默认 0.44）在 LLM 调用前直接返回 HTTP 422，避免对诗歌/闲聊/通用代码请求生成全 placeholder 占位代码
+- **Thinking 模型友好**：GLM-4.7 / DeepSeek-R1 等三步调用按用途独立调档；step2 thinking 开关在 Admin UI 可切（默认禁，实测从 12-249s 降至 ~3s）
 - **三级权限**：普通用户 / 库管理员 / 超管
 - **批量处理**：Excel 批量导入，打包下载生成结果
 
@@ -56,20 +58,21 @@ docker compose up --build
 
 当前阶段：**核心功能实现完成，待 Alpha 测试**
 
-- [x] PRD 确认（v2.9）
-- [x] 架构设计（ARCHITECTURE v2.14）
+- [x] PRD 确认（v2.11）
+- [x] 架构设计（ARCHITECTURE v2.16）
 - [x] 后端骨架搭建
-- [x] 确定性引擎核心实现（pipeline / renderer / dedup / cache + expr_type 校验/规范化层）
+- [x] 确定性引擎核心实现（pipeline / renderer / dedup / cache + identifier 规范化 + expr_validator 校验）
 - [x] 三阶段 RAG 检索流水线（混合检索 → ColBERT 精排 → Cross-Encoder 重排，含关键词补充召回兜底）
-- [x] 两步式 UI 确认面板（preview + render，5 类参数源徽标，意图缓存短路）
+- [x] 无关意图 dense 余弦阈值闸（HTTP 422 + 前端专属 Modal + 校准脚本 + 回归语料）
+- [x] 两步式 UI 确认面板（preview + render，5 类参数源徽标 + expr_type 清洗/校验提示，意图缓存短路）
 - [x] 前端框架搭建（生成页、意图构建器、模板库、批量处理、管理控制台、登录/注册）
 - [x] 模板库初始化（SVA 断言 6 个 + 功能覆盖率 4 个）
 - [x] 批量处理 & Celery 任务队列
-- [x] LLM 多模型配置管理（Anthropic / OpenAI 兼容 / GLM / DeepSeek / Ollama，含 thinking-model 两步纯文本调用）
+- [x] LLM 多模型配置管理（Anthropic / OpenAI 兼容 / GLM / DeepSeek / Ollama，per-call thinking/`max_tokens` 调档 + Admin UI step2 thinking 开关）
 - [x] 独立嵌入服务（BGE-M3 + BGE Reranker，支持 GPU/CPU）
 - [x] Docker Compose 完整栈（含开发热重载、GPU 部署 overlay）
 - [x] 部署手册（[dev-windows](docs/deployment-dev-windows.md) / [prod-linux](docs/deployment-prod-linux.md) / [WSL 启动](docs/startup-wsl.md)）
-- [x] 单元测试基础落地（pipeline preview/render + 正则参数提取）
+- [x] 单元测试基础落地（pipeline preview/render + 正则参数提取 + off-topic mocked 回归套件）
 - [ ] Alpha 测试
 
 ## License
