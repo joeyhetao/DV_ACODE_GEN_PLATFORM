@@ -19,6 +19,10 @@ class Settings(BaseSettings):
 
     # Embedding service
     embedding_service_url: str = "http://localhost:8001"
+    # 维度必须匹配 EMBED_MODEL 实际输出（bge-m3=1024, bge-large-en-v1.5=1024,
+    # Qwen3-Embedding-4B=2560）。换模型时同步改本字段；启动时若 Qdrant 中已存在
+    # 的 collection 维度与本设置不一致，main.py:_init_qdrant_collection 将日志告警。
+    embedding_dim: int = 1024
 
     # LLM
     anthropic_api_key: str = ""

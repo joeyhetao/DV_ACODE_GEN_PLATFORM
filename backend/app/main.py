@@ -61,12 +61,29 @@ async def _init_qdrant_collection():
         await qdrant.create_collection(
             collection_name=settings.qdrant_collection,
             vectors_config={
-                "dense": VectorParams(size=1024, distance=Distance.COSINE),
+                "dense": VectorParams(size=settings.embedding_dim, distance=Distance.COSINE),
             },
             sparse_vectors_config={
                 "sparse": SparseVectorParams(index=SparseIndexParams()),
             },
         )
+    else:
+        # collection 已存在：检查 dense 维度与当前配置一致，避免 embed_dim 改了
+        # 但 Qdrant 端没 reindex 导致 upsert 时 dimension mismatch 静默失败。
+        info = await qdrant.get_collection(settings.qdrant_collection)
+        actual_dim = None
+        params = getattr(info.config, "params", None)
+        vectors = getattr(params, "vectors", None) if params else None
+        if vectors and isinstance(vectors, dict):
+            dense_cfg = vectors.get("dense")
+            actual_dim = getattr(dense_cfg, "size", None) if dense_cfg else None
+        if actual_dim is not None and actual_dim != settings.embedding_dim:
+            print(
+                f"[WARN] Qdrant collection {settings.qdrant_collection!r} dense dim={actual_dim} "
+                f"!= settings.embedding_dim={settings.embedding_dim}. "
+                f"换 embedding 模型后必须 `lib_manager.py rebuild` 重建 collection。",
+                flush=True,
+            )
 
 
 settings = get_settings()
