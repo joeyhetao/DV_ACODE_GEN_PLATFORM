@@ -40,6 +40,7 @@ def _build_client(config, api_key: str | None = None) -> LLMClient:
             temperature=config.temperature,
             max_tokens=config.max_tokens,
             output_mode=config.output_mode,
+            step2_disable_thinking=config.step2_disable_thinking,
         )
 
 

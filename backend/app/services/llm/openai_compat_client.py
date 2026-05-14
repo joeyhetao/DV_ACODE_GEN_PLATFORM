@@ -25,6 +25,19 @@ def _extract_json(text: str) -> dict:
     return json.loads(match.group())
 
 
+def _reasoning_tokens(resp) -> int | str:
+    """从 OpenAI 兼容响应里取 reasoning_tokens；非 thinking 模型或 SDK 旧版返 'n/a'。"""
+    try:
+        details = resp.usage.completion_tokens_details
+        if details is None:
+            return "n/a"
+        if isinstance(details, dict):
+            return details.get("reasoning_tokens", "n/a")
+        return getattr(details, "reasoning_tokens", "n/a")
+    except AttributeError:
+        return "n/a"
+
+
 class OpenAICompatLLMClient(LLMClient):
     def __init__(
         self,
@@ -34,6 +47,7 @@ class OpenAICompatLLMClient(LLMClient):
         temperature: float = 0.0,
         max_tokens: int = 2048,
         output_mode: str = "tool_calling",
+        step2_disable_thinking: bool = True,
     ) -> None:
         self._client = openai.AsyncOpenAI(
             api_key=api_key, base_url=base_url, timeout=_LLM_HTTPX_TIMEOUT,
@@ -42,6 +56,8 @@ class OpenAICompatLLMClient(LLMClient):
         self._temperature = temperature
         self._max_tokens = max_tokens
         self._output_mode = output_mode  # 保留字段供未来扩展，当前两步均使用纯文本
+        # step2 是否禁 thinking。normalize/step1 已硬编码禁；step2 默认禁但可通过 Admin UI 关掉。
+        self._step2_disable_thinking = step2_disable_thinking
 
     async def normalize_intent(self, original_intent: str, rules: str) -> str:
         system = f"你是IC验证领域专家。将用户提供的验证意图改写为标准句式。\n\n规则：\n{rules}"
@@ -58,7 +74,11 @@ class OpenAICompatLLMClient(LLMClient):
                 {"role": "user", "content": original_intent},
             ],
         )
-        print(f"[Timing] llm=normalize_intent ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
+        print(
+            f"[Timing] llm=normalize_intent ms={int((time.perf_counter() - _t) * 1000)} "
+            f"reasoning_tokens={_reasoning_tokens(resp)} thinking=off",
+            flush=True,
+        )
         return resp.choices[0].message.content.strip()
 
     async def select_template(
@@ -129,7 +149,11 @@ class OpenAICompatLLMClient(LLMClient):
                 {"role": "user", "content": user},
             ],
         )
-        print(f"[Timing] llm=step1_select_id ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
+        print(
+            f"[Timing] llm=step1_select_id ms={int((time.perf_counter() - _t) * 1000)} "
+            f"reasoning_tokens={_reasoning_tokens(resp)} thinking=off",
+            flush=True,
+        )
         content = (resp.choices[0].message.content or "").strip()
         print(f"[GLM Step1] raw={content!r} finish={resp.choices[0].finish_reason}", flush=True)
 
@@ -163,19 +187,36 @@ class OpenAICompatLLMClient(LLMClient):
             f'输出示例：{{"group_name": "cur_state", "signal": "cur_state", "signal_width": "3"}}'
         )
 
-        # Step2 保留 thinking：FSM state_list / bins_expr 等边界场景靠推理填出正确值，禁了会掉准。
-        # max_tokens 从 4096 收回到 1024：实测 reasoning ≤ 600 tokens + JSON 输出 ~150 tokens 足够。
+        # Step2 由 self._step2_disable_thinking（来自 llm_configs.step2_disable_thinking）控制：
+        # - True（默认）：禁 thinking，max_tokens=2048（纯输出可宽，反正不再被 reasoning 占）。
+        #   实测 GLM-4.7 single call ~3s 稳定。
+        # - False：保留 thinking，max_tokens=1024（reasoning ≤ 600 + JSON ~150）。FSM state_list /
+        #   bins_expr 等边界场景靠推理填准；但实测方差 12-249s，偶发 finish=length 返空。
+        if self._step2_disable_thinking:
+            create_kwargs: dict = {"extra_body": {"thinking": {"type": "disabled"}}}
+            step2_max_tokens = 2048
+            thinking_label = "off"
+        else:
+            create_kwargs = {}
+            step2_max_tokens = 1024
+            thinking_label = "on"
+
         _t = time.perf_counter()
         resp = await self._client.chat.completions.create(
             model=self._model,
-            max_tokens=1024,
+            max_tokens=step2_max_tokens,
             temperature=0.0,
             messages=[
                 {"role": "system", "content": system},
                 {"role": "user", "content": user},
             ],
+            **create_kwargs,
         )
-        print(f"[Timing] llm=step2_fill_params ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
+        print(
+            f"[Timing] llm=step2_fill_params ms={int((time.perf_counter() - _t) * 1000)} "
+            f"reasoning_tokens={_reasoning_tokens(resp)} thinking={thinking_label}",
+            flush=True,
+        )
         content = resp.choices[0].message.content or ""
         print(f"[GLM Step2] raw={content!r} finish={resp.choices[0].finish_reason}", flush=True)
 

@@ -14,6 +14,7 @@ class LLMConfigCreate(BaseModel):
     max_tokens: int = 2048
     is_active: bool = True
     is_default: bool = False
+    step2_disable_thinking: bool = True
 
 
 class LLMConfigUpdate(BaseModel):
@@ -27,6 +28,7 @@ class LLMConfigUpdate(BaseModel):
     max_tokens: int | None = None
     is_active: bool | None = None
     is_default: bool | None = None
+    step2_disable_thinking: bool | None = None
 
 
 class LLMConfigOut(BaseModel):
@@ -41,6 +43,7 @@ class LLMConfigOut(BaseModel):
     max_tokens: int
     is_active: bool
     is_default: bool
+    step2_disable_thinking: bool
     created_at: datetime
     updated_at: datetime
 

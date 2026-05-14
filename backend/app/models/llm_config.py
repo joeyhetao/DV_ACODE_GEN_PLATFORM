@@ -27,6 +27,11 @@ class LLMConfig(Base):
     max_tokens: Mapped[int] = mapped_column(Integer, nullable=False, default=512)
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # 仅 OpenAI 兼容 provider 生效（智谱 GLM / DeepSeek 系）；Anthropic 走 extended_thinking 不受此控制。
+    # 默认 True：实测 GLM-4.7 step2 thinking ON 单次 12-249s，禁后 ~3s（ARCHITECTURE.md §3.12.2）。
+    step2_disable_thinking: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true",
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True),
         nullable=False,

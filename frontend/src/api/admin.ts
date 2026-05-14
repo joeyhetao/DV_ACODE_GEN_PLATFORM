@@ -4,7 +4,8 @@ export interface LLMConfig {
   id: string; name: string; provider: string; base_url?: string
   api_key_masked: string; model_id: string; output_mode: string
   temperature: number; max_tokens: number; is_active: boolean
-  is_default: boolean; created_at: string; updated_at: string
+  is_default: boolean; step2_disable_thinking: boolean
+  created_at: string; updated_at: string
 }
 
 export const adminApi = {

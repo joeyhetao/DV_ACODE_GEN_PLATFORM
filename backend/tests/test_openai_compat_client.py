@@ -22,12 +22,13 @@ def _make_resp(content: str = "ok"):
     return resp
 
 
-def _make_client():
+def _make_client(step2_disable_thinking: bool = True):
     with patch("openai.AsyncOpenAI"):
         client = OpenAICompatLLMClient(
             api_key="sk-test",
             model_id="glm-4.7",
             base_url="https://open.bigmodel.cn/api/paas/v4",
+            step2_disable_thinking=step2_disable_thinking,
         )
     return client
 
@@ -63,8 +64,9 @@ async def test_step1_select_id_disables_thinking_and_caps_max_tokens():
 
 
 @pytest.mark.asyncio
-async def test_step2_fill_params_keeps_thinking_and_caps_max_tokens():
-    client = _make_client()
+async def test_step2_disables_thinking_when_flag_true():
+    """默认（llm_configs.step2_disable_thinking=True）：禁 thinking + max_tokens=2048。"""
+    client = _make_client(step2_disable_thinking=True)
     client._client = MagicMock()
     client._client.chat.completions.create = AsyncMock(
         return_value=_make_resp('{"group_name":"cur_state","signal":"cur_state","signal_width":"3"}')
@@ -82,7 +84,29 @@ async def test_step2_fill_params_keeps_thinking_and_caps_max_tokens():
     )
 
     kwargs = client._client.chat.completions.create.call_args.kwargs
-    assert "extra_body" not in kwargs, "Step2 必须保留 thinking，不应传 extra_body 禁用"
+    assert kwargs["extra_body"] == {"thinking": {"type": "disabled"}}
+    assert kwargs["max_tokens"] == 2048
+
+
+@pytest.mark.asyncio
+async def test_step2_keeps_thinking_when_flag_false():
+    """Admin UI 关掉 step2_disable_thinking：保留 thinking + max_tokens=1024（旧行为）。"""
+    client = _make_client(step2_disable_thinking=False)
+    client._client = MagicMock()
+    client._client.chat.completions.create = AsyncMock(
+        return_value=_make_resp('{"group_name":"cur_state"}')
+    )
+
+    required = [{"name": "group_name", "description": "分组名", "type": "string"}]
+    await client._step2_fill_params(
+        intent="对 cur_state 做状态覆盖率",
+        signal_context="clk=clk rst=rst_n",
+        template_id="tpl_fsm",
+        required_params=required,
+    )
+
+    kwargs = client._client.chat.completions.create.call_args.kwargs
+    assert "extra_body" not in kwargs, "step2_disable_thinking=False 时不应传 extra_body"
     assert kwargs["max_tokens"] == 1024
 
 

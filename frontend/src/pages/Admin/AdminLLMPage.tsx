@@ -87,6 +87,7 @@ export default function AdminLLMPage() {
     { title: '模式', dataIndex: 'output_mode', width: 120, render: (v: string) => <Tag color="purple">{v}</Tag> },
     { title: '默认', dataIndex: 'is_default', width: 70, render: (v: boolean) => v ? <Tag color="gold">默认</Tag> : '—' },
     { title: '激活', dataIndex: 'is_active', width: 70, render: (v: boolean) => <Tag color={v ? 'green' : 'red'}>{v ? '是' : '否'}</Tag> },
+    { title: 'Step2 禁 thinking', dataIndex: 'step2_disable_thinking', width: 130, render: (v: boolean) => <Tag color={v ? 'blue' : 'orange'}>{v ? '禁' : '保留'}</Tag> },
     {
       title: '操作', width: 220,
       render: (_: unknown, r: LLMConfig) => (
@@ -155,6 +156,15 @@ export default function AdminLLMPage() {
             </Form.Item>
           </Space>
           <Form.Item name="is_active" label="激活" valuePropName="checked" initialValue={true}>
+            <Switch />
+          </Form.Item>
+          <Form.Item
+            name="step2_disable_thinking"
+            label="Step2 禁用 thinking"
+            valuePropName="checked"
+            initialValue={true}
+            extra="仅 OpenAI 兼容 provider 生效。禁用后单次 ~3s；保留 thinking 单次 12-250s 但 FSM state_list / bins_expr 等边界场景填参更准。GLM-4.7 / DeepSeek-R1 推荐开。"
+          >
             <Switch />
           </Form.Item>
         </Form>
