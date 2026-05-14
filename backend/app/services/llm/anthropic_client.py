@@ -1,9 +1,15 @@
 from __future__ import annotations
 import json
 import anthropic
+import httpx
 
 from app.schemas.intent import TemplateSelectionOutput
 from app.services.llm.base import LLMClient
+
+
+# thinking 模型（GLM-4.7、DeepSeek-R1、Claude 4.x extended thinking 等）单次推理 20-60s。
+# 显式设 read=300s，避免默认 connect=5s 在网络抖动时早断；read=300s 跟 nginx 同步。
+_LLM_HTTPX_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
 
 _TOOL_DEF = {
     "name": "select_template",
@@ -29,7 +35,7 @@ _TOOL_DEF = {
 
 class AnthropicLLMClient(LLMClient):
     def __init__(self, api_key: str, model_id: str, temperature: float = 0.0, max_tokens: int = 512) -> None:
-        self._client = anthropic.AsyncAnthropic(api_key=api_key)
+        self._client = anthropic.AsyncAnthropic(api_key=api_key, timeout=_LLM_HTTPX_TIMEOUT)
         self._model = model_id
         self._temperature = temperature
         self._max_tokens = max_tokens

@@ -1,10 +1,16 @@
 from __future__ import annotations
 import json
 import re
+import httpx
 import openai
 
 from app.schemas.intent import TemplateSelectionOutput
 from app.services.llm.base import LLMClient
+
+
+# thinking 模型（GLM-4.7、DeepSeek-R1 等）单次推理 20-60s。显式设 read=300s 避免默认
+# 5s connect 在网络抖动时早断；与 nginx proxy_read_timeout=300s 对齐。
+_LLM_HTTPX_TIMEOUT = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
 
 
 def _extract_json(text: str) -> dict:
@@ -28,7 +34,9 @@ class OpenAICompatLLMClient(LLMClient):
         max_tokens: int = 2048,
         output_mode: str = "tool_calling",
     ) -> None:
-        self._client = openai.AsyncOpenAI(api_key=api_key, base_url=base_url)
+        self._client = openai.AsyncOpenAI(
+            api_key=api_key, base_url=base_url, timeout=_LLM_HTTPX_TIMEOUT,
+        )
         self._model = model_id
         self._temperature = temperature
         self._max_tokens = max_tokens
