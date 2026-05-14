@@ -129,15 +129,17 @@ Don't hardcode `if code_type == "assertion"` branches — go through the registr
 
 `app/services/llm/factory.py` reads `llm_configs` table (rows are seeded via Admin UI; `is_default=true` row wins) and instantiates either `AnthropicClient` or `OpenAICompatClient`. Anthropic uses native tool calling; OpenAI-compatible uses the **two-step plain-text** path (`_step1_select_id` + `_step2_fill_params`) to survive thinking-model `reasoning_tokens` consumption (GLM-4.7, DeepSeek-R1). The schema field `output_mode` is reserved for future routing — do not assume it gates behavior today.
 
-**Thinking-disable contract for GLM-4.7-class endpoints** (Zhipu OpenAI-compatible): the three LLM calls are tuned per-call rather than client-level, because they have different reasoning needs:
+**Thinking-disable contract for GLM-4.7-class endpoints** (Zhipu OpenAI-compatible): the three LLM calls are tuned per-call. `normalize_intent` and `_step1_select_id` are hardcoded to disable thinking; `_step2_fill_params` is **runtime-configurable via `llm_configs.step2_disable_thinking`** (Admin UI Switch).
 
 | Call | `extra_body` | `max_tokens` | Rationale |
 |---|---|---|---|
-| `normalize_intent` | `{"thinking":{"type":"disabled"}}` | 512 | Pure sentence rewriting per fixed rules — zero reasoning value |
-| `_step1_select_id` | `{"thinking":{"type":"disabled"}}` | 64 | Pick-from-list classifier — discriminators already in system prompt; RAG fallback in `pipeline.py` is the safety net for any misclassification |
-| `_step2_fill_params` | *not set* (thinking ON) | 1024 | FSM `state_list` / `bins_expr` edge cases need chain-of-thought to fill correctly |
+| `normalize_intent` | `{"thinking":{"type":"disabled"}}` (hardcoded) | 512 | Pure sentence rewriting per fixed rules — zero reasoning value |
+| `_step1_select_id` | `{"thinking":{"type":"disabled"}}` (hardcoded) | 64 | Pick-from-list classifier — discriminators already in system prompt; RAG fallback in `pipeline.py` is the safety net for any misclassification |
+| `_step2_fill_params` | conditional: `{"thinking":{"type":"disabled"}}` if `step2_disable_thinking=true` (default), else not set | 2048 (off) / 1024 (on) | **Default off**: empirical p50 ~3s. **On (legacy)**: 12-249s variance, occasional `finish=length`. Toggle off when FSM `state_list` / `bins_expr` accuracy needs to be validated against thinking baseline. |
 
 `extra_body={"thinking":{"type":"disabled"}}` is the Zhipu native parameter (the OpenAI SDK passes it through). DeepSeek-style `chat_template_kwargs.enable_thinking=false` only works on self-hosted vLLM and is NOT used here. When swapping in a non-thinking model, the `extra_body` is silently ignored — no behavior change needed.
+
+Every LLM call emits `[Timing] llm=<name> ms=<n> reasoning_tokens=<n> thinking=<on/off>` so you can verify at runtime whether thinking actually disabled (`reasoning_tokens=0` = confirmed off). Use this to debug if a model variant silently ignores the `extra_body`.
 
 API keys are AES-256-GCM encrypted with `LLM_KEY_ENCRYPTION_SECRET`. GET only returns a hint; PUT with empty `api_key` keeps the existing ciphertext.
 
