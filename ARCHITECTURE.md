@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.14  
+**版本**：v2.15  
 **状态**：已确认  
-**日期**：2026-05-07  
+**日期**：2026-05-13  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -19,6 +19,7 @@
 - v2.11 → v2.12：流水线鲁棒性与 thinking 模型支持——OpenAI 兼容客户端拆为"选模板 + 填参数"两步纯文本调用，规避 GLM-4.7 等 thinking 模型 reasoning_tokens 截断问题，max_tokens 提升至 4096（§3.12.2、§3.12.3）；Pipeline 在 RAG 后增加关键词补充召回、意图正则参数提取、LLM 失败 fallback 三层兜底（§3.15.3）；lib_manager 用 `uuid.uuid5(NAMESPACE_DNS, template.id)` 派生确定性 Qdrant point ID，修复 rebuild 重复 point bug（§3.8）；新增 docker-compose.hotreload.yml 开发 overlay（§8.2）；nginx 入口启用 Docker 内置 resolver `127.0.0.11 valid=10s` + 变量化 proxy_pass，解决 backend 容器重启后 nginx 缓存旧 IP 导致 502 的问题（§8.3）；前端容器 nginx 对 index.html 强制 `no-cache` 响应头，确保 hash 化 bundle 升级后浏览器立即拉新（§8.3）
 - v2.12 → v2.13：方案 3 两步式 UI 落地——`run_pipeline` 拆为 `pipeline_preview` + `pipeline_render`（§3.15.3），新增 `/api/v1/generate/preview` 端点 + 增强 `/api/v1/generate/render` 端点（§5.1）；`_map_params` 重写为 `_map_params_with_source`，每参数标注 5 类来源（signal_list / regex / llm / default / placeholder）（§3.15.4）；新增 `confidence_source` 字段区分 LLM 主动选中 vs RAG fallback vs 意图缓存命中（§3.15.5）；前端引入 ConfirmationPanel + ParametersForm 两步式确认面板（§3.16），意图缓存命中走 `quick_render=true` 路径自动跳过确认；既有 `/generate` 端点改为内部调 preview+render，对 batch_tasks 调用方零变更
 - v2.13 → v2.14：参数 expr_type 元数据 + 标识符规范化层落地——模板 YAML 的 `parameters[].expr_type` 字段声明参数语法类型（`sv_identifier` / `sv_identifier_list` / `sv_boolean_expr` / `sv_bins_expr`）；新增 `services/core/identifier.py`（SV 标识符 sanitize + IDENTIFIER_PARAMS 兜底白名单 + `construct_group_name`）和 `services/core/expr_validator.py`（轻量手写状态机校验布尔/列表/bins 表达式）；`_map_params_with_source` 末尾追加 expr_type-driven Step 7（覆盖所有 5 类源，sv_identifier 类参数被静默清洗、布尔/bins 类校验失败仅打 `validation_error`）（§3.15.5 新增）；`PreviewResponse.params` schema 新增 `sanitized` / `expr_type` / `validation_error` 三字段供前端徽标提示；前端镜像 `frontend/src/utils/exprValidators.ts`（§7）；§5.1 端点表补齐 `/api/v1/generate/preview`、`/api/v1/auth/register`、`/api/v1/auth/me`、`/api/health`，移除不存在的 `/api/v1/auth/refresh`；`lib_manager.py import` 在参数缺 `expr_type` 时输出 WARN 提示
+- v2.14 → v2.15：契约修订 + RAG 原生 off-topic 闸——"always produce code" 契约**收窄为仅对域内 IC 输入**（§1.1）；新增 `services/rag/engine.py::dense_top1_score` helper 复用 Qdrant dense 通道；`pipeline_preview` 头部插入 dense 阈值闸（用 `original_intent` 而非 `normalized`——后者会被 LLM 改写成"无法判断类型"等元说明意外抬高 off-topic 分数），低于 `OFFTOPIC_DENSE_THRESHOLD`（校准默认 0.44）抛 `OffTopicIntentError` 返 HTTP 422；`generate.py` 端点结构化 detail（`type=off_topic` + `detector` + `top_dense_score` + `threshold`）让前端弹专属 Modal；`OFFTOPIC_GATE_ENABLED=false` 紧急 kill-switch；删除前一轮的 normalizer sentinel 注入式临时方案（恢复 `normalize_intent` 提示词为纯改写）；新增 `backend/scripts/calibrate_offtopic_threshold.py` 经验校准脚本；回归语料 `backend/tests/data/offtopic_corpus.yaml` + mock/real-LLM 双套件保留
 
 ---
 
@@ -54,6 +55,8 @@ LLM 本质上是概率性的，但平台要求输出是确定性的。完整 RAG
 
 **LLM 在 RAG 中的职责边界**：接收检索到的模板作为上下文，输出"选择哪个模板 + 填入哪些参数"，**不生成任何代码**。代码生成完全由 Jinja2 完成。
 
+**契约修订（v2.15）**：原"always produce code"契约范围收窄为**仅对域内（IC 验证）输入**。无关意图（诗歌/闲聊/数学题/通用代码请求等）经 RAG 之前的 dense 余弦阈值闸（threshold=0.44，原文 embedding × Qdrant top1 < 阈值）直接 HTTP 422 拒绝，不进入 LLM 调用链。阈值由 `backend/scripts/calibrate_offtopic_threshold.py` 在 `backend/tests/data/offtopic_corpus.yaml` 上经验校准；emergency kill-switch `OFFTOPIC_GATE_ENABLED=false`。
+
 **四层确定性保障**：
 
 | 层次 | 机制 | 确定性强度 |
@@ -62,6 +65,7 @@ LLM 本质上是概率性的，但平台要求输出是确定性的。完整 RAG
 | 检索层 | bge-m3 固定模型版本 + Qdrant 算法确定性 + ColBERT MaxSim 纯数学计算 | 算法确定性 |
 | 解析层 | temperature=0 + JSON Schema 工具调用 + Pydantic 归一化 | 强约束确定性 |
 | 渲染层 | Jinja2 StrictUndefined，参数缺失报错不静默 | 100% 确定性 |
+| 域过滤 | dense 余弦阈值闸，无关意图早返 422，不进入下游 | 拒绝路径确定性 |
 
 ---
 

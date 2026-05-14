@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-IC verification assistant code generation platform: structured Excel input → deterministic SVA assertion / UVM functional coverage code. Authoritative spec is `PRD.md` (v2.7) and `ARCHITECTURE.md` (v2.13). README and CONTRIBUTING are in Chinese; design docs are the source of truth.
+IC verification assistant code generation platform: structured Excel input → deterministic SVA assertion / UVM functional coverage code. Authoritative spec is `PRD.md` (v2.9) and `ARCHITECTURE.md` (v2.14). README and CONTRIBUTING are in Chinese; design docs are the source of truth.
 
 ## Common commands
 
@@ -46,16 +46,22 @@ docker compose exec backend pytest tests/test_pipeline_preview_render.py::test_n
 
 # Or host-native
 cd backend && pytest tests/ -v
+
+# Off-topic regression corpus — real-LLM mode (requires llm_configs default row)
+docker compose exec backend pytest tests/test_offtopic_corpus_real_llm.py --real-llm -v
 ```
+
+`tests/data/offtopic_corpus.yaml` is the contract for "what counts as off-topic vs marginal IC". When you hit a misclassification, add a sample and let the mock suite enforce it forever. See `CONTRIBUTING.md` §11 for the growth workflow.
 
 ### Template library CLI (`backend/lib_manager.py`)
 
 ```bash
 python lib_manager.py import [--dir DIR] [--force]   # import YAML → PG + Qdrant; --force skips semantic dedup
 python lib_manager.py validate [--dir DIR]
-python lib_manager.py rebuild  [--collection NAME]   # rebuild Qdrant from PG (after embedding model swap)
+python lib_manager.py rebuild  [--collection NAME]   # re-sync rows with sync_status=syncing into Qdrant (also use after embedding model swap)
 python lib_manager.py export   [--dir DIR]           # PG → YAML snapshot
-python lib_manager.py list
+python lib_manager.py backup                         # pg_dump → data/backups/
+python lib_manager.py list     [--code-type TYPE]
 ```
 
 Run inside the backend container so it inherits service URLs.
@@ -71,7 +77,9 @@ npm run lint     # ESLint with --max-warnings 0
 
 ## Architecture: the determinism contract
 
-**The single most important constraint**: the platform must produce identical output for identical input. The LLM is *only* allowed to choose a template ID and map signal names to template parameters — it never generates code. Code comes from Jinja2 rendering. Read `ARCHITECTURE.md` §1.1 before changing anything in `services/core/` or `services/llm/`.
+**The single most important constraint**: the platform must produce identical output for identical input **for in-domain inputs**. The LLM is *only* allowed to choose a template ID and map signal names to template parameters — it never generates code. Code comes from Jinja2 rendering. Read `ARCHITECTURE.md` §1.1 before changing anything in `services/core/` or `services/llm/`.
+
+**Off-topic inputs are explicitly rejected with HTTP 422**, not silently fall back to placeholder code. The gate lives at the top of `pipeline_preview`: `dense_top1_score(original_intent, code_type) < offtopic_dense_threshold` → `OffTopicIntentError`. Threshold is calibrated empirically against `backend/tests/data/offtopic_corpus.yaml`; rerun `backend/scripts/calibrate_offtopic_threshold.py` after major template-library changes.
 
 Four-layer determinism guard:
 
@@ -88,7 +96,7 @@ Consequence: **never call an LLM from `app/services/core/`**. LLM calls live in 
 
 Two-step flow (UI plan 3, see ARCHITECTURE §3.15–3.16):
 
-- `pipeline_preview(PipelineInput) → PreviewResult` does normalize → intent-cache → RAG → keyword-supplement → LLM step1 (pick id) → LLM step2 (fill params) → multi-source param mapping. Returns each parameter tagged with one of 5 `source`s: `llm` / `regex` / `signal_list` / `default` / `placeholder`. Frontend `ConfirmationPanel` + `ParametersForm` render these with colored badges.
+- `pipeline_preview(PipelineInput) → PreviewResult` does **off-topic dense gate** → normalize → intent-cache → RAG → keyword-supplement → LLM step1 (pick id) → LLM step2 (fill params) → multi-source param mapping. Returns each parameter tagged with one of 5 `source`s: `llm` / `regex` / `signal_list` / `default` / `placeholder`. Frontend `ConfirmationPanel` + `ParametersForm` render these with colored badges.
 - `pipeline_render(RenderInput) → (code, cache_hit)` renders the user-confirmed params with Jinja2, writes generation cache, saves intent history.
 - `quick_render=True` on a preview means intent-cache hit; the frontend skips the confirmation panel.
 
@@ -96,6 +104,15 @@ Two-step flow (UI plan 3, see ARCHITECTURE §3.15–3.16):
 RAG empty → keyword supplement (DB scan over `template.keywords`) → LLM picks none/invalid → take RAG top-1 (and rewrite confidence to RAG score with `confidence_source="rag_fallback"`) → LLM step2 returns nothing → regex `_extract_params_from_intent` → role-hint signal-list mapping → template `default` → semantic fallback (`group_name`/`signal`/`state_list`/`bins_expr`) → required-param placeholder = parameter name itself.
 
 Param precedence (mirrored in `_map_params_with_source`): **llm > regex > signal_list > default > placeholder**.
+
+**Last-line defense — `expr_type` sanitize/validate** (pipeline.py step 7, after the precedence resolution):
+Each `template.parameters[i].expr_type` drives a final pass over the resolved value, regardless of which source produced it:
+
+- `sv_identifier` / `sv_identifier_list` → `sanitize_sv_identifier` from `services/core/identifier.py` rewrites the value to a legal SV ident; flags `sanitized=True` on the param meta.
+- `sv_boolean_expr` / `sv_bins_expr` → validators in `services/core/expr_validator.py` (`EXPR_TYPE_DISPATCH`) check format; failures attach `validation_error` (value untouched).
+- `integer` / `free_text` / unset → skipped (Pydantic and the frontend handle these).
+
+Legacy templates without `expr_type` fall back to the `IDENTIFIER_PARAMS` whitelist (by parameter name) for back-compat. When adding a new template parameter, declare `expr_type` explicitly — don't rely on the name-based fallback.
 
 ## Code-type registry (no-Python-code extension)
 
@@ -110,7 +127,17 @@ Don't hardcode `if code_type == "assertion"` branches — go through the registr
 
 ## LLM client abstraction
 
-`app/services/llm/factory.py` reads `llm_configs` table (rows are seeded via Admin UI; `is_default=true` row wins) and instantiates either `AnthropicClient` or `OpenAICompatClient`. Anthropic uses native tool calling; OpenAI-compatible uses the **two-step plain-text** path (`_step1_select_id` + `_step2_fill_params`, both `max_tokens=4096`) to survive thinking-model `reasoning_tokens` consumption (GLM-4.7, DeepSeek-R1). The schema field `output_mode` is reserved for future routing — do not assume it gates behavior today.
+`app/services/llm/factory.py` reads `llm_configs` table (rows are seeded via Admin UI; `is_default=true` row wins) and instantiates either `AnthropicClient` or `OpenAICompatClient`. Anthropic uses native tool calling; OpenAI-compatible uses the **two-step plain-text** path (`_step1_select_id` + `_step2_fill_params`) to survive thinking-model `reasoning_tokens` consumption (GLM-4.7, DeepSeek-R1). The schema field `output_mode` is reserved for future routing — do not assume it gates behavior today.
+
+**Thinking-disable contract for GLM-4.7-class endpoints** (Zhipu OpenAI-compatible): the three LLM calls are tuned per-call rather than client-level, because they have different reasoning needs:
+
+| Call | `extra_body` | `max_tokens` | Rationale |
+|---|---|---|---|
+| `normalize_intent` | `{"thinking":{"type":"disabled"}}` | 512 | Pure sentence rewriting per fixed rules — zero reasoning value |
+| `_step1_select_id` | `{"thinking":{"type":"disabled"}}` | 64 | Pick-from-list classifier — discriminators already in system prompt; RAG fallback in `pipeline.py` is the safety net for any misclassification |
+| `_step2_fill_params` | *not set* (thinking ON) | 1024 | FSM `state_list` / `bins_expr` edge cases need chain-of-thought to fill correctly |
+
+`extra_body={"thinking":{"type":"disabled"}}` is the Zhipu native parameter (the OpenAI SDK passes it through). DeepSeek-style `chat_template_kwargs.enable_thinking=false` only works on self-hosted vLLM and is NOT used here. When swapping in a non-thinking model, the `extra_body` is silently ignored — no behavior change needed.
 
 API keys are AES-256-GCM encrypted with `LLM_KEY_ENCRYPTION_SECRET`. GET only returns a hint; PUT with empty `api_key` keeps the existing ciphertext.
 
@@ -118,7 +145,7 @@ Switching the default model **flushes both `intent_cache:*` and `cache:*`** beca
 
 ## Data layout
 
-- **PostgreSQL** = source of truth (templates, users, generation history, batch jobs, llm_configs, contributions, audit logs). `templates.qdrant_point_id` links to Qdrant; `sync_status ∈ {ok, syncing, sync_error}` flags cross-store drift (use `lib_manager.py repair --id ...`).
+- **PostgreSQL** = source of truth (templates, users, generation history, batch jobs, llm_configs, contributions, audit logs). `templates.qdrant_point_id` links to Qdrant; `sync_status ∈ {ok, syncing, sync_error}` flags cross-store drift — `lib_manager.py rebuild` re-pushes any row in `syncing` state to Qdrant and flips it back to `ok`.
 - **Qdrant** = derived (rebuildable from PG). Single collection `templates` with named vectors `dense` (1024-d cosine) + `sparse` (RRF). The architecture doc mentions `colbert` as a multi-vector field; the actual `_init_qdrant_collection` in `app/main.py` provisions only `dense` + `sparse` — verify before assuming colbert is live in PG-side init.
 - **Redis** = caches only. `intent_cache:*` (semantic) and `cache:*` (template+params hash) are both LRU-evictable; `maxmemory 2gb / allkeys-lru` set in compose.
 
@@ -135,7 +162,8 @@ backend/app/
 ├── models/        # SQLAlchemy ORM
 ├── schemas/       # Pydantic request/response (TemplateSelectionOutput etc.)
 ├── services/
-│   ├── core/      # pipeline.py, renderer.py, cache.py, dedup.py — DETERMINISTIC ZONE, NO LLM
+│   ├── core/      # pipeline.py, renderer.py, cache.py, dedup.py, identifier.py,
+│   │              # expr_validator.py — DETERMINISTIC ZONE, NO LLM
 │   ├── rag/       # engine.py, stage1_hybrid, stage2_colbert, stage3_reranker
 │   ├── llm/       # base, anthropic_client, openai_compat_client, factory
 │   ├── intent/    # normalizer, builder, preflight, history (4 layers per ARCHITECTURE §3.11)

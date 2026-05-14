@@ -16,6 +16,7 @@
 8. [文档维护规范](#8-文档维护规范)
 9. [版本发布流程](#9-版本发布流程)
 10. [常用命令速查](#10-常用命令速查)
+11. [无关意图回归语料维护](#11-无关意图回归语料维护)
 
 ---
 
@@ -464,6 +465,65 @@ git log --all --grep="keyword"     # 按关键词搜索提交记录
 git blame <file>                   # 查看每行最后一次修改者
 git bisect start                   # 二分法定位引入 bug 的提交
 ```
+
+---
+
+## 11. 无关意图回归语料维护
+
+系统的"无关意图早返"（off-topic gate）依赖 RAG 之前的 dense 余弦阈值闸：原文 → bge-m3 dense embedding → Qdrant top1 余弦 < `OFFTOPIC_DENSE_THRESHOLD`（默认 0.44）→ HTTP 422。这条信号容易在以下情况静默回归：
+
+- bge-m3 模型升级或更换 embedding 服务
+- 模板库扩张（新增 code_type / 新模板使语料分布偏移）
+- 阈值校准失效（语料样本不再典型）
+
+`backend/tests/data/offtopic_corpus.yaml` 是兜底网——一份 checked-in 的"无关意图 vs marginal 真请求"样本集，由两套 pytest 守护：
+
+- `tests/test_offtopic_corpus_mocked.py`：mock LLM，PR 必跑，守 pipeline 逻辑
+- `tests/test_offtopic_corpus_real_llm.py`：调真 LLM，手动跑（`--real-llm` flag），守 prompt + 模型
+
+### 11.1 新增样本的标准流程
+
+**触发点 A：用户报告误判（最高频）**
+1. 拿到原文：用户报"真请求被错拒"或"无关请求过了"
+2. 复现并定位失效信号（通常是 sentinel 没触发 / 误触发）
+3. 在 `offtopic_corpus.yaml` 对应段（`off_topic` 或 `marginal_ic`）加一条样本，必填 `id` / `input` / `code_type[s]` / `added` / `source: "user report YYYY-MM-DD"` / `reason`
+4. **先跑 mock 测——预期当前 fail**（红灯证明语料抓到了真问题）
+5. 改 prompt / 代码使 mock 测变绿 → 提 PR → 永守
+
+**触发点 B：新增 code_type 或重大模板库变更（中频）**
+PR 前 checklist：
+- [ ] `offtopic_corpus.yaml` 是否需要新增样本？
+  - 新 code_type 至少补 1 条 marginal_ic 边界样本
+  - 新模板若引入了以前没法生成的场景，补一条对应输入
+
+**触发点 C：bge-m3 或模板库重大变更（低频但风险高）**
+1. PR 前先跑校准脚本看分布是否偏移：
+   ```bash
+   docker compose exec backend python scripts/calibrate_offtopic_threshold.py
+   ```
+2. 若 off_max 与 marg_min 出现重叠，**优先扩充模板库**让在域请求 embedding 更清晰，不要直接放宽阈值
+3. 校准建议值与现有 `offtopic_dense_threshold` 偏差较大时，更新 `backend/app/core/config.py` 默认值并在 PR description 附校准输出
+4. 真 LLM 端到端测试：`docker compose exec backend pytest tests/test_offtopic_corpus_real_llm.py --real-llm -v`
+5. 个别样本不稳定可标 `flaky: true`——real-LLM 套件会 warn 而非 fail，保留历史
+
+### 11.2 维护准则
+
+- **append-only 优先**：除非彻底改设计契约，不要删除已有样本——它们是历史回归的疫苗
+- **断言保持松散**：不绑具体 `template_id`（避免模板改名/合并破测）
+- **`source` + `reason` 必填**：6 个月后能看懂"这条为什么在这里"
+- **`added` 日期**：便于定期 review 时识别老化样本
+
+### 11.3 跑法速查
+
+```bash
+# PR 必跑：mock 套件（快，纯本地）
+docker compose exec backend pytest tests/test_offtopic_corpus_mocked.py -v
+
+# 手动跑：真 LLM 套件（需 llm_configs 表已配 is_default=true 记录）
+docker compose exec backend pytest tests/test_offtopic_corpus_real_llm.py --real-llm -v
+```
+
+详细 schema 字段约定见 `backend/tests/data/offtopic_corpus.yaml` 文件头注释。
 
 ---
 
