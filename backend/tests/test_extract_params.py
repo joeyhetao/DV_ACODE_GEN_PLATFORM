@@ -514,3 +514,25 @@ def test_map_params_sanitizes_llm_chinese_group_name():
     assert result["ready"]["value"] == "awready"
     assert "sanitized" not in result["valid"]
     assert "sanitized" not in result["ready"]
+
+
+def test_map_params_group_name_falls_back_to_sanitize_when_construct_fails():
+    """group_name 中文 + 同伴信号也都非合法 ident → construct_group_name 返 None →
+    回落到 sanitize_sv_identifier 兜底，仍生成合法 SV 名（不允许把"中文"原样落进
+    covergroup 名让 simulator 报错）。"""
+    template = _FakeTemplate(parameters=[
+        {"name": "group_name", "type": "string", "required": True},
+        {"name": "signal", "type": "string", "required": True, "role_hint": "data"},
+    ])
+    inp = PipelineInput(original_intent="dummy", code_type="coverage", signals=[])
+    llm_mapping = {
+        "group_name": "AXI握手覆盖",         # ← 非法
+        "signal": "数据信号",                # ← 同伴信号也非合法 ident
+    }
+
+    result = _map_params_with_source(template, inp, regex_mapping={}, llm_mapping=llm_mapping)
+
+    # 关键：value 必须是合法 SV identifier，不能是中文字面量。
+    assert is_sv_identifier(result["group_name"]["value"]), \
+        f"got non-legal SV id: {result['group_name']['value']!r}"
+    assert result["group_name"]["sanitized"] is True

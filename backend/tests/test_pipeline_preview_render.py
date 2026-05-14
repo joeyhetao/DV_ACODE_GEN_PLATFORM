@@ -188,7 +188,9 @@ async def test_pipeline_render_cache_hit():
     fake_db.get = AsyncMock(return_value=fake_template)
 
     with patch("app.services.core.pipeline.get_generation_cache",
-               new=AsyncMock(return_value="// cached code")):
+               new=AsyncMock(return_value="// cached code")), \
+         patch("app.services.core.pipeline.get_default_llm_config_id",
+               new=AsyncMock(return_value="cfg_test")):
         req = RenderInput(
             template_id="tmpl_x",
             template_version="1.0.0",
@@ -217,6 +219,8 @@ async def test_pipeline_render_cache_miss_renders_and_writes():
     with patch("app.services.core.pipeline.get_generation_cache", new=AsyncMock(return_value=None)), \
          patch("app.services.core.pipeline.set_generation_cache", new=set_cache_mock), \
          patch("app.services.core.pipeline.save_history", new=save_hist_mock), \
+         patch("app.services.core.pipeline.get_default_llm_config_id",
+               new=AsyncMock(return_value="cfg_test")), \
          patch("app.services.core.pipeline.render_template", return_value="module foo; endmodule"):
         req = RenderInput(
             template_id="tmpl_x",
@@ -250,6 +254,8 @@ async def test_pipeline_render_no_intent_hash_skips_save_history():
     with patch("app.services.core.pipeline.get_generation_cache", new=AsyncMock(return_value=None)), \
          patch("app.services.core.pipeline.set_generation_cache", new=AsyncMock()), \
          patch("app.services.core.pipeline.save_history", new=save_hist_mock), \
+         patch("app.services.core.pipeline.get_default_llm_config_id",
+               new=AsyncMock(return_value="cfg_test")), \
          patch("app.services.core.pipeline.render_template", return_value="// rendered"):
         req = RenderInput(
             template_id="tmpl_x",
@@ -513,3 +519,285 @@ async def test_pipeline_preview_is_deterministic_for_same_input():
 def _values_only_from_preview(result) -> dict:
     """提取 params dict 的 value-only 视图，便于比较确定性契约。"""
     return {name: meta["value"] for name, meta in result.params.items()}
+
+
+# ── keyword_supplement fallback 路径（RAG 返空时由 DB keywords 兜底）────────
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_keyword_supplement_fills_when_rag_empty():
+    """RAG 三阶段返空 → _keyword_supplement 命中 → 候选注入 LLM step1。
+
+    若不命中、不补充，pipeline 会 raise EmptyRetrievalError。这里 mock 补充返回
+    一条候选，验证 LLM 拿到了非空候选列表并被选中。
+    """
+    from contextlib import ExitStack
+    stack = ExitStack()
+    supplement_hit = _make_rag_candidate("sva_handshake_keyword_supplement_v1", score=0.6)
+    llm_pick = TemplateSelectionOutput(
+        template_id="sva_handshake_keyword_supplement_v1",
+        param_mapping={"signal": "valid"},
+        confidence=0.85,
+    )
+
+    stack.enter_context(patch(
+        "app.services.core.pipeline.dense_top1_score", new=AsyncMock(return_value=0.9),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.normalize_intent",
+        new=AsyncMock(return_value=("normalized", "hash_supp")),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.lookup_history", new=AsyncMock(return_value=None),
+    ))
+    # 关键：RAG 三阶段返空
+    stack.enter_context(patch(
+        "app.services.core.pipeline.rag_retrieve", new=AsyncMock(return_value=[]),
+    ))
+    # 关键：keyword 补充非空
+    supplement_mock = AsyncMock(return_value=[supplement_hit])
+    stack.enter_context(patch(
+        "app.services.core.pipeline._keyword_supplement", new=supplement_mock,
+    ))
+    fake_llm = MagicMock()
+    fake_llm.select_template = AsyncMock(return_value=llm_pick)
+    stack.enter_context(patch(
+        "app.services.core.pipeline.get_default_llm_client",
+        new=AsyncMock(return_value=fake_llm),
+    ))
+
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = []
+    fake_tmpl.id = "sva_handshake_keyword_supplement_v1"
+    fake_tmpl.name = "Template sva_handshake_keyword_supplement_v1"
+    fake_tmpl.version = "1.0.0"
+    fake_db = MagicMock()
+    fake_db.get = AsyncMock(return_value=fake_tmpl)
+
+    with stack:
+        result = await pipeline_preview(_make_preview_inp(), fake_db)
+
+    supplement_mock.assert_awaited_once()
+    assert result.template_id == "sva_handshake_keyword_supplement_v1"
+    # LLM 选中的是 keyword 补充注入的候选（RAG 三阶段未召回）→ confidence_source
+    # 应标为 keyword_supplement，让前端 / 日志区分这条 fallback 路径。
+    assert result.confidence_source == "keyword_supplement"
+    assert result.confidence == 0.85
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_rag_empty_and_no_supplement_raises_empty_retrieval():
+    """RAG 返空且 keyword 补充也返空 → EmptyRetrievalError（不是 OffTopicIntentError，
+    也不是 ValueError）。前端应当能区分这两种 422 / 503 路径。"""
+    from app.services.core.pipeline import EmptyRetrievalError
+    from contextlib import ExitStack
+    stack = ExitStack()
+
+    stack.enter_context(patch(
+        "app.services.core.pipeline.dense_top1_score", new=AsyncMock(return_value=0.9),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.normalize_intent",
+        new=AsyncMock(return_value=("normalized", "hash_e")),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.lookup_history", new=AsyncMock(return_value=None),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.rag_retrieve", new=AsyncMock(return_value=[]),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline._keyword_supplement", new=AsyncMock(return_value=[]),
+    ))
+    fake_llm = MagicMock()
+    fake_llm.select_template = AsyncMock()
+    stack.enter_context(patch(
+        "app.services.core.pipeline.get_default_llm_client",
+        new=AsyncMock(return_value=fake_llm),
+    ))
+
+    fake_db = MagicMock()
+    fake_db.get = AsyncMock(return_value=None)
+
+    with stack, pytest.raises(EmptyRetrievalError) as excinfo:
+        await pipeline_preview(_make_preview_inp(), fake_db)
+
+    assert excinfo.value.code_type == "assertion"
+    # LLM 不应被调到（连候选列表都凑不齐）
+    fake_llm.select_template.assert_not_awaited()
+
+
+# ── intent_cache 命中路径 ─────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_intent_cache_hit_returns_quick_render():
+    """intent_hash 命中、fingerprint 匹配 → 直接 quick_render=True，
+    跳过 RAG / keyword / LLM 全链路。"""
+    from contextlib import ExitStack
+    from app.services.intent.history import template_params_fingerprint
+
+    template_params = [
+        {"name": "signal", "required": True, "expr_type": "sv_identifier"},
+    ]
+    fp = template_params_fingerprint(template_params)
+
+    stack = ExitStack()
+    stack.enter_context(patch(
+        "app.services.core.pipeline.dense_top1_score", new=AsyncMock(return_value=0.9),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.normalize_intent",
+        new=AsyncMock(return_value=("normalized cache hit", "hash_cache")),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.lookup_history",
+        new=AsyncMock(return_value={
+            "template_id": "sva_handshake_v1",
+            "version": "1.0.0",
+            "param_mapping": {"signal": "valid"},
+            "confidence": 0.92,
+            "params_fingerprint": fp,
+        }),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.get_generation_cache",
+        new=AsyncMock(return_value="// cached SV code"),
+    ))
+    rag_mock = AsyncMock(return_value=[])
+    stack.enter_context(patch("app.services.core.pipeline.rag_retrieve", new=rag_mock))
+    fake_llm = MagicMock()
+    fake_llm.select_template = AsyncMock()
+    stack.enter_context(patch(
+        "app.services.core.pipeline.get_default_llm_client",
+        new=AsyncMock(return_value=fake_llm),
+    ))
+
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = template_params
+    fake_tmpl.id = "sva_handshake_v1"
+    fake_tmpl.name = "SVA Handshake"
+    fake_tmpl.version = "1.0.0"
+    fake_db = MagicMock()
+    fake_db.get = AsyncMock(return_value=fake_tmpl)
+
+    with stack:
+        result = await pipeline_preview(_make_preview_inp(), fake_db)
+
+    assert result.quick_render is True
+    assert result.confidence_source == "intent_cache"
+    assert result.template_id == "sva_handshake_v1"
+    # 关键：RAG / LLM 都没被调用
+    rag_mock.assert_not_awaited()
+    fake_llm.select_template.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_intent_cache_schema_drift_bypasses_cache():
+    """intent_hash 命中但 params_fingerprint 不匹配（模板被编辑过）→
+    bypass 缓存，走 RAG / LLM 完整路径。防止用旧 mapping 渲染编辑过的模板。"""
+    from contextlib import ExitStack
+
+    # 缓存写入时模板只有 signal 一个参数；现在模板新增了 required state_list。
+    cached_fingerprint = "stale_fp_does_not_match_current_schema_1234"
+
+    stack = ExitStack()
+    stack.enter_context(patch(
+        "app.services.core.pipeline.dense_top1_score", new=AsyncMock(return_value=0.9),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.normalize_intent",
+        new=AsyncMock(return_value=("normalized drift", "hash_drift")),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.lookup_history",
+        new=AsyncMock(return_value={
+            "template_id": "sva_fsm_v1",
+            "version": "1.0.0",
+            "param_mapping": {"signal": "valid"},  # 缺 state_list
+            "confidence": 0.9,
+            "params_fingerprint": cached_fingerprint,
+        }),
+    ))
+    rag_mock = AsyncMock(return_value=[_make_rag_candidate("sva_fsm_v1", score=0.85)])
+    stack.enter_context(patch("app.services.core.pipeline.rag_retrieve", new=rag_mock))
+    stack.enter_context(patch(
+        "app.services.core.pipeline._keyword_supplement", new=AsyncMock(return_value=[]),
+    ))
+    fake_llm = MagicMock()
+    fake_llm.select_template = AsyncMock(return_value=TemplateSelectionOutput(
+        template_id="sva_fsm_v1",
+        param_mapping={"signal": "valid", "state_list": "IDLE,RUN"},
+        confidence=0.9,
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.get_default_llm_client",
+        new=AsyncMock(return_value=fake_llm),
+    ))
+
+    # 当前模板含两个 required 参数 → fingerprint 与 cached_fingerprint 必不等
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "signal", "required": True, "expr_type": "sv_identifier"},
+        {"name": "state_list", "required": True, "expr_type": "free_text"},
+    ]
+    fake_tmpl.id = "sva_fsm_v1"
+    fake_tmpl.name = "FSM template"
+    fake_tmpl.version = "1.0.0"
+    fake_db = MagicMock()
+    fake_db.get = AsyncMock(return_value=fake_tmpl)
+
+    with stack:
+        result = await pipeline_preview(_make_preview_inp(), fake_db)
+
+    # 关键：走了 RAG / LLM 完整路径，没有 quick_render
+    assert result.quick_render is False
+    assert result.confidence_source != "intent_cache"
+    rag_mock.assert_awaited_once()
+    fake_llm.select_template.assert_awaited_once()
+
+
+# ── validation_error 端到端透传 ───────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_propagates_validation_error_to_params_meta():
+    """LLM 返回非法 sv_boolean_expr（含双 &&）→ pipeline_preview 在每个 param 的 meta
+    上挂 validation_error，PreviewResponse 通过 ParamWithSource 透传到 JSON。
+
+    保护契约：前端从 `params[name].validation_error` 读取错误描述渲染红色提示。
+    若 pipeline 重构把这个字段丢了，本测试立刻报警。
+    """
+    rag = [_make_rag_candidate("sva_property_v1", score=0.85,
+                                parameters=[
+                                    {"name": "condition", "type": "string",
+                                     "required": True, "expr_type": "sv_boolean_expr"},
+                                ])]
+    llm_pick = TemplateSelectionOutput(
+        template_id="sva_property_v1",
+        param_mapping={"condition": "awvalid && && ready"},  # 非法：双 &&
+        confidence=0.9,
+    )
+
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "condition", "type": "string", "required": True,
+         "expr_type": "sv_boolean_expr"},
+    ]
+    fake_tmpl.id = "sva_property_v1"
+    fake_tmpl.name = "SVA Property"
+    fake_tmpl.version = "1.0.0"
+
+    stack, fake_db = _patch_preview_deps(rag, llm_pick, db_get_return_value=fake_tmpl)
+    with stack:
+        result = await pipeline_preview(_make_preview_inp(), fake_db)
+
+    cond_meta = result.params["condition"]
+    # 值不动（validator 不修改值）
+    assert cond_meta["value"] == "awvalid && && ready"
+    # 关键：validation_error 字段被填充
+    assert cond_meta.get("validation_error"), \
+        f"expected validation_error to be set, got meta={cond_meta}"
+    # 字段会以 ParamWithSource(**meta) 形式序列化进 /preview JSON 响应。
+
+    # 验证 Pydantic schema 能接受 meta dict
+    from app.schemas.generate import ParamWithSource
+    pwa = ParamWithSource(**cond_meta)
+    assert pwa.validation_error == cond_meta["validation_error"]
