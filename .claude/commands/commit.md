@@ -7,6 +7,8 @@
 
 若未传入参数，则按"主题拆分 + 不 push"默认行为执行。
 
+**默认全自主模式**：skill 自行决定 commit message、scope、拆分粒度、文件归类，不在中途等用户确认。用户仅通过 args 提供倾向（`全部合并为一个` / `fix(rag)` / `push`），无 args 即按 skill 自己的判断执行。审计阶段的"绝对禁止"硬停仍保留——是事故防线，不在放权范围。
+
 ---
 
 ## 执行步骤
@@ -21,31 +23,31 @@
 git status --short | grep "^??"
 ```
 
-对每个 `??` 文件（即 untracked 但未被 `.gitignore` 拦截的文件），按下表归类后向用户**输出分流方案**等确认：
+对每个 `??` 文件（即 untracked 但未被 `.gitignore` 拦截的文件），按下表自行归类并**直接执行**，结果在第四步汇报中列出，不在中途等用户确认：
 
-| 类别 | 判断特征 | 默认处理 |
+| 类别 | 判断特征 | 自动处理 |
 |---|---|---|
-| **应追踪** | 源代码（.py / .ts / .tsx / .js / .yaml / .sh / Dockerfile / .conf / .toml / .json）<br>项目文档（README/CHANGELOG/PRD/ARCHITECTURE/CONTRIBUTING/docs/*.md）<br>配置文件（docker-compose*.yml / nginx*.conf / pyproject.toml / package.json / tsconfig.json）<br>新增模板（template_library/**/*.yaml） | 加入下一步 commit 候选 |
-| **应忽略**（但 .gitignore 漏了） | node_modules/ / dist/ / __pycache__/ / .venv/ / *.pyc / coverage/ / hf_cache/ / models/ | **先补 .gitignore**，提示用户单独 commit gitignore，不要把这些文件 add |
-| **可疑—需用户决定** | 文件名含 `temp_` / `tmp_` / `scratch_` / `draft_` / `wip_` / `personal_` / `test_local`<br>未配套被引用的孤立脚本<br>无后缀且非典型项目文件 | **报告给用户**：列出文件名 + 内容前 5 行，等用户决定 commit / ignore / 删除 |
-| **绝对禁止** | 文件名含 `secret` / `credential` / `private_key` / `id_rsa` / `*.pem` / `*.key` / `*.crt` / `.env`（任何变体，包括 `.env.production` / `.env.local`） | **拒绝 commit + 立刻报警**：警告用户该文件是敏感数据，建议加入 .gitignore；若已是 .gitignore 漏了，先补 |
+| **应追踪** | 源代码（.py / .ts / .tsx / .js / .yaml / .sh / Dockerfile / .conf / .toml / .json）<br>项目文档（README/CHANGELOG/PRD/ARCHITECTURE/CONTRIBUTING/docs/*.md）<br>配置文件（docker-compose*.yml / nginx*.conf / pyproject.toml / package.json / tsconfig.json）<br>新增模板（template_library/**/*.yaml） | 直接加入 commit 候选 |
+| **应忽略**（但 .gitignore 漏了） | node_modules/ / dist/ / __pycache__/ / .venv/ / *.pyc / coverage/ / hf_cache/ / models/ | 自动补 `.gitignore` 并作为一个独立 `chore` commit；这些文件本身不 add |
+| **可疑** | 文件名含 `temp_` / `tmp_` / `scratch_` / `draft_` / `wip_` / `personal_` / `test_local`<br>未配套被引用的孤立脚本<br>无后缀且非典型项目文件 | **默认跳过**（不 stage、不删），在第四步汇报中列出文件名 + 跳过原因，由用户事后决定 |
+| **绝对禁止** | 文件名含 `secret` / `credential` / `private_key` / `id_rsa` / `*.pem` / `*.key` / `*.crt` / `.env`（任何变体，包括 `.env.production` / `.env.local`） | **硬停 + 立刻报警**：警告用户该文件是敏感数据，建议加入 .gitignore；若已是 .gitignore 漏了，先补 |
 
-输出示例：
+事后汇报示例（写入第四步输出，不在 0a 阶段打断）：
 
 ```
 未追踪文件分流：
-✓ 应追踪（自动加入候选）：
+✓ 应追踪（已加入候选）：
   - backend/app/services/new_feature.py
   - docs/feature-spec.md
 
-⚠ 可疑（请确认）：
-  - scratch_test.sh    （文件名含 "scratch_"，请确认是临时脚本还是要保留？）
+⊘ 可疑（已跳过，未 stage，请事后手动处置）：
+  - scratch_test.sh    （文件名含 "scratch_"）
 
-✗ 绝对禁止：
-  - secrets.json       （含 "secret" 关键词，已自动跳过；建议加入 .gitignore）
-
-是否按此分流执行？
+✗ 绝对禁止（硬停）：
+  - secrets.json       （含 "secret" 关键词；已建议加入 .gitignore，等用户处置后重试）
 ```
+
+仅当出现"绝对禁止"项时打断流程；其余分类完成后输出一行 `分流完成，进入下一步。` 自动继续。
 
 #### 0b. 敏感内容扫描
 
@@ -57,24 +59,36 @@ git status --short | grep "^??"
 | AWS Secret | `aws_secret_access_key\s*=\s*[A-Za-z0-9/+=]{40}` | **硬阻止**，定位到行 |
 | 私钥块 | `-----BEGIN [A-Z ]*PRIVATE KEY-----` | **硬阻止**，建议挪到 secrets/ 目录并加 .gitignore |
 | JWT Token | `eyJ[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}\.[A-Za-z0-9_-]{20,}` | **硬阻止**，定位到行 |
-| 硬编码密码 | `(password\|passwd\|secret\|pwd)\s*[:=]\s*["'][^"'$\{][^"']{4,}["']`<br>排除：值是 placeholder（含 `change-me` / `example` / `your-` / `xxx` / `<...>` / `${...}` / `os.environ`）<br>排除：`SUPER_ADMIN_PASSWORD` 在 config.py 里的开发默认值（已是已知非生产值） | **警告 + 等用户确认**，可能是占位符 |
-| 内部 IP / 主机名 | `\b(?:10\\.\|172\\.(?:1[6-9]\|2[0-9]\|3[01])\.\|192\\.168\\.)\d+\\.\d+\\.\d+`<br>排除：`192.168.1.1` / `10.0.0.1` 等示例 IP；排除 docker-compose 内部 hostname（`postgres` / `redis` / `qdrant` / `backend` 等） | **警告 + 等用户确认**，可能是公司内网地址 |
-| 个人路径 | `[Cc]:[\\\/]Users[\\\/]\w+`<br>`/Users/\w+`<br>`/home/[\w\-]+` | **警告 + 等用户确认**，是否要替换成相对路径 |
-| 个人邮箱（非 Co-Authored-By） | `[\w\.\-]+@(?!example\.com\|test\.com\|noreply\.\|anthropic\.com)[\w\.\-]+\.\w+` | **警告**，可能含真实人名 |
+| 硬编码密码 | `(password\|passwd\|secret\|pwd)\s*[:=]\s*["'][^"'$\{][^"']{4,}["']`<br>排除：值是 placeholder（含 `change-me` / `example` / `your-` / `xxx` / `<...>` / `${...}` / `os.environ`）<br>排除：`SUPER_ADMIN_PASSWORD` 在 config.py 里的开发默认值（已是已知非生产值） | **自动分档**（见下方"灰色项分档"） |
+| 内部 IP / 主机名 | `\b(?:10\\.\|172\\.(?:1[6-9]\|2[0-9]\|3[01])\.\|192\\.168\\.)\d+\\.\d+\\.\d+`<br>排除：`192.168.1.1` / `10.0.0.1` 等示例 IP；排除 docker-compose 内部 hostname（`postgres` / `redis` / `qdrant` / `backend` 等） | **自动分档**（见下方"灰色项分档"） |
+| 个人路径 | `[Cc]:[\\\/]Users[\\\/]\w+`<br>`/Users/\w+`<br>`/home/[\w\-]+` | **自动分档**（见下方"灰色项分档"） |
+| 个人邮箱（非 Co-Authored-By） | `[\w\.\-]+@(?!example\.com\|test\.com\|noreply\.\|anthropic\.com)[\w\.\-]+\.\w+` | **自动分档**（见下方"灰色项分档"） |
 
-**扫描方法**：用 Grep 工具对每个候选文件运行上述模式，命中则向用户输出：
-```
-⛔ 检测到敏感内容，已阻止 commit：
+**灰色项分档规则**（仅适用于上面 4 类警告级匹配；硬阻止四类——API Key / AWS Secret / 私钥块 / JWT——不走此规则，仍硬停）：
 
-  文件：backend/app/services/llm/openai_compat_client.py
-  行 12：    api_key="sk-abc123def456ghi789jkl012mno345pqr678stu"
-            ↑ 第三方 API Key 直接硬编码
+1. **静默通过**：
+   - 命中排除规则内的 placeholder / 示例 IP / docker-compose hostname / noreply 邮箱 / example.com 等
+   - 所在文件位于文档/测试/示例目录（`docs/` / `tests/` / `*.example` / `*.md`）
+2. **从本次 commit 候选中剔除该文件**（不打断流程）：
+   - 不在上述静默通过条件内的剩余命中
+   - 在第四步汇报中列出文件名 + 命中类别 + 行号，与"可疑"同等处置，由用户事后决定
 
-  建议：改为 api_key=os.getenv("LLM_API_KEY")，并在 .env 中配置。
-        请修复后重试 /commit。
-```
+**扫描方法**：用 Grep 工具对每个候选文件运行上述模式。
 
-发现敏感内容时**只报告，不自动修改**——修改决策权在用户。
+- **硬阻止四类**命中 → 立即打断，输出位置+建议，等用户处置：
+  ```
+  ⛔ 检测到敏感内容，已阻止 commit：
+
+    文件：backend/app/services/llm/openai_compat_client.py
+    行 12：    api_key="sk-<EXAMPLE_KEY_PLACEHOLDER>"
+              ↑ 第三方 API Key 直接硬编码（此处为脱敏示例占位符）
+
+    建议：改为 api_key=os.getenv("LLM_API_KEY")，并在 .env 中配置。
+          请修复后重试 /commit。
+  ```
+- **警告四类**命中 → 按上面的"灰色项分档"规则自动处置，不打断流程；被剔除的文件汇总到第四步汇报。
+
+发现敏感内容时**只报告 / 自动剔除候选，不自动修改源代码**——修改决策权在用户。
 
 #### 0c. 已追踪文件中的"应忽略"模式
 
@@ -134,14 +148,14 @@ git log --oneline -10
 - feat 与 fix 同时存在（一个 commit 只解决一件事）
 - 文档变更与代码变更（docs 单独成 commit，便于后续 cherry-pick）
 
-#### 拆分方案预览
+#### 拆分方案公告（执行前打印，不再等确认）
 
-主题归类完成后，**先向用户输出拟拆分方案**（编号清单 + 每个 commit 涉及的文件 + 一句话主题），等用户确认或调整后再开始 add/commit。
+主题归类完成后，skill **自行决定**拆分粒度，输出"按以下方案提交"的执行前公告，随即进入第三步开始 add/commit，**不在中途等用户确认**。
 
 例：
 
 ```
-拟拆分为 3 个 commit：
+按以下方案提交（3 个 commit）：
 1. feat(llm): two-step calling for thinking models
    - backend/app/services/llm/openai_compat_client.py
    - backend/app/services/llm/base.py
@@ -153,10 +167,12 @@ git log --oneline -10
    - frontend/src/components/MainLayout.tsx
    - frontend/src/pages/Admin/AdminLLMPage.tsx
 
-是否按此方案提交？(/commit 全部合并为一个 可强制单 commit)
+开始执行……
 ```
 
-若用户传入 `全部合并为一个` / `单 commit` 等参数，跳过此步骤直接合为 1 个 commit。
+用户可通过 args 影响拆分倾向：
+- `全部合并为一个` / `单 commit` → 强制单 commit
+- `fix(rag)` 等主题提示 → 仅作为分析参考，不影响 skill 拆分自主性
 
 ### 第三步：逐个执行 commit
 
@@ -218,7 +234,7 @@ push 前确认：
 | commit message 不带 Co-Authored-By trailer | 永远附上 `Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>` |
 | 提交敏感文件（.env, *.key, *.pem, .claude/settings.local.json, credentials*） | 跳过并在汇报中提示用户加 .gitignore |
 | 不读 diff 直接 commit | 至少 `git diff --stat` 确认范围 |
-| **跳过第零步审计直接进入 commit 流程** | 即使用户传 `push` / `全部合并` 等参数，第零步也必须先跑完；审计有"绝对禁止"或"硬阻止"项时**禁止**继续，等用户处置 |
+| **跳过第零步审计直接进入 commit 流程** | 全自主模式仍跑完第零步；"绝对禁止"硬停项与 "API Key / AWS Secret / 私钥块 / JWT" 类硬阻止仍必须停下报告，等用户处置；其余灰色项按改动 2、改动 3 的规则自动分档，不打断流程 |
 | 自动修改用户的源代码（即使是为了消除敏感内容警告） | 只报告位置 + 建议；改不改、怎么改由用户决定 |
 
 ---
@@ -231,3 +247,4 @@ push 前确认：
 - 每个 commit 完成后再开始下一个，不要积攒；中途 commit 失败立即停下问用户
 - 如果用户在某个 commit 后说"撤销"，用 `git reset --soft HEAD~1` 退回到 staging 区（保留改动），**不要** `--hard`
 - `.claude/agents/` 与 `.claude/commands/` 下的 skill 文件**应该提交**（项目级共享），但 `.claude/settings.local.json` 与 `.claude/agent-memory/` **不能提交**（已在 .gitignore，但仍需警觉）
+- 全自主模式下，第零步若把某些文件从候选中剔除（可疑文件 / 灰色敏感项），第四步汇报中必须显式列出被剔除的文件名 + 剔除原因，便于用户事后复核
