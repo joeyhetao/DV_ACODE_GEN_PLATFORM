@@ -22,9 +22,9 @@ from app.services.core.identifier import (
 )
 from app.services.core.renderer import render_template
 from app.services.intent.normalizer import normalize_intent
-from app.services.intent.history import lookup_history, save_history
+from app.services.intent.history import lookup_history, save_history, template_params_fingerprint
 from app.services.rag.engine import rag_retrieve, dense_top1_score
-from app.services.llm.factory import get_default_llm_client
+from app.services.llm.factory import get_default_llm_client, get_default_llm_config_id
 
 
 class OffTopicIntentError(ValueError):
@@ -42,6 +42,21 @@ class OffTopicIntentError(ValueError):
         self.threshold = threshold
         self.detector = "rag_dense_threshold"
         super().__init__("输入似乎与 IC 验证需求无关")
+
+
+class EmptyRetrievalError(RuntimeError):
+    """RAG 检索返空——不是 off-topic（已通过 dense 闸），而是基础设施层异常。
+
+    可能原因：Qdrant 服务不可达、collection 为空（模板未导入）、embedding service
+    挂掉。前端应当区分 422（用户问题）和 503（系统问题）：
+      - off-topic 走 422 让用户改提问
+      - empty retrieval 走 503 让 SRE 排查 / 用户稍后重试
+
+    不继承 ValueError，避免 endpoint 旧 except ValueError 被泛化兜底成 422。
+    """
+    def __init__(self, code_type: str = ""):
+        self.code_type = code_type
+        super().__init__(f"RAG 检索为空（code_type={code_type}）——疑似模板库或检索服务故障")
 
 
 @dataclass
@@ -126,44 +141,65 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
                 threshold=settings.offtopic_dense_threshold,
             )
 
+    # Resolve default LLM 提前到 normalize 之前：所有缓存 key 都需要 config_id 分桶，
+    # 避免不同 LLM 配置写入的 (template_id, params) 互相覆盖。client 构造无网络 IO，开销可忽略。
+    llm = await get_default_llm_client(db)
+    llm_config_id = getattr(llm, "config_id", "")
+
     # Step 1: Intent Normalize
     _t = time.perf_counter()
-    normalized, intent_hash = await normalize_intent(inp.original_intent, db)
+    normalized, intent_hash = await normalize_intent(inp.original_intent, db, llm=llm)
     print(f"[Timing] stage=normalize ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
 
     # Step 2: Intent Cache Lookup
-    history = await lookup_history(intent_hash)
+    history = await lookup_history(intent_hash, llm_config_id)
     if history:
         tmpl_id = history.get("template_id")
         tmpl_version = history.get("version", "1")
         history_params = history.get("param_mapping", {})
-        cached_code = await get_generation_cache(tmpl_id, tmpl_version, history_params)
-        if cached_code:
-            tmpl = await db.get(Template, tmpl_id)
-            # 缓存命中：构建一个最小 PreviewResult，标记 quick_render
-            params_with_source = {
-                name: {"value": v, "source": "default", "required": True, "description": "", "type": "string"}
-                for name, v in history_params.items()
-            }
-            return PreviewResult(
-                template_id=tmpl_id,
-                template_name=tmpl.name if tmpl else "",
-                template_version=tmpl.version if tmpl else tmpl_version,
-                confidence=history.get("confidence", 1.0),
-                confidence_source="intent_cache",
-                rag_candidates=[],
-                params=params_with_source,
-                intent_hash=intent_hash,
-                normalized_intent=normalized,
-                quick_render=True,
-            )
+        # 模板可能被编辑（加/删 required 参数、改 expr_type）。比对当前 template 的
+        # parameters 指纹与缓存写入时的指纹——不一致就把这条 intent_cache 视为失效，
+        # 落到 RAG/LLM 完整路径，避免 StrictUndefined / 丢参 / expr 校验后续报错。
+        tmpl = await db.get(Template, tmpl_id) if tmpl_id else None
+        cache_valid = True
+        if tmpl is None:
+            cache_valid = False
+        else:
+            cached_fp = history.get("params_fingerprint", "")
+            current_fp = template_params_fingerprint(tmpl.parameters)
+            if cached_fp and cached_fp != current_fp:
+                print(
+                    f"[Pipeline] intent_cache schema drift: tmpl={tmpl_id} "
+                    f"cached_fp={cached_fp} current_fp={current_fp} → bypass cache",
+                    flush=True,
+                )
+                cache_valid = False
+
+        if cache_valid:
+            cached_code = await get_generation_cache(tmpl_id, tmpl_version, history_params, llm_config_id)
+            if cached_code:
+                # 缓存命中：构建一个最小 PreviewResult，标记 quick_render
+                params_with_source = {
+                    name: {"value": v, "source": "default", "required": True, "description": "", "type": "string"}
+                    for name, v in history_params.items()
+                }
+                return PreviewResult(
+                    template_id=tmpl_id,
+                    template_name=tmpl.name if tmpl else "",
+                    template_version=tmpl.version if tmpl else tmpl_version,
+                    confidence=history.get("confidence", 1.0),
+                    confidence_source="intent_cache",
+                    rag_candidates=[],
+                    params=params_with_source,
+                    intent_hash=intent_hash,
+                    normalized_intent=normalized,
+                    quick_render=True,
+                )
 
     # Step 3 + 4: RAG Retrieve
     _t = time.perf_counter()
     rag_candidates = await rag_retrieve(normalized, db, code_type=inp.code_type)
     print(f"[Timing] stage=rag ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
-    if not rag_candidates:
-        raise ValueError("未能从模板库中检索到合适的模板，请检查意图描述或丰富模板库")
 
     seen_ids: set[str] = set()
     deduped: list[dict] = []
@@ -173,19 +209,27 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
             deduped.append(c)
     rag_candidates = deduped
 
-    # Step 4b: Keyword Supplement
+    # Step 4b: Keyword Supplement —— 必须先于 EmptyRetrievalError 判断，
+    # 这样"RAG 返空 + keyword 有命中"也能救场（fallback 链的设计契约）。
     supplements = await _keyword_supplement(
         normalized + " " + inp.original_intent,
         db,
         inp.code_type,
         existing_ids={c["template_id"] for c in rag_candidates},
     )
+    supplement_ids: set[str] = set()
     if supplements:
         print(f"[Pipeline] keyword supplement: {[s['template_id'] for s in supplements]}", flush=True)
         rag_candidates = supplements + rag_candidates
+        supplement_ids = {s["template_id"] for s in supplements}
 
-    # Step 5: LLM Step1 + Step2
-    llm = await get_default_llm_client(db)
+    if not rag_candidates:
+        # off-topic 闸已经在 step 0 处理，能到这里意味着 dense top1 ≥ threshold 但
+        # 既无 RAG 候选也无 keyword 命中 —— 只可能是基础设施问题（Qdrant 空 /
+        # 检索服务异常 / 模板库没导入），与"用户离题"在语义上完全不同。
+        raise EmptyRetrievalError(code_type=inp.code_type)
+
+    # Step 5: LLM Step1 + Step2 （llm 已在前面 resolve，无需重取）
     signal_context = _build_signal_context(inp)
     candidate_dicts = [
         {
@@ -208,6 +252,10 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
     confidence_source = "llm_step1"
     if selection.template_id and selection.template_id.lower() not in ("none", "", "null"):
         template = await db.get(Template, selection.template_id)
+        # LLM 选中的若是 keyword 补充注入的候选（RAG 三阶段未召回），标专门的源——
+        # 让前端 / 日志能区分"LLM 在 RAG top 中挑"与"靠 keyword 才救回来"。
+        if template and selection.template_id in supplement_ids:
+            confidence_source = "keyword_supplement"
 
     # Off-topic 检测的唯一信号是 normalize_intent 的 sentinel 输出（在本函数早期已检查并早返）。
     # 这里**不**再用 RAG cross-encoder 分数作为闸——实测发现 reranker 对不同 code_type 子语料
@@ -275,9 +323,12 @@ async def pipeline_render(req: RenderInput, db: AsyncSession) -> tuple[str, bool
     if not template:
         raise ValueError(f"模板不存在: {req.template_id}")
 
+    # 缓存按当前 default LLM 分桶。轻量版 helper 只查 id 不构造 client。
+    llm_config_id = await get_default_llm_config_id(db)
+
     # Step 5b: Generation cache lookup
     version_str = str(template.version)
-    cached_code = await get_generation_cache(template.id, version_str, req.params)
+    cached_code = await get_generation_cache(template.id, version_str, req.params, llm_config_id)
     if cached_code:
         return cached_code, True
 
@@ -285,7 +336,7 @@ async def pipeline_render(req: RenderInput, db: AsyncSession) -> tuple[str, bool
     code = render_template(template.template_body, req.params, template.id, version_str)
 
     # Step 8: Cache write + history save
-    await set_generation_cache(template.id, version_str, req.params, code)
+    await set_generation_cache(template.id, version_str, req.params, code, llm_config_id)
     if req.intent_hash:
         await save_history(
             intent_hash=req.intent_hash,
@@ -293,6 +344,9 @@ async def pipeline_render(req: RenderInput, db: AsyncSession) -> tuple[str, bool
             param_mapping=req.params,
             confidence=req.confidence,
             code=code,
+            llm_config_id=llm_config_id,
+            params_fingerprint=template_params_fingerprint(template.parameters),
+            template_version=version_str,
         )
 
     return code, False
@@ -306,8 +360,9 @@ async def run_pipeline(inp: PipelineInput, db: AsyncSession) -> PipelineResult:
     if preview.quick_render:
         # intent_cache 命中：preview 已经把缓存 code 透传了；需要 render 来取 code
         # 但缓存的 code 在 history 里，需要重查 generation_cache
+        legacy_cfg_id = await get_default_llm_config_id(db)
         cached_code = await get_generation_cache(
-            preview.template_id, preview.template_version, params_value_only
+            preview.template_id, preview.template_version, params_value_only, legacy_cfg_id
         )
         if cached_code:
             return PipelineResult(
@@ -607,6 +662,15 @@ def _map_params_with_source(
         constructed = construct_group_name(result)
         if constructed:
             gn_meta["value"] = constructed
+            gn_meta["source"] = "default"
+            gn_meta["sanitized"] = True
+        else:
+            # construct 兜底失败（同伴参数也都是非法 ident）→ 把当前值 sanitize 成合法 id。
+            # 避免生成 `covergroup 中文名 ...` 这种直接编译报错的代码。
+            cleaned, _changed = sanitize_sv_identifier(
+                str(gn_meta.get("value", "")), fallback_prefix="cov"
+            )
+            gn_meta["value"] = cleaned or "cov_group"
             gn_meta["source"] = "default"
             gn_meta["sanitized"] = True
 

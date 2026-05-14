@@ -6,18 +6,26 @@ from sqlalchemy import select
 
 from app.core.database import get_db
 from app.core.security import require_role
-from app.core.security import encrypt_api_key, mask_api_key
+from app.core.security import encrypt_api_key, decrypt_api_key, mask_api_key
 from app.models.user import User
 from app.models.llm_config import LLMConfig
 from app.schemas.llm_config import LLMConfigCreate, LLMConfigUpdate, LLMConfigOut, LLMTestRequest, LLMTestResponse
+from app.services.core.cache import invalidate_all_llm_caches
 
 router = APIRouter(prefix="/admin/llm", tags=["admin-llm"])
 
 
 def _to_config_out(c: LLMConfig) -> LLMConfigOut:
+    # 必须先 decrypt 再 mask：mask_api_key 作用于密文 hex 只能产出无意义的"密文头尾"，
+    # 用户无法识别这是哪条 key。决心解密的开销可忽略（仅在 Admin list / detail 时调）。
+    try:
+        plaintext = decrypt_api_key(c.api_key_encrypted) if c.api_key_encrypted else ""
+    except Exception:
+        # 兜底：密文损坏 / 加密 key 改了，至少别让整个 list 端点 500。
+        plaintext = ""
     return LLMConfigOut(
         id=c.id, name=c.name, provider=c.provider, base_url=c.base_url,
-        api_key_masked=mask_api_key(c.api_key_encrypted or ""),
+        api_key_masked=mask_api_key(plaintext),
         model_id=c.model_id, output_mode=c.output_mode,
         temperature=c.temperature, max_tokens=c.max_tokens,
         is_active=c.is_active, is_default=c.is_default,
@@ -54,6 +62,7 @@ async def create_config(
         max_tokens=payload.max_tokens,
         is_active=payload.is_active,
         is_default=payload.is_default,
+        step2_disable_thinking=payload.step2_disable_thinking,
     )
     if payload.is_default:
         await db.execute(
@@ -62,6 +71,9 @@ async def create_config(
     db.add(cfg)
     await db.commit()
     await db.refresh(cfg)
+    # 新建配置若立刻成为 default，旧的 gen:*/intent_cache:* 由不同 LLM 写入，必须清。
+    if payload.is_default:
+        await invalidate_all_llm_caches()
     return _to_config_out(cfg)
 
 
@@ -76,11 +88,17 @@ async def update_config(
     if not cfg:
         raise HTTPException(status_code=404, detail="配置不存在")
 
+    # was_default 在 setattr 前快照——更新当前 default 配置本体（如改 model_id /
+    # temperature / max_tokens / step2_disable_thinking）也要 flush，否则旧缓存
+    # 命中后用户看到的是旧模型/旧参数的输出。
+    was_default = bool(cfg.is_default)
+
     data = payload.model_dump(exclude_none=True)
     if "api_key" in data:
         cfg.api_key_encrypted = encrypt_api_key(data.pop("api_key"))
 
-    if data.get("is_default"):
+    becoming_default = bool(data.get("is_default"))
+    if becoming_default:
         await db.execute(
             LLMConfig.__table__.update().where(LLMConfig.id != config_id).values(is_default=False)
         )
@@ -90,6 +108,8 @@ async def update_config(
 
     await db.commit()
     await db.refresh(cfg)
+    if was_default or becoming_default:
+        await invalidate_all_llm_caches()
     return _to_config_out(cfg)
 
 
@@ -102,8 +122,12 @@ async def delete_config(
     cfg = await db.get(LLMConfig, config_id)
     if not cfg:
         raise HTTPException(status_code=404, detail="配置不存在")
+    was_default = bool(cfg.is_default)
     await db.delete(cfg)
     await db.commit()
+    if was_default:
+        # 删掉的是当前 default：下一次请求会落到新 default（或 500），旧缓存无效。
+        await invalidate_all_llm_caches()
 
 
 @router.post("/configs/{config_id}/set-default")
@@ -120,6 +144,8 @@ async def set_default(
     )
     cfg.is_default = True
     await db.commit()
+    # 切默认模型必清两层缓存：旧 LLM 命中的 (template_id, params) 在新模型下未必合法。
+    await invalidate_all_llm_caches()
     return {"status": "ok", "default_config_id": config_id}
 
 

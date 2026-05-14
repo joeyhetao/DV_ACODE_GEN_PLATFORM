@@ -26,14 +26,14 @@ def _build_client(config, api_key: str | None = None) -> LLMClient:
         api_key = decrypt_api_key(config.api_key_encrypted)
 
     if config.provider == "anthropic":
-        return AnthropicLLMClient(
+        client: LLMClient = AnthropicLLMClient(
             api_key=api_key,
             model_id=config.model_id,
             temperature=config.temperature,
             max_tokens=config.max_tokens,
         )
     else:
-        return OpenAICompatLLMClient(
+        client = OpenAICompatLLMClient(
             api_key=api_key,
             model_id=config.model_id,
             base_url=config.base_url,
@@ -42,6 +42,10 @@ def _build_client(config, api_key: str | None = None) -> LLMClient:
             output_mode=config.output_mode,
             step2_disable_thinking=config.step2_disable_thinking,
         )
+    # 盖 config_id 让缓存层能按 LLM 配置维度分桶；test mock 不 stamp 此属性时
+    # 调用方 getattr(..., "config_id", "") 兜底为 "_"。
+    client.config_id = config.id  # type: ignore[attr-defined]
+    return client
 
 
 async def get_llm_client_by_id(config_id: str, db: AsyncSession) -> LLMClient:
@@ -52,3 +56,14 @@ async def get_llm_client_by_id(config_id: str, db: AsyncSession) -> LLMClient:
     if config is None:
         raise ValueError(f"LLM 配置不存在: {config_id}")
     return _build_client(config)
+
+
+async def get_default_llm_config_id(db: AsyncSession) -> str:
+    """轻量版：只查 id，不构造客户端。pipeline_render 用来给 cache key 分桶。"""
+    from app.models.llm_config import LLMConfig
+
+    result = await db.execute(
+        select(LLMConfig.id).where(LLMConfig.is_default == True, LLMConfig.is_active == True)
+    )
+    cfg_id = result.scalar_one_or_none()
+    return cfg_id or ""

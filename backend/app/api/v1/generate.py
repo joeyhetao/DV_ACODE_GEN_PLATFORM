@@ -20,6 +20,7 @@ from app.schemas.generate import (
 )
 from app.services.core.pipeline import (
     OffTopicIntentError,
+    EmptyRetrievalError,
     PipelineInput,
     RenderInput,
     run_pipeline,
@@ -35,6 +36,14 @@ def _off_topic_detail(e: OffTopicIntentError) -> dict:
         "detector": e.detector,
         "top_dense_score": round(e.top_dense_score, 4),
         "threshold": e.threshold,
+    }
+
+
+def _empty_retrieval_detail(e: EmptyRetrievalError) -> dict:
+    return {
+        "type": "empty_retrieval",
+        "message": "模板库检索返空——疑似 Qdrant 或检索服务异常。请稍后重试或联系管理员。",
+        "code_type": e.code_type,
     }
 from app.services.core.renderer import render_template
 from app.services.registry import get_registry
@@ -66,6 +75,8 @@ async def generate(
         result = await run_pipeline(inp, db)
     except OffTopicIntentError as e:
         raise HTTPException(status_code=422, detail=_off_topic_detail(e))
+    except EmptyRetrievalError as e:
+        raise HTTPException(status_code=503, detail=_empty_retrieval_detail(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
@@ -132,6 +143,8 @@ async def preview(
         result = await pipeline_preview(inp, db)
     except OffTopicIntentError as e:
         raise HTTPException(status_code=422, detail=_off_topic_detail(e))
+    except EmptyRetrievalError as e:
+        raise HTTPException(status_code=503, detail=_empty_retrieval_detail(e))
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
