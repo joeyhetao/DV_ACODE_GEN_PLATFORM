@@ -1,6 +1,6 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.16  
+**版本**：v2.17  
 **状态**：已确认  
 **日期**：2026-05-14  
 **变更**：
@@ -21,6 +21,7 @@
 - v2.13 → v2.14：参数 expr_type 元数据 + 标识符规范化层落地——模板 YAML 的 `parameters[].expr_type` 字段声明参数语法类型（`sv_identifier` / `sv_identifier_list` / `sv_boolean_expr` / `sv_bins_expr`）；新增 `services/core/identifier.py`（SV 标识符 sanitize + IDENTIFIER_PARAMS 兜底白名单 + `construct_group_name`）和 `services/core/expr_validator.py`（轻量手写状态机校验布尔/列表/bins 表达式）；`_map_params_with_source` 末尾追加 expr_type-driven Step 7（覆盖所有 5 类源，sv_identifier 类参数被静默清洗、布尔/bins 类校验失败仅打 `validation_error`）（§3.15.5 新增）；`PreviewResponse.params` schema 新增 `sanitized` / `expr_type` / `validation_error` 三字段供前端徽标提示；前端镜像 `frontend/src/utils/exprValidators.ts`（§7）；§5.1 端点表补齐 `/api/v1/generate/preview`、`/api/v1/auth/register`、`/api/v1/auth/me`、`/api/health`，移除不存在的 `/api/v1/auth/refresh`；`lib_manager.py import` 在参数缺 `expr_type` 时输出 WARN 提示
 - v2.14 → v2.15：契约修订 + RAG 原生 off-topic 闸——"always produce code" 契约**收窄为仅对域内 IC 输入**（§1.1）；新增 `services/rag/engine.py::dense_top1_score` helper 复用 Qdrant dense 通道；`pipeline_preview` 头部插入 dense 阈值闸（用 `original_intent` 而非 `normalized`——后者会被 LLM 改写成"无法判断类型"等元说明意外抬高 off-topic 分数），低于 `OFFTOPIC_DENSE_THRESHOLD`（校准默认 0.44）抛 `OffTopicIntentError` 返 HTTP 422；`generate.py` 端点结构化 detail（`type=off_topic` + `detector` + `top_dense_score` + `threshold`）让前端弹专属 Modal；`OFFTOPIC_GATE_ENABLED=false` 紧急 kill-switch；删除前一轮的 normalizer sentinel 注入式临时方案（恢复 `normalize_intent` 提示词为纯改写）；新增 `backend/scripts/calibrate_offtopic_threshold.py` 经验校准脚本；回归语料 `backend/tests/data/offtopic_corpus.yaml` + mock/real-LLM 双套件保留
 - v2.15 → v2.16：thinking 控制由全局硬编码改为**按 LLM 调用分档 + 按配置可调**（§3.12.2、§3.12.3）——`llm_configs` 表新增 `step2_disable_thinking` BOOLEAN 列（NOT NULL，默认 true；迁移 `002_step2_disable_thinking.py`）（§4.1）；`normalize_intent` 与 `_step1_select_id` 硬编码禁 thinking 且收紧 `max_tokens`（512 / 64），`_step2_fill_params` 由 `llm_configs.step2_disable_thinking` 运行时切换（true→`max_tokens=2048` 禁 thinking，false→`max_tokens=1024` 保留 thinking）；所有 OpenAI-compat 调用打点 `[Timing] llm=<name> ms=<n> reasoning_tokens=<n> thinking=<on/off>` 便于验证 `extra_body` 是否被模型实际识别；`LLMConfigCreate/Update/Out` 三个 Schema 透出新字段，Admin UI 加 Switch（§5.1）；前端 `/generate` 与 `/generate/preview` 客户端超时由 180s 提升至 300s（thinking ON 模式下三步累加可达 ~4min）
+- v2.16 → v2.17：缓存结构按 LLM 配置分桶 + intent_cache schema-drift 兜底 + RAG 空召回独立错误路径——`gen:{llm_config_id}:{template_id}:{version}:{params_hash}` 替换旧 `cache:{sha256(...)}` 复合 hash；`intent_cache:{llm_config_id}:{intent_hash}` 同样按配置分桶，TTL 30d（§3.6）；`services/intent/history.py::template_params_fingerprint()` 对 `parameters[].name/required/expr_type` 三字段取稳定指纹随 intent_cache 条目写入，命中时与当前模板指纹比对，漂移即 bypass 走完整流水线（§3.15.3 Step 2）；新增 `EmptyRetrievalError`（继承 `RuntimeError` 而非 `ValueError`，避免被泛化 `except ValueError` 兜底）—— off-topic 闸通过但关键词补充召回后仍返空时抛出，端点结构化 detail（`type=empty_retrieval` / `code_type` / `hint`）映射 **HTTP 503**，与 off-topic 422 分流（§3.15.3 Step 4 / §5.1）；缓存失效原语拆为 `invalidate_template_cache(tid)`（用 `gen:*:{tid}:*` 通配跨所有配置桶删除单模板）+ `invalidate_all_intent_cache()`（lib_manager 批量重导 hook）+ `invalidate_all_llm_caches()`（admin LLM CRUD/set-default 时仍全清两个前缀，分桶不是为了切换后保留旧缓存，而是为了 update 单模板时能跨配置精准失效）；迁移 `003_align_sync_status_enum.py` 幂等修正 `sync_status_enum` 旧值 `('pending','synced','error')` 到 ORM 值 `('ok','syncing','sync_error')`（兼容 `app/main.py:_init_db` 的 `create_all` 先于 alembic 跑、dev DB 已是 ORM 值的情况）；迁移 `004_unique_default_llm.py` 把 §4.1 已声明的部分唯一索引 `WHERE is_default=true` 落到 alembic 树上（兜底并发 set-default 留多行 True 导致 `MultipleResultsFound` → 500）
 
 ---
 
@@ -446,18 +447,27 @@ payload = {
 
 ### 3.6 缓存层（Redis）
 
-**缓存键设计**：
+**缓存键设计**（两类缓存，均按 LLM 配置分桶）：
 
 ```
-cache_key = SHA256(
-    template_id + "|" + template_version + "|" + canonical_json(sorted params)
-)
+# 生成结果缓存（pipeline_render 写入，TTL 90天）
+gen:{llm_config_id}:{template_id}:{template_version}:{sha256(canonical_json(sorted params))}
+
+# 意图归一化缓存（pipeline_preview Step 2 写入，TTL 30天）
+intent_cache:{llm_config_id}:{intent_hash}
+  value = JSON({template_id, params, confidence, params_fingerprint})
 ```
+
+空 `llm_config_id` 用 `_` 占位（测试 mock / 早期未配置场景）。`params_hash` 拆出 `template_id` / `version` 单独是为了支持 `invalidate_template_cache(template_id)` 用 `gen:*:{template_id}:*` 通配跨所有配置桶精准失效。
 
 **缓存策略**：
 - 命中：直接返回，跳过检索+LLM+渲染全部环节，100% 确定性
-- 未命中：走完整链路，结果写入 Redis（TTL 90天）
-- 模板更新时：批量失效该模板 ID 下所有版本的缓存条目（通过 key pattern 扫描删除）
+- 未命中：走完整链路，结果写入 Redis
+- **intent_cache schema-drift 兜底**：命中条目里取出的 `params_fingerprint` 与当前模板 `template_params_fingerprint(template.parameters)` 比对（hash `name/required/expr_type` 三字段）；漂移即 bypass 缓存走完整 pipeline，避免模板参数改名/增删后旧 mapping 被短路返回
+- 失效原语：
+  - `invalidate_template_cache(tid)` —— 单模板 Admin 改/停用后调用，跨所有配置桶
+  - `invalidate_all_intent_cache()` —— `lib_manager.py import` 批量重导后调用（模板可能整体被替换）
+  - `invalidate_all_llm_caches()` —— Admin LLM 配置 CRUD / set-default 时全清两个前缀（不同 LLM 对同一意图可能返不同 `(template_id, params)`，复用旧缓存会让切换形同没切；分桶不是为了切换后保留旧缓存，而是支撑单模板/单意图维度的精准失效）
 
 **Redis 内存配置**（写入 `docker-compose.yml` 的 Redis 服务 command）：
 ```
@@ -1081,12 +1091,11 @@ PUT /api/v1/admin/llm/configs/{id}/set-default
   ↓
 ① UPDATE llm_configs SET is_default=false（旧默认）
 ② UPDATE llm_configs SET is_default=true（新默认）
-③ Redis FLUSHDB_PATTERN "intent_cache:*"（意图标准化缓存，新模型可能产生不同归一化）
-④ Redis FLUSHDB_PATTERN "cache:*"（生成结果缓存，依赖 LLM 选择结果）
-⑤ 写入 admin 操作日志
+③ invalidate_all_llm_caches() —— scan-delete `intent_cache:*` + `gen:*`（覆盖所有配置桶）
+④ 写入 admin 操作日志
 ```
 
-新旧模型对同一输入可能选择不同模板，清空缓存确保切换后行为一致。
+新旧模型对同一输入可能选择不同模板/参数，全清两个前缀确保切换后行为一致。§3.6 的 `llm_config_id` 分桶不是为了"切换后保留旧缓存"——既然要切换语义，旧条目必须失效——而是为了支持 `invalidate_template_cache(tid)` 用 `gen:*:{tid}:*` 跨所有配置桶精准失效单模板（Admin 改/停用模板时只动该模板对应键，不动其他模板的缓存）。
 
 ---
 
@@ -1280,25 +1289,36 @@ Step 1: IntentNormalize
   输出：normalized_intent + intent_hash（SHA256，temperature=0，确定性）
 
 Step 2: IntentCacheLookup
-  lookup_history(intent_hash) → 若命中，取历史 template_id + params
-  再尝试 get_generation_cache(tmpl_id, version, params)
-  双重命中 → 直接返回（intent_cache_hit=True, cache_hit=True），流水线结束
+  lookup_history(intent_hash, llm_config_id) → 若命中，取历史 template_id + params + params_fingerprint
+  schema-drift 守门：current_fp = template_params_fingerprint(tmpl.parameters)
+    cached_fp != current_fp → bypass 缓存（模板 schema 已改，旧 mapping 不再合法）→ 进入 Step 3
+    cached_fp == current_fp → 再尝试 get_generation_cache(tmpl_id, version, params, llm_config_id)
+      双重命中 → 直接返回（intent_cache_hit=True, cache_hit=True），流水线结束
   未命中 → 进入 Step 3
+
+Step 0 (preview 前置)：off-topic dense 闸（详见 §1.1）
+  dense_top1_score(original_intent, code_type) < OFFTOPIC_DENSE_THRESHOLD
+    → 抛 OffTopicIntentError → 端点映射 HTTP 422
 
 Step 3+4: Embed + RAGRetrieve
   rag_retrieve(normalized_intent, db, code_type)
   Stage1 Qdrant 混合检索（dense+sparse RRF，code_type 过滤）
-  Stage2 ColBERT MaxSim 精排
+  Stage2 ColBERT MaxSim 精排（注：当前实际 bypass——main.py:_init_qdrant_collection 只 provisions
+    dense+sparse 命名向量，stage1 读 r.vector.get("colbert") 永远为 None，stage2 见 None 透传 RRF 分数）
   Stage3 bge-reranker 精排
   对返回结果按 template_id 去重（Qdrant 可能返回同一模板的多个 point）
-  rag_candidates 为空 → 抛 ValueError 422
-  否则进入 Step 4b
+  进入 Step 4b（关键词补充召回）
 
 Step 4b: KeywordSupplement（向量召回兜底）
   从 PostgreSQL 查询同 code_type 的 active 模板
   按 template.keywords 与 (normalized_intent + original_intent) 做小写子串匹配
   对每个模板计算命中关键词数作为分数，取 top-2 加入 rag_candidates 头部
   动机：bge-m3 对中文 IC 验证术语区分度有限，关键词命中作为 RAG 召回的兜底
+
+  rag_candidates 仍为空（向量+关键词双兜底后） → 抛 EmptyRetrievalError → 端点映射 HTTP 503
+    这是基础设施层问题（Qdrant 不可达 / collection 空 / embedding service 挂），不是用户问题；
+    与 off-topic 422 分流，让 SRE 排查而不是让用户改提问。该异常继承 RuntimeError 而非
+    ValueError，避免端点旧的 except ValueError 把它泛化兜底成 422。
 
 Step 5a: TemplateSelect（LLM Step1）
   llm.select_template(normalized, signal_context, candidates, original_intent)

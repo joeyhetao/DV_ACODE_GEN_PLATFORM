@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
-- **缓存 key 按 LLM 配置分桶**：`cache:{sha256(...)}` → `gen:{llm_config_id}:{template_id}:{version}:{sha256(sorted_params)}`；`intent_cache:{intent_hash}` → `intent_cache:{llm_config_id}:{intent_hash}`，TTL 30d。不同 LLM 配置的渲染结果与意图归一化各自写入独立分桶共存，切换默认 LLM 不再需要 FLUSH，回切原模型即命中旧缓存。空 `llm_config_id` 用 `_` 占位（保留测试 mock 路径）
+- **缓存 key 按 LLM 配置分桶**：`cache:{sha256(...)}` → `gen:{llm_config_id}:{template_id}:{version}:{sha256(sorted_params)}`；`intent_cache:{intent_hash}` → `intent_cache:{llm_config_id}:{intent_hash}`，TTL 30d。`template_id` 与 `version` 从单一复合 hash 中拆出，使 `invalidate_template_cache(tid)` 能用 `gen:*:{tid}:*` 通配跨所有配置桶精准失效单模板（旧 schema 只能整库 FLUSH）。Admin LLM CRUD / set-default 时仍调用 `invalidate_all_llm_caches()` 全清两个前缀——分桶不是为了"切换后保留旧缓存"，而是支撑单模板维度的精准失效。空 `llm_config_id` 用 `_` 占位（保留测试 mock 路径）
 - **intent_cache schema-drift 兜底**：`services/intent/history.py::template_params_fingerprint()` 对 `parameters[].name / required / expr_type` 三字段稳定 hash 写入缓存条目；命中时 pipeline 用当前 `template.parameters` 重算指纹比对，**漂移即 bypass 缓存走完整流水线**，避免模板参数改名/增删后旧 mapping 被短路返回
 - **`EmptyRetrievalError` 独立错误路径 → HTTP 503**：通过 off-topic dense 闸但 RAG 三阶段返空时抛出，端点结构化 detail（`type=empty_retrieval` / `code_type` / `hint`）映射 503 让 SRE 排查 Qdrant/embedding service，**不与 off-topic 422 共用错误流**；该异常继承 `RuntimeError` 而非 `ValueError`，避免被泛化 `except ValueError` 兜底降级
 - **DB 端 `llm_configs.is_default` 部分唯一索引**（迁移 `004_unique_default_llm.py`）：`CREATE UNIQUE INDEX ... WHERE is_default=true`，并发 set-default 或事务回滚遗留多行 True 时由 DB 拦截，防止 `factory.get_default_llm_client.scalar_one_or_none()` 抛 `MultipleResultsFound` → 500
