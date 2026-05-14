@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **缓存 key 按 LLM 配置分桶**：`cache:{sha256(...)}` → `gen:{llm_config_id}:{template_id}:{version}:{sha256(sorted_params)}`；`intent_cache:{intent_hash}` → `intent_cache:{llm_config_id}:{intent_hash}`，TTL 30d。不同 LLM 配置的渲染结果与意图归一化各自写入独立分桶共存，切换默认 LLM 不再需要 FLUSH，回切原模型即命中旧缓存。空 `llm_config_id` 用 `_` 占位（保留测试 mock 路径）
+- **intent_cache schema-drift 兜底**：`services/intent/history.py::template_params_fingerprint()` 对 `parameters[].name / required / expr_type` 三字段稳定 hash 写入缓存条目；命中时 pipeline 用当前 `template.parameters` 重算指纹比对，**漂移即 bypass 缓存走完整流水线**，避免模板参数改名/增删后旧 mapping 被短路返回
+- **`EmptyRetrievalError` 独立错误路径 → HTTP 503**：通过 off-topic dense 闸但 RAG 三阶段返空时抛出，端点结构化 detail（`type=empty_retrieval` / `code_type` / `hint`）映射 503 让 SRE 排查 Qdrant/embedding service，**不与 off-topic 422 共用错误流**；该异常继承 `RuntimeError` 而非 `ValueError`，避免被泛化 `except ValueError` 兜底降级
+- **DB 端 `llm_configs.is_default` 部分唯一索引**（迁移 `004_unique_default_llm.py`）：`CREATE UNIQUE INDEX ... WHERE is_default=true`，并发 set-default 或事务回滚遗留多行 True 时由 DB 拦截，防止 `factory.get_default_llm_client.scalar_one_or_none()` 抛 `MultipleResultsFound` → 500
+
+### Fixed
+- **`sync_status_enum` 值与 ORM 错位**（迁移 `003_align_sync_status_enum.py`）：migration 001 旧声明 `('pending','synced','error')` 与 ORM/`lib_manager.py` 长期写入的 `('ok','syncing','sync_error')` 错位，导致纯 alembic 路径升级的 DB 首次 import 模板报 `invalid input value for enum`。迁移**幂等**实现：兼容三种状态（旧值 / 新值 / 混合），考虑到 `app/main.py:_init_db` 的 `create_all` 先于 alembic 跑，大多数 dev DB 实际已经是 ORM 值
+
+### Changed
+- CLAUDE.md：补齐 cache key 结构与 schema-drift 契约 §（"Four-layer determinism guard" 第 1 条）、`EmptyRetrievalError` vs `OffTopicIntentError` 的 422/503 分流说明、Stage2 ColBERT 实际 bypass 的代码位点（`stage1_hybrid.py:62` / `stage2_colbert.py:25-27`，main.py 只 provisions dense+sparse 命名向量）——后者是已存在行为的文档化，不是代码变更
+
 ---
 
 ## [0.5.0] - 2026-05-14
