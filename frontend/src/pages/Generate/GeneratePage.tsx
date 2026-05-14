@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import {
   Card, Form, Input, Select, Button, Row, Col, Space, Tag,
-  Statistic, Divider, Typography, Table, Collapse, message, Spin,
+  Statistic, Divider, Typography, Table, Collapse, message, Modal, Spin,
 } from 'antd'
 import {
   ThunderboltOutlined, CopyOutlined, SendOutlined, PlusOutlined, DeleteOutlined,
@@ -70,8 +70,7 @@ export default function GeneratePage() {
       }
       setState({ phase: 'confirming', preview })
     } catch (e: unknown) {
-      const err = e as { response?: { data?: { detail?: string } } }
-      message.error(err.response?.data?.detail || '分析失败，请重试')
+      handleApiError(e, '分析失败，请重试')
       setState({ phase: 'idle' })
     }
   }
@@ -137,8 +136,7 @@ export default function GeneratePage() {
         },
       })
     } catch (e: unknown) {
-      const err = e as { response?: { data?: { detail?: string } } }
-      message.error(err.response?.data?.detail || '渲染失败，请重试')
+      handleApiError(e, '渲染失败，请重试')
       setState({ phase: 'idle' })
     }
   }
@@ -354,4 +352,31 @@ function extractValueDict(preview: PreviewResponse): Record<string, unknown> {
     out[name] = meta.value
   }
   return out
+}
+
+/** 解析 FastAPI 错误响应。detail 可能是字符串或结构化对象（如 off_topic 拒绝）。 */
+type OffTopicDetail = {
+  type: 'off_topic'
+  message: string
+  detector?: string
+  top_dense_score?: number
+  threshold?: number
+}
+type ApiErrorDetail = string | OffTopicDetail | undefined
+function handleApiError(e: unknown, fallbackMsg: string): void {
+  const err = e as { response?: { data?: { detail?: ApiErrorDetail } } }
+  const detail = err.response?.data?.detail
+  if (detail && typeof detail === 'object' && detail.type === 'off_topic') {
+    const diag =
+      detail.top_dense_score !== undefined && detail.threshold !== undefined
+        ? `（输入与模板库的最高相似度 ${detail.top_dense_score} 低于阈值 ${detail.threshold}）`
+        : ''
+    Modal.warning({
+      title: '检测到非验证请求',
+      content: `${detail.message}\n\n${diag}\n\n如果你确认这是 IC 验证请求被误拒，请补充信号名、协议、要验证的属性等更多上下文重试。`,
+      width: 520,
+    })
+    return
+  }
+  message.error(typeof detail === 'string' ? detail : fallbackMsg)
 }

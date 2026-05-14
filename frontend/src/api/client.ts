@@ -2,7 +2,9 @@ import axios from 'axios'
 
 export const apiClient = axios.create({
   baseURL: '/api/v1',
-  timeout: 200000,
+  // 全局默认 5min；个别端点（如 /generate/preview）可在 generateApi 里覆盖。
+  // thinking 模型 (GLM-4.7 等) 单次推理可达 60s，三次累加可能 180s。
+  timeout: 300000,
 })
 
 apiClient.interceptors.request.use((config) => {

@@ -78,14 +78,14 @@ export interface RenderConfirmedResponse {
 
 export const generateApi = {
   generate: async (req: GenerateRequest) => {
-    // legacy 一步式（保留兼容用）
-    const res = await apiClient.post<GenerateResponse>('/generate', req, { timeout: 180000 })
+    // legacy 一步式（保留兼容用）。thinking 模型 worst case 3 次 LLM × 60s。
+    const res = await apiClient.post<GenerateResponse>('/generate', req, { timeout: 300000 })
     return res.data
   },
   // 方案 3 两步式
   preview: async (req: GenerateRequest) => {
-    // GLM 调用慢，给 3min 超时
-    const res = await apiClient.post<PreviewResponse>('/generate/preview', req, { timeout: 180000 })
+    // thinking 模型（GLM-4.7 等）单次推理 20-60s，三次累加 60-180s，给 5min 留 buffer。
+    const res = await apiClient.post<PreviewResponse>('/generate/preview', req, { timeout: 300000 })
     return res.data
   },
   renderConfirmed: async (req: RenderConfirmedRequest) => {
