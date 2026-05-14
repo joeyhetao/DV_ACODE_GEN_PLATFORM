@@ -43,7 +43,7 @@ async def _create_template_from_contribution(
         template_body=template_body,
         maturity="draft",
         created_by=created_by,
-        sync_status="pending",
+        sync_status="syncing",
     )
     db.add(template)
     await db.flush()
@@ -143,7 +143,7 @@ async def create_template(
         maturity=payload.maturity,
         related_ids=payload.related_ids,
         created_by=current_user.id,
-        sync_status="pending",
+        sync_status="syncing",
     )
     db.add(template)
     await db.commit()
@@ -185,7 +185,7 @@ async def update_template(
 
     from datetime import datetime, timezone
     template.updated_at = datetime.now(timezone.utc)
-    template.sync_status = "pending"
+    template.sync_status = "syncing"
 
     await invalidate_template_cache(template_id)
     await db.commit()
