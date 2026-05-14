@@ -21,6 +21,7 @@ def _to_config_out(c: LLMConfig) -> LLMConfigOut:
         model_id=c.model_id, output_mode=c.output_mode,
         temperature=c.temperature, max_tokens=c.max_tokens,
         is_active=c.is_active, is_default=c.is_default,
+        step2_disable_thinking=c.step2_disable_thinking,
         created_at=c.created_at, updated_at=c.updated_at,
     )
 
