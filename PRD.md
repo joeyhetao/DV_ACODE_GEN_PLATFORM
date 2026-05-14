@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 产品需求文档（PRD）
 
-**版本**：v2.10  
+**版本**：v2.11  
 **状态**：已确认  
-**日期**：2026-05-13  
+**日期**：2026-05-14  
 **变更**：
 - v1.0 → v2.0：输入方式由"自然语言+Excel信号表"调整为"双表格结构化输入"（SVA需求表 + 功能覆盖率需求表）
 - v2.0 → v2.1：新增模板贡献与审核机制，处理 RAG 置信度 < 50% 时模板缺口的知识沉淀闭环
@@ -15,6 +15,7 @@
 - v2.7 → v2.8：§4.3 性能指标按所选 LLM 是否为 thinking 模型分档（非 thinking 模型保持 <10s，thinking 模型如 GLM-4.7 / DeepSeek-R1 调整为 60-150s）；§3.5.1 LLM 模型清单补充 GLM 系列与 Ollama 本地部署说明
 - v2.8 → v2.9：§3.6 新增"自助注册账号"能力——登录页提供注册标签页，新账号默认 role=普通用户，库管理员/平台管理员仍由超管在用户管理页升级；§6.1 单条生成主流程改为统一两步式确认面板（preview → 用户确认 → render），意图缓存命中时通过 `quick_render` 短路跳过确认面板
 - v2.9 → v2.10：**核心契约修订**——"系统对任何输入必定产出代码"契约**收窄为仅对域内 IC 验证输入**；无关意图（诗歌/闲聊/数学题/通用代码请求等）经 RAG 之前的 dense 余弦阈值闸（默认 0.44）直接返 HTTP 422 拒绝，前端弹"检测到非验证请求"专属 Modal，不再退化生成全 placeholder 代码（详见 ARCHITECTURE.md §1.1）；阈值由 `backend/scripts/calibrate_offtopic_threshold.py` 经验校准，紧急情况通过 `OFFTOPIC_GATE_ENABLED=false` 一键关闸退回老行为
+- v2.10 → v2.11：§3.5.1 LLM 模型配置新增"Step2 禁用 thinking"开关（仅 OpenAI 兼容 Provider 可见，默认开启）——对 GLM-4.7/DeepSeek-R1 等 thinking 模型，关闭后单次推理可由 12-249s 降至 ~3s；管理员可在 FSM 复杂参数填充能力验证场景临时关闭以保留推理；§4.3 性能指标按 thinking 开关分档刷新（thinking 默认禁用后非缓存路径回到 < 10s 量级），前端 `/generate` 客户端超时从 180s 提升至 300s 以兼容 thinking ON 模式
 
 ---
 
@@ -250,7 +251,8 @@ Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最
 | Model ID | 文本 | 模型标识，如 `glm-4.7`、`deepseek-chat`、`claude-sonnet-4-6` |
 | 输出模式 | 枚举 | `工具调用（Tool Calling）` / `JSON Mode` / `Prompt JSON`，决定结构化输出策略；OpenAI 兼容路径当前固定走两步纯文本以兼容 thinking 模型 |
 | Temperature | 数字 | 默认 0.0（确定性约束） |
-| Max Tokens | 整数 | 默认 2048；thinking 类模型（GLM-4.7、DeepSeek-R1）建议 ≥ 4096，否则 reasoning_tokens 占满会出现空响应 |
+| Max Tokens | 整数 | 仅作为该模型默认 `max_tokens` 透出；实际 OpenAI 兼容路径按调用分档（normalize=512、step1=64、step2=2048/1024，详见 ARCHITECTURE §3.12.2） |
+| Step2 禁用 thinking | 开关 | 仅 OpenAI 兼容 Provider 显示，默认开启。开启时 `_step2_fill_params` 调用注入 `extra_body={"thinking":{"type":"disabled"}}`，GLM-4.7 实测从 12-249s 降至 ~3s。关闭后保留模型推理能力，用于 FSM `state_list` / `bins_expr` 等复杂参数填充能力对照（详见 ARCHITECTURE §3.12.2） |
 
 **Provider 说明**：
 
@@ -575,8 +577,10 @@ Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最
 - 单条生成（缓存命中）：响应时间 < 500ms
 - 单条生成（缓存未命中，含 LLM 调用）：
   - 非 thinking 类模型（Claude、DeepSeek-V3、GPT-4o、Qwen-Plus 等）：< 10s
-  - Thinking 类模型（GLM-4.7、DeepSeek-R1 等）：60-150s（reasoning_tokens 占主要时间，前端 `/generate` 默认超时 180s）
-- 批量生成：支持单次上传不少于 100 行 Excel，整体生成时间 < 5 分钟（按非 thinking 模型估算；thinking 模型下需相应放宽，建议批量场景配置非 thinking 模型）
+  - Thinking 类模型（GLM-4.7、DeepSeek-R1 等）默认配置（`step2_disable_thinking=true`）：< 10s，与非 thinking 模型同档
+  - Thinking 类模型显式关闭"Step2 禁用 thinking"开关时：60-150s，方差较大，建议仅在 FSM 等复杂参数填充能力验证场景使用
+- 前端 `/generate` 与 `/generate/preview` 客户端默认超时 300s，覆盖 thinking ON 模式最坏情况
+- 批量生成：支持单次上传不少于 100 行 Excel，整体生成时间 < 5 分钟（默认 thinking 禁用配置下达成；显式启用 thinking 时需相应放宽）
 - 系统支持至少 50 个并发用户
 
 ### 4.4 可用性

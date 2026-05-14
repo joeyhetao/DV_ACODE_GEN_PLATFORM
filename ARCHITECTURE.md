@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.15  
+**版本**：v2.16  
 **状态**：已确认  
-**日期**：2026-05-13  
+**日期**：2026-05-14  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -20,6 +20,7 @@
 - v2.12 → v2.13：方案 3 两步式 UI 落地——`run_pipeline` 拆为 `pipeline_preview` + `pipeline_render`（§3.15.3），新增 `/api/v1/generate/preview` 端点 + 增强 `/api/v1/generate/render` 端点（§5.1）；`_map_params` 重写为 `_map_params_with_source`，每参数标注 5 类来源（signal_list / regex / llm / default / placeholder）（§3.15.4）；新增 `confidence_source` 字段区分 LLM 主动选中 vs RAG fallback vs 意图缓存命中（§3.15.5）；前端引入 ConfirmationPanel + ParametersForm 两步式确认面板（§3.16），意图缓存命中走 `quick_render=true` 路径自动跳过确认；既有 `/generate` 端点改为内部调 preview+render，对 batch_tasks 调用方零变更
 - v2.13 → v2.14：参数 expr_type 元数据 + 标识符规范化层落地——模板 YAML 的 `parameters[].expr_type` 字段声明参数语法类型（`sv_identifier` / `sv_identifier_list` / `sv_boolean_expr` / `sv_bins_expr`）；新增 `services/core/identifier.py`（SV 标识符 sanitize + IDENTIFIER_PARAMS 兜底白名单 + `construct_group_name`）和 `services/core/expr_validator.py`（轻量手写状态机校验布尔/列表/bins 表达式）；`_map_params_with_source` 末尾追加 expr_type-driven Step 7（覆盖所有 5 类源，sv_identifier 类参数被静默清洗、布尔/bins 类校验失败仅打 `validation_error`）（§3.15.5 新增）；`PreviewResponse.params` schema 新增 `sanitized` / `expr_type` / `validation_error` 三字段供前端徽标提示；前端镜像 `frontend/src/utils/exprValidators.ts`（§7）；§5.1 端点表补齐 `/api/v1/generate/preview`、`/api/v1/auth/register`、`/api/v1/auth/me`、`/api/health`，移除不存在的 `/api/v1/auth/refresh`；`lib_manager.py import` 在参数缺 `expr_type` 时输出 WARN 提示
 - v2.14 → v2.15：契约修订 + RAG 原生 off-topic 闸——"always produce code" 契约**收窄为仅对域内 IC 输入**（§1.1）；新增 `services/rag/engine.py::dense_top1_score` helper 复用 Qdrant dense 通道；`pipeline_preview` 头部插入 dense 阈值闸（用 `original_intent` 而非 `normalized`——后者会被 LLM 改写成"无法判断类型"等元说明意外抬高 off-topic 分数），低于 `OFFTOPIC_DENSE_THRESHOLD`（校准默认 0.44）抛 `OffTopicIntentError` 返 HTTP 422；`generate.py` 端点结构化 detail（`type=off_topic` + `detector` + `top_dense_score` + `threshold`）让前端弹专属 Modal；`OFFTOPIC_GATE_ENABLED=false` 紧急 kill-switch；删除前一轮的 normalizer sentinel 注入式临时方案（恢复 `normalize_intent` 提示词为纯改写）；新增 `backend/scripts/calibrate_offtopic_threshold.py` 经验校准脚本；回归语料 `backend/tests/data/offtopic_corpus.yaml` + mock/real-LLM 双套件保留
+- v2.15 → v2.16：thinking 控制由全局硬编码改为**按 LLM 调用分档 + 按配置可调**（§3.12.2、§3.12.3）——`llm_configs` 表新增 `step2_disable_thinking` BOOLEAN 列（NOT NULL，默认 true；迁移 `002_step2_disable_thinking.py`）（§4.1）；`normalize_intent` 与 `_step1_select_id` 硬编码禁 thinking 且收紧 `max_tokens`（512 / 64），`_step2_fill_params` 由 `llm_configs.step2_disable_thinking` 运行时切换（true→`max_tokens=2048` 禁 thinking，false→`max_tokens=1024` 保留 thinking）；所有 OpenAI-compat 调用打点 `[Timing] llm=<name> ms=<n> reasoning_tokens=<n> thinking=<on/off>` 便于验证 `extra_body` 是否被模型实际识别；`LLMConfigCreate/Update/Out` 三个 Schema 透出新字段，Admin UI 加 Switch（§5.1）；前端 `/generate` 与 `/generate/preview` 客户端超时由 180s 提升至 300s（thinking ON 模式下三步累加可达 ~4min）
 
 ---
 
@@ -997,19 +998,23 @@ services/llm/
 
 **OpenAI 兼容路径——两步调用模式**：
 
-为兼容 GLM-4.7、DeepSeek-R1 等 thinking 类模型（reasoning_tokens 实测 ~650/次），`select_template` 内部拆为两次纯文本调用，避免单次 prompt 输出过长触发 `finish_reason='length'`：
+为兼容 GLM-4.7、DeepSeek-R1 等 thinking 类模型（reasoning_tokens 实测 ~650/次），`select_template` 内部拆为两次纯文本调用，避免单次 prompt 输出过长触发 `finish_reason='length'`。每次调用的 thinking 开关与 `max_tokens` 按用途独立调档：
 
-```
-Step 1: _step1_select_id(normalized_intent, candidates) → template_id
-   max_tokens=4096，仅返回候选列表中的 template_id 字符串
-   候选简化为 "id  name  description[:60]" 三段，system prompt 含选型规则
+| 调用 | `extra_body` | `max_tokens` | 说明 |
+|------|--------------|--------------|------|
+| `normalize_intent` | `{"thinking":{"type":"disabled"}}`（硬编码） | 512 | 句式改写，无需 chain-of-thought |
+| `_step1_select_id` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 仅返回候选列表中的 template_id；选错由 pipeline.py 的 RAG fallback 兜底 |
+| `_step2_fill_params` | 由 `llm_configs.step2_disable_thinking` 运行时切换 | 2048（off）/ 1024（on） | 仅针对所选模板的 required 参数生成 JSON；prompt 注入示例输出，正则提取响应中第一个 JSON 对象（兼容 ` ```json``` ` 围栏） |
+| `test_basic` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 连通性自检 |
 
-Step 2: _step2_fill_params(intent, signal_context, template_id, required_params) → dict
-   max_tokens=4096，仅针对所选模板的 required 参数生成 JSON
-   prompt 注入示例输出，正则提取响应中第一个 JSON 对象（兼容 ```json``` 围栏）
-```
+`_step2_fill_params` 的两档配置：
 
-返回 `TemplateSelectionOutput(template_id, param_mapping, confidence)`，其中 `param_mapping` schema 类型为 `dict`（不限定 value 类型，因 LLM 可能返回 `signal_width: 3` 等数字）。`normalize_intent` 与 `test_basic` 同样使用 `max_tokens=4096` 给 reasoning_tokens 留缓冲。
+- **`step2_disable_thinking=true`（默认）**：禁 thinking，`max_tokens=2048`。实测 GLM-4.7 单次 ~3s 稳定，无 `finish=length`。适合生产路径。
+- **`step2_disable_thinking=false`**：保留 thinking，`max_tokens=1024`（reasoning ≤ 600 + JSON ~150）。实测方差 12-249s，偶发 `finish=length` 返空。仅在需要复杂推理填参数（FSM `state_list` / `bins_expr` 等边界场景）时由超管在 Admin UI 临时切换以做能力对照。
+
+`extra_body={"thinking":{"type":"disabled"}}` 是 Zhipu OpenAI-compatible 原生参数（`openai` SDK 透传），非 thinking 模型会静默忽略，无副作用。每次调用打点 `[Timing] llm=<name> ms=<n> reasoning_tokens=<n> thinking=<on/off>`，`reasoning_tokens=0` 确认 `extra_body` 真正生效。
+
+返回 `TemplateSelectionOutput(template_id, param_mapping, confidence)`，其中 `param_mapping` schema 类型为 `dict`（不限定 value 类型，因 LLM 可能返回 `signal_width: 3` 等数字）。
 
 **factory.py 逻辑**：
 
@@ -1590,6 +1595,7 @@ lib_manager.py import template_library/ --dry-run
 | max_tokens | INT | 默认 512 |
 | is_active | BOOLEAN | 是否启用 |
 | is_default | BOOLEAN | 是否为当前默认（同时只允许一条为 true） |
+| step2_disable_thinking | BOOLEAN | NOT NULL DEFAULT true；仅 `provider=openai_compatible` 生效，控制 `_step2_fill_params` 是否禁用模型 thinking（详见 §3.12.2）。Anthropic provider 走 `extended_thinking` 不受此字段控制 |
 | created_at | TIMESTAMPTZ | 创建时间 |
 | updated_at | TIMESTAMPTZ | 更新时间 |
 
