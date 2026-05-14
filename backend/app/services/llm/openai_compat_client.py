@@ -1,6 +1,7 @@
 from __future__ import annotations
 import json
 import re
+import time
 import httpx
 import openai
 
@@ -46,6 +47,7 @@ class OpenAICompatLLMClient(LLMClient):
         system = f"你是IC验证领域专家。将用户提供的验证意图改写为标准句式。\n\n规则：\n{rules}"
         # 纯句式改写不需要 chain-of-thought：thinking={"type":"disabled"} 跳过 reasoning_tokens，
         # max_tokens 收回到 512（实测输出 ≤ 200 tokens）。非 thinking 模型忽略 extra_body 字段。
+        _t = time.perf_counter()
         resp = await self._client.chat.completions.create(
             model=self._model,
             max_tokens=512,
@@ -56,6 +58,7 @@ class OpenAICompatLLMClient(LLMClient):
                 {"role": "user", "content": original_intent},
             ],
         )
+        print(f"[Timing] llm=normalize_intent ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
         return resp.choices[0].message.content.strip()
 
     async def select_template(
@@ -115,6 +118,7 @@ class OpenAICompatLLMClient(LLMClient):
         # Step1 是 pick-from-list 分类，依赖 system prompt 里的 FSM/handshake/value/cross 规则即可，
         # 无需 chain-of-thought：thinking={"type":"disabled"} 跳过 reasoning_tokens，
         # max_tokens=64 容纳 ~10 token 的 template_id 输出。误判由 pipeline.py 的 RAG fallback 兜底。
+        _t = time.perf_counter()
         resp = await self._client.chat.completions.create(
             model=self._model,
             max_tokens=64,
@@ -125,6 +129,7 @@ class OpenAICompatLLMClient(LLMClient):
                 {"role": "user", "content": user},
             ],
         )
+        print(f"[Timing] llm=step1_select_id ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
         content = (resp.choices[0].message.content or "").strip()
         print(f"[GLM Step1] raw={content!r} finish={resp.choices[0].finish_reason}", flush=True)
 
@@ -160,6 +165,7 @@ class OpenAICompatLLMClient(LLMClient):
 
         # Step2 保留 thinking：FSM state_list / bins_expr 等边界场景靠推理填出正确值，禁了会掉准。
         # max_tokens 从 4096 收回到 1024：实测 reasoning ≤ 600 tokens + JSON 输出 ~150 tokens 足够。
+        _t = time.perf_counter()
         resp = await self._client.chat.completions.create(
             model=self._model,
             max_tokens=1024,
@@ -169,6 +175,7 @@ class OpenAICompatLLMClient(LLMClient):
                 {"role": "user", "content": user},
             ],
         )
+        print(f"[Timing] llm=step2_fill_params ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
         content = resp.choices[0].message.content or ""
         print(f"[GLM Step2] raw={content!r} finish={resp.choices[0].finish_reason}", flush=True)
 

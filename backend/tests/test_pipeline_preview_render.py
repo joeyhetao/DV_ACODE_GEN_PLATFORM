@@ -444,3 +444,72 @@ async def test_pipeline_preview_off_topic_gate_disabled_skips_check():
         assert result.confidence_source == "rag_fallback"
     finally:
         settings.offtopic_gate_enabled = original
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_offtopic_short_circuits_normalize_and_rag():
+    """跑题闸触发时必须早返：normalize / rag / llm 都不能被调到。
+
+    防止后续重构无意中把 dense gate 移到 normalize 之后，浪费 GLM-4.7 thinking 20s。
+    """
+    from contextlib import ExitStack
+    stack = ExitStack()
+    dense_mock = AsyncMock(return_value=0.10)
+    normalize_mock = AsyncMock(return_value=("should not reach here", "hash"))
+    rag_mock = AsyncMock(return_value=[])
+    llm_factory_mock = AsyncMock()
+
+    stack.enter_context(patch("app.services.core.pipeline.dense_top1_score", new=dense_mock))
+    stack.enter_context(patch("app.services.core.pipeline.normalize_intent", new=normalize_mock))
+    stack.enter_context(patch("app.services.core.pipeline.rag_retrieve", new=rag_mock))
+    stack.enter_context(patch("app.services.core.pipeline.get_default_llm_client", new=llm_factory_mock))
+
+    fake_db = MagicMock()
+    fake_db.get = AsyncMock(return_value=None)
+
+    with stack, pytest.raises(OffTopicIntentError):
+        await pipeline_preview(_make_preview_inp(), fake_db)
+
+    dense_mock.assert_awaited_once()
+    normalize_mock.assert_not_awaited()
+    rag_mock.assert_not_awaited()
+    llm_factory_mock.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_is_deterministic_for_same_input():
+    """两次调用相同输入必须得到相同 template_id 和 params（确定性契约）。
+
+    禁掉 step1 thinking 后理论上仍 deterministic（temperature=0），本测试用 mock
+    LLM 锁死契约：相同 input → 相同 select_template 返回 → 相同 PreviewResult。
+    """
+    rag = [_make_rag_candidate("sva_handshake_timeout_v1", score=0.85)]
+    selection = TemplateSelectionOutput(
+        template_id="sva_handshake_timeout_v1",
+        param_mapping={"signal": "valid"},
+        confidence=0.9,
+    )
+
+    fake_db_template = MagicMock()
+    fake_db_template.parameters = []
+    fake_db_template.id = "sva_handshake_timeout_v1"
+    fake_db_template.name = "Template sva_handshake_timeout_v1"
+    fake_db_template.version = "1.0.0"
+
+    inp = _make_preview_inp()
+
+    results = []
+    for _ in range(2):
+        stack, fake_db = _patch_preview_deps(rag, selection, db_get_return_value=fake_db_template)
+        with stack:
+            results.append(await pipeline_preview(inp, fake_db))
+
+    assert results[0].template_id == results[1].template_id
+    assert results[0].template_version == results[1].template_version
+    assert results[0].confidence_source == results[1].confidence_source
+    assert _values_only_from_preview(results[0]) == _values_only_from_preview(results[1])
+
+
+def _values_only_from_preview(result) -> dict:
+    """提取 params dict 的 value-only 视图，便于比较确定性契约。"""
+    return {name: meta["value"] for name, meta in result.params.items()}

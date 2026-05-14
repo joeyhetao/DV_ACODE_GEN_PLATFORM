@@ -1,6 +1,7 @@
 from __future__ import annotations
 import re
 import json
+import time
 from dataclasses import dataclass, field
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
@@ -109,8 +110,11 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
     # 那串字符的 embedding 反而抬高了 off-topic 段分数；原文保留"远离 IC 域"语义。
     # 阈值经 calibrate_offtopic_threshold.py 在 offtopic_corpus.yaml 上校准得出。
     settings = get_settings()
+    _t_total = time.perf_counter()
     if settings.offtopic_gate_enabled:
+        _t = time.perf_counter()
         top_dense = await dense_top1_score(inp.original_intent, code_type=inp.code_type)
+        print(f"[Timing] stage=offtopic_gate ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
         if top_dense < settings.offtopic_dense_threshold:
             print(
                 f"[Pipeline] off-topic dense gate: top1={top_dense:.4f} "
@@ -123,7 +127,9 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
             )
 
     # Step 1: Intent Normalize
+    _t = time.perf_counter()
     normalized, intent_hash = await normalize_intent(inp.original_intent, db)
+    print(f"[Timing] stage=normalize ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
 
     # Step 2: Intent Cache Lookup
     history = await lookup_history(intent_hash)
@@ -153,7 +159,9 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
             )
 
     # Step 3 + 4: RAG Retrieve
+    _t = time.perf_counter()
     rag_candidates = await rag_retrieve(normalized, db, code_type=inp.code_type)
+    print(f"[Timing] stage=rag ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
     if not rag_candidates:
         raise ValueError("未能从模板库中检索到合适的模板，请检查意图描述或丰富模板库")
 
@@ -189,9 +197,11 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
         }
         for c in rag_candidates
     ]
+    _t = time.perf_counter()
     selection = await llm.select_template(
         normalized, signal_context, candidate_dicts, original_intent=inp.original_intent
     )
+    print(f"[Timing] stage=llm_select ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
     print(f"[Pipeline] LLM selection: template_id={selection.template_id!r} confidence={selection.confidence}", flush=True)
 
     template = None
@@ -228,6 +238,7 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
         template, inp, regex_mapping=regex_mapping, llm_mapping=selection.param_mapping
     )
     print(f"[Pipeline] params={_values_only(params_with_source)}", flush=True)
+    print(f"[Timing] stage=preview_total ms={int((time.perf_counter() - _t_total) * 1000)}", flush=True)
 
     # 构建 RAG 候选摘要（含 parameters 供前端切换用）
     rag_summary = [
