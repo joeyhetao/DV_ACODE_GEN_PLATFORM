@@ -1,10 +1,24 @@
 from __future__ import annotations
 import json
+import time
 import anthropic
 import httpx
 
 from app.schemas.intent import TemplateSelectionOutput
 from app.services.llm.base import LLMClient
+
+
+def _anthropic_thinking_tokens(msg) -> str:
+    """Anthropic extended thinking 暴露在 usage 上的字段名按 SDK 版本变动；
+    取不到就返 n/a，与 OpenAI-compat 的 [Timing] 日志格式对齐。"""
+    usage = getattr(msg, "usage", None)
+    if not usage:
+        return "n/a"
+    for attr in ("thinking_tokens", "reasoning_tokens"):
+        val = getattr(usage, attr, None)
+        if val is not None:
+            return str(val)
+    return "n/a"
 
 
 # thinking 模型（GLM-4.7、DeepSeek-R1、Claude 4.x extended thinking 等）单次推理 20-60s。
@@ -42,12 +56,18 @@ class AnthropicLLMClient(LLMClient):
 
     async def normalize_intent(self, original_intent: str, rules: str) -> str:
         system = f"你是IC验证领域专家。将用户提供的验证意图改写为标准句式。\n\n规则：\n{rules}"
+        _t = time.perf_counter()
         msg = await self._client.messages.create(
             model=self._model,
             max_tokens=128,
             temperature=self._temperature,
             system=system,
             messages=[{"role": "user", "content": original_intent}],
+        )
+        print(
+            f"[Timing] llm=normalize_intent ms={int((time.perf_counter() - _t) * 1000)} "
+            f"reasoning_tokens={_anthropic_thinking_tokens(msg)} thinking=n/a",
+            flush=True,
         )
         return msg.content[0].text.strip()
 
@@ -56,6 +76,7 @@ class AnthropicLLMClient(LLMClient):
         normalized_intent: str,
         signal_context: str,
         candidates: list[dict],
+        original_intent: str = "",
     ) -> TemplateSelectionOutput:
         candidates_text = "\n\n".join(
             f"模板{i + 1}：{c['template_id']} - {c['name']}\n"
@@ -68,11 +89,17 @@ class AnthropicLLMClient(LLMClient):
             "你是资深IC验证工程师。从候选模板中选择最匹配的，并将信号角色与参数对应。\n"
             "严格使用工具调用输出，不要输出任何其他内容。"
         )
+        # original_intent 保留用户原始信号名/状态枚举（normalize 可能改写），优先填参数；
+        # 与 OpenAICompatLLMClient._step2_fill_params 行为对齐。
+        raw_intent_block = (
+            f"\n\n[用户原始描述]\n{original_intent}" if original_intent else ""
+        )
         user = (
-            f"{signal_context}\n\n[验证意图]\n{normalized_intent}\n\n"
+            f"{signal_context}\n\n[验证意图]\n{normalized_intent}{raw_intent_block}\n\n"
             f"[候选模板]\n{candidates_text}"
         )
 
+        _t = time.perf_counter()
         msg = await self._client.messages.create(
             model=self._model,
             max_tokens=self._max_tokens,
@@ -81,6 +108,11 @@ class AnthropicLLMClient(LLMClient):
             tools=[_TOOL_DEF],
             tool_choice={"type": "tool", "name": "select_template"},
             messages=[{"role": "user", "content": user}],
+        )
+        print(
+            f"[Timing] llm=select_template ms={int((time.perf_counter() - _t) * 1000)} "
+            f"reasoning_tokens={_anthropic_thinking_tokens(msg)} thinking=n/a",
+            flush=True,
         )
 
         for block in msg.content:
