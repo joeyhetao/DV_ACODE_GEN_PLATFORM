@@ -3,12 +3,13 @@
 lib_manager.py — 模板库管理 CLI
 
 用法:
-  python lib_manager.py import    [--dir DIR] [--force]
-  python lib_manager.py validate  [--dir DIR]
-  python lib_manager.py rebuild   [--collection NAME]
-  python lib_manager.py export    [--dir DIR]
+  python lib_manager.py import      [--dir DIR] [--force]
+  python lib_manager.py validate    [--dir DIR]
+  python lib_manager.py rebuild     [--collection NAME]
+  python lib_manager.py export      [--dir DIR]
   python lib_manager.py backup
-  python lib_manager.py list
+  python lib_manager.py list        [--code-type TYPE]
+  python lib_manager.py dedup-check [--threshold T] [--code-type TYPE]
 """
 from __future__ import annotations
 import asyncio
@@ -124,6 +125,17 @@ async def _import(lib_dir: Path, force: bool):
                 failed += 1
 
     click.echo(f"\n完成: 导入={imported} 名称冲突={skipped_name} 语义重复={skipped_dup} 失败={failed}")
+
+    # 批量导入后清 intent_cache：旧的 intent → (template_id, params) 映射可能
+    # 指向已不存在 / schema 改了的模板。逐条核对成本高，整体清更稳。
+    # gen:* 不清（template_id+params 维度精确，新模板用新 key，不会撞）。
+    if imported > 0:
+        try:
+            from app.services.core.cache import invalidate_all_intent_cache
+            n = await invalidate_all_intent_cache()
+            click.echo(f"  [清缓存] intent_cache:* 删除 {n} 条")
+        except Exception as e:
+            click.echo(f"  [WARN] intent_cache 清理失败: {e}", err=True)
 
 
 # ─── validate ────────────────────────────────────────────────────────────────
@@ -275,6 +287,69 @@ async def _list(code_type: str | None):
         for tmpl in templates:
             click.echo(f"{tmpl.id:<32} {tmpl.code_type:<12} {tmpl.maturity:<10} {tmpl.name}")
         click.echo(f"\n共 {len(templates)} 个模板")
+
+
+# ─── dedup-check ─────────────────────────────────────────────────────────────
+
+@cli.command("dedup-check")
+@click.option("--threshold", type=float, default=None,
+              help="覆盖 settings.template_dedup_threshold（默认 0.90）")
+@click.option("--code-type", default=None, help="只检查指定 code_type")
+def cmd_dedup_check(threshold: float | None, code_type: str | None):
+    """按当前 dedup 阈值扫一遍历史模板，列出潜在重复。
+
+    阈值变更后用：dedup 在 import 时只对"新模板 vs 历史"判定一次，阈值改了不会
+    回溯历史样本。本命令对每条 active 模板调一次 check_semantic_duplicate，列出
+    每条命中阈值的同义对（自反命中除外）。仅打印，**不**删除任何模板。
+    """
+    asyncio.run(_dedup_check(threshold, code_type))
+
+
+async def _dedup_check(threshold: float | None, code_type: str | None):
+    from app.core.database import AsyncSessionLocal
+    from app.core.config import get_settings
+    from app.models.template import Template
+    from app.services.core.dedup import check_semantic_duplicate
+    from sqlalchemy import select
+
+    settings = get_settings()
+    effective = threshold if threshold is not None else settings.template_dedup_threshold
+    click.echo(f"使用阈值 {effective:.4f}（settings 默认 {settings.template_dedup_threshold:.4f}）")
+
+    # 临时覆盖 settings 让 check_semantic_duplicate 用我们的阈值
+    original = settings.template_dedup_threshold
+    settings.template_dedup_threshold = effective
+    try:
+        async with AsyncSessionLocal() as db:
+            stmt = select(Template).where(Template.is_active == True)
+            if code_type:
+                stmt = stmt.where(Template.code_type == code_type)
+            templates = (await db.execute(stmt.order_by(Template.name))).scalars().all()
+            click.echo(f"扫描 {len(templates)} 条模板……\n")
+
+            findings = 0
+            for tmpl in templates:
+                similar = await check_semantic_duplicate(
+                    description=tmpl.description or "",
+                    name=tmpl.name,
+                    tags=tmpl.tags,
+                    keywords=tmpl.keywords,
+                    top_k=3,
+                )
+                # 滤掉自反命中
+                similar = [s for s in similar if s["template_id"] != tmpl.id]
+                if similar:
+                    findings += 1
+                    click.echo(f"[潜在重复] {tmpl.id}  {tmpl.name}")
+                    for s in similar:
+                        click.echo(f"    ~ {s['template_id']}  score={s['score']}")
+
+            click.echo(
+                f"\n完成：{findings} 条模板存在阈值内 (≥{effective}) 的相似项。"
+                f"不会自动删除——请人工评审后用 Admin UI / API 处理。"
+            )
+    finally:
+        settings.template_dedup_threshold = original
 
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
