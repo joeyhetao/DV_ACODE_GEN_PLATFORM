@@ -139,6 +139,21 @@ async def main() -> None:
     print()
     _print_compare("embed=NORMALIZED (生产现状)", off_norm, "...", marg_norm)
 
+    # 建议的 env 行：让运维直接粘贴进 .env 即可生效（无需改代码 / 重 build 镜像）
+    if off_orig and marg_orig:
+        off_max = max(off_orig)
+        marg_min = min(marg_orig)
+        gap = marg_min - off_max
+        if gap > 0:
+            recommended = round(off_max + gap / 2, 2)
+        else:
+            recommended = round(max(0.0, marg_min - 0.02), 2)
+        print()
+        print("=" * 100)
+        print("写入 .env（生效需重启 backend）：")
+        print(f"  OFFTOPIC_DENSE_THRESHOLD={recommended}")
+        print("=" * 100)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
