@@ -427,8 +427,9 @@ type UnderSpecifiedDetail = {
 type ApiErrorDetail = string | OffTopicDetail | CodeTypeMismatchDetail | UnderSpecifiedDetail | undefined
 
 function handleApiError(e: unknown, fallbackMsg: string, navigate?: NavigateFunction): void {
-  const err = e as { response?: { data?: { detail?: ApiErrorDetail } } }
+  const err = e as { response?: { status?: number; data?: { detail?: ApiErrorDetail } } }
   const detail = err.response?.data?.detail
+  const status = err.response?.status
 
   // v3.0：detail.redirect_to 优先于一切——后端明示前端应跳转的路由，前端无脑 router.push
   // off_topic / code_type_mismatch / empty_retrieval 三种 detail.redirect_to=null 不触发本分支
@@ -486,5 +487,18 @@ function handleApiError(e: unknown, fallbackMsg: string, navigate?: NavigateFunc
     })
     return
   }
-  message.error(typeof detail === 'string' ? detail : fallbackMsg)
+  // Fallback：detail 不是已知结构化 type 也不是字符串时（如 FastAPI 默认 500 / 网络错误），
+  // 把 HTTP 状态 + detail 摘要拼进消息，避免黑盒"生成失败"难定位
+  const detailStr =
+    typeof detail === 'string'
+      ? detail
+      : detail
+        ? JSON.stringify(detail).slice(0, 200)
+        : ''
+  const suffix = status
+    ? `（HTTP ${status}${detailStr ? `: ${detailStr}` : ''}）`
+    : detailStr
+      ? `：${detailStr}`
+      : ''
+  message.error(`${fallbackMsg}${suffix}`)
 }
