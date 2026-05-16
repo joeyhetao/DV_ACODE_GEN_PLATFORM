@@ -1,7 +1,10 @@
 from __future__ import annotations
+import logging
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+
+logger = logging.getLogger(__name__)
 
 from app.core.database import get_db
 from app.core.security import get_current_user
@@ -127,10 +130,16 @@ async def generate(
     except EmptyRetrievalError as e:
         raise HTTPException(status_code=503, detail=_empty_retrieval_detail(e))
     except ValueError as e:
+        logger.warning(
+            "run_pipeline ValueError: user=%s code_type=%s text_len=%s err=%s",
+            current_user.id, payload.code_type, len(payload.text or ""), e,
+        )
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.exception(
+            "run_pipeline unexpected failure: user=%s code_type=%s text_len=%s",
+            current_user.id, payload.code_type, len(payload.text or ""),
+        )
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
     record = GenerationRecord(
@@ -191,6 +200,30 @@ async def preview(
 
     try:
         result = await pipeline_preview(inp, db)
+        # PreviewResponse 构造也包进 try：Pydantic 校验失败时也走结构化 500，
+        # 而不是绕开本 except chain 进 FastAPI 默认 handler → 前端看不到 detail.type。
+        return PreviewResponse(
+            template_id=result.template_id,
+            template_name=result.template_name,
+            template_version=result.template_version,
+            confidence=result.confidence,
+            confidence_source=result.confidence_source,
+            rag_candidates=[
+                RAGCandidateWithParams(
+                    template_id=c["template_id"],
+                    name=c["name"],
+                    score=c["score"],
+                    parameters=c.get("parameters", []),
+                )
+                for c in result.rag_candidates
+            ],
+            params={
+                name: ParamWithSource(**meta) for name, meta in result.params.items()
+            },
+            intent_hash=result.intent_hash,
+            normalized_intent=result.normalized_intent,
+            quick_render=result.quick_render,
+        )
     except OffTopicIntentError as e:
         raise HTTPException(status_code=422, detail=_off_topic_detail(e))
     except CodeTypeMismatchError as e:
@@ -200,34 +233,17 @@ async def preview(
     except EmptyRetrievalError as e:
         raise HTTPException(status_code=503, detail=_empty_retrieval_detail(e))
     except ValueError as e:
+        logger.warning(
+            "pipeline_preview ValueError: user=%s code_type=%s text_len=%s err=%s",
+            current_user.id, payload.code_type, len(payload.text or ""), e,
+        )
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.exception(
+            "pipeline_preview unexpected failure: user=%s code_type=%s text_len=%s",
+            current_user.id, payload.code_type, len(payload.text or ""),
+        )
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
-
-    return PreviewResponse(
-        template_id=result.template_id,
-        template_name=result.template_name,
-        template_version=result.template_version,
-        confidence=result.confidence,
-        confidence_source=result.confidence_source,
-        rag_candidates=[
-            RAGCandidateWithParams(
-                template_id=c["template_id"],
-                name=c["name"],
-                score=c["score"],
-                parameters=c.get("parameters", []),
-            )
-            for c in result.rag_candidates
-        ],
-        params={
-            name: ParamWithSource(**meta) for name, meta in result.params.items()
-        },
-        intent_hash=result.intent_hash,
-        normalized_intent=result.normalized_intent,
-        quick_render=result.quick_render,
-    )
 
 
 @router.post("/render", response_model=RenderResponse)
@@ -255,10 +271,16 @@ async def render(
         )
         code, cache_hit = await pipeline_render(render_input, db)
     except ValueError as e:
+        logger.warning(
+            "pipeline_render ValueError: user=%s template=%s err=%s",
+            current_user.id, payload.template_id, e,
+        )
         raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
-        import traceback
-        traceback.print_exc()
+        logger.exception(
+            "pipeline_render unexpected failure: user=%s template=%s",
+            current_user.id, payload.template_id,
+        )
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
     # 仅在两步式路径（含 intent_hash）下写 GenerationRecord
