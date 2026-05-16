@@ -126,6 +126,45 @@ class AnthropicLLMClient(LLMClient):
 
         raise RuntimeError("LLM 未调用 select_template 工具")
 
+    async def chat(
+        self,
+        messages: list[dict],
+        max_tokens: int = 1024,
+        temperature: float | None = None,
+    ) -> str:
+        """v3.0 通用多轮接口。Anthropic SDK 把 system 单独成参数，需要从 messages 拆出。
+
+        IntentBuilder + 贡献 LLM 反推 parameters 用。Anthropic 默认不开 extended_thinking
+        （需要额外参数显式开），所以默认行为已经满足 IntentBuilder"低延迟稳定多轮"需求。
+        """
+        # 提取 system message（若存在），其余传给 messages.create
+        system_content = ""
+        chat_messages = []
+        for m in messages:
+            if m.get("role") == "system":
+                system_content = m.get("content", "")
+            else:
+                chat_messages.append(m)
+        _t = time.perf_counter()
+        msg = await self._client.messages.create(
+            model=self._model,
+            max_tokens=max_tokens,
+            temperature=temperature if temperature is not None else self._temperature,
+            system=system_content,
+            messages=chat_messages,
+        )
+        print(
+            f"[Timing] llm=chat ms={int((time.perf_counter() - _t) * 1000)} "
+            f"reasoning_tokens={_anthropic_thinking_tokens(msg)} thinking=n/a "
+            f"messages_count={len(messages)}",
+            flush=True,
+        )
+        # Anthropic content 是 list[ContentBlock]，取第一个 text block
+        for block in msg.content:
+            if getattr(block, "type", None) == "text":
+                return block.text.strip()
+        return ""
+
     async def test_basic(self) -> str:
         msg = await self._client.messages.create(
             model=self._model,

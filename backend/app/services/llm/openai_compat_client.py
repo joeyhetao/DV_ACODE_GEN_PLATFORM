@@ -225,6 +225,33 @@ class OpenAICompatLLMClient(LLMClient):
         except Exception:
             return {}
 
+    async def chat(
+        self,
+        messages: list[dict],
+        max_tokens: int = 1024,
+        temperature: float | None = None,
+    ) -> str:
+        """v3.0 通用多轮接口。IntentBuilder + 贡献 LLM 反推 parameters 用。
+
+        默认禁 thinking——多轮对话需要稳定低延迟，不需要 reasoning_tokens。
+        若 caller 需要 thinking，自行包装 extra_body 调底层 SDK（本接口不暴露）。
+        """
+        _t = time.perf_counter()
+        resp = await self._client.chat.completions.create(
+            model=self._model,
+            max_tokens=max_tokens,
+            temperature=temperature if temperature is not None else self._temperature,
+            extra_body={"thinking": {"type": "disabled"}},
+            messages=messages,
+        )
+        print(
+            f"[Timing] llm=chat ms={int((time.perf_counter() - _t) * 1000)} "
+            f"reasoning_tokens={_reasoning_tokens(resp)} thinking=off "
+            f"messages_count={len(messages)}",
+            flush=True,
+        )
+        return (resp.choices[0].message.content or "").strip()
+
     async def test_basic(self) -> str:
         resp = await self._client.chat.completions.create(
             model=self._model,
