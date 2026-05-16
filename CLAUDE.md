@@ -4,7 +4,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-IC verification assistant code generation platform: structured Excel input → deterministic SVA assertion / UVM functional coverage code. Authoritative spec is `PRD.md` (v2.9) and `ARCHITECTURE.md` (v2.14). README and CONTRIBUTING are in Chinese; design docs are the source of truth.
+IC verification assistant code generation platform: structured Excel input → deterministic SVA assertion / UVM functional coverage code. Authoritative spec is `PRD.md` (**v3.0**) and `ARCHITECTURE.md` (v2.14). README and CONTRIBUTING are in Chinese; design docs are the source of truth.
+
+**v3.0 user journey reversal (most important reading before changing pipeline / IntentBuilder / contribution code)**: open-ended NL is no longer salvaged by the pipeline. The 4 gates (off-topic / code_type_mismatch / under_specified / empty_retrieval) all return 422/503 with a structured `detail`. `detail.redirect_to` is the v3.0 mechanism by which the backend tells the frontend where to route the user — only `under_specified` populates it (`/intent-builder?prefill=...&template_id=...&missing=...`); the other three are `null`. Frontend `handleApiError` checks `redirect_to` **first**, before any Modal — read [GeneratePage.tsx handleApiError](frontend/src/pages/Generate/GeneratePage.tsx) for the exact branching. IntentBuilder ([api/v1/intent_builder.py](backend/app/api/v1/intent_builder.py) + [services/intent/conversation.py](backend/app/services/intent/conversation.py)) is a RAG-grounded multi-turn chat with Redis 24h session ([services/intent/session.py](backend/app/services/intent/session.py))—LLM is forced to align user intent to existing templates and is not allowed to invent scenarios. Contribution wizard ([api/v1/contributions.py](backend/app/api/v1/contributions.py)) now takes 4 user fields; backend LLM reverse-derives parameter_defs / Jinja body / keywords via [services/platform/parameter_extractor.py](backend/app/services/platform/parameter_extractor.py) and validates through 3 gates (param_defs naming, Jinja2 renderability, keywords shape) before queuing for admin review.
 
 ## Common commands
 
@@ -79,11 +81,22 @@ npm run lint     # ESLint with --max-warnings 0
 
 ## Architecture: the determinism contract
 
-**The single most important constraint**: the platform must produce identical output for identical input **for in-domain inputs**. The LLM is *only* allowed to choose a template ID and map signal names to template parameters — it never generates code. Code comes from Jinja2 rendering. Read `ARCHITECTURE.md` §1.1 before changing anything in `services/core/` or `services/llm/`.
+**The single most important constraint**: the platform must produce identical output for identical input **for in-domain inputs that contain sufficient information**. The LLM is *only* allowed to choose a template ID and map signal names to template parameters — it never generates code. Code comes from Jinja2 rendering. **Contract v2.11 reversal**: when the input is in-domain but missing required parameters (no signal names, no state list, etc.), the platform now **rejects with HTTP 422** rather than fabricating placeholder code. Read `ARCHITECTURE.md` §1.1 before changing anything in `services/core/` or `services/llm/`.
 
-**Off-topic inputs are explicitly rejected with HTTP 422**, not silently fall back to placeholder code. The gate lives at the top of `pipeline_preview`: `dense_top1_score(original_intent, code_type) < offtopic_dense_threshold` → `OffTopicIntentError`. Threshold is calibrated empirically against `backend/tests/data/offtopic_corpus.yaml`; rerun `backend/scripts/calibrate_offtopic_threshold.py` after major template-library changes.
+**Four hard gates before code is rendered**, in order at the top of `pipeline_preview`:
 
-**RAG 检索为空 ≠ off-topic**. 通过了 dense 闸但三阶段检索仍返空 → `EmptyRetrievalError` → **HTTP 503**（基础设施异常，让 SRE 排查 Qdrant / embedding service）。不要把这种情况降级为 422，那是用户问题；503 才是系统问题。两条错误路径都在 [api/v1/generate.py](backend/app/api/v1/generate.py) 的 except 链里独立处理，不要泛化为 `except ValueError`。
+1. **Off-topic gate**: `dense_top1_score(original_intent, code_type) < OFFTOPIC_DENSE_THRESHOLD` → `OffTopicIntentError` → HTTP 422. Threshold calibrated empirically against `backend/tests/data/offtopic_corpus.yaml`; rerun `backend/scripts/calibrate_offtopic_threshold.py` after major template-library changes.
+2. **Code-type mismatch gate**: For each non-selected code_type, run a dense_top1_score; if `max(other) - selected ≥ CODE_TYPE_MISMATCH_MARGIN` (default 0.10) → `CodeTypeMismatchError` → 422 with `detail.suggested_code_type`. Typical case: user picks "assertion" but writes "统计 ... 覆盖率".
+3. **Empty retrieval gate** (post-RAG): three-stage retrieval returned no candidates AND keyword supplement also empty → `EmptyRetrievalError` → **HTTP 503** (infrastructure issue — Qdrant / embedding service / empty template library). Distinct from off-topic; SRE looks at this, not the user.
+4. **Under-specified intent gate** ([`_detect_under_specified`](backend/app/services/core/pipeline.py), after `_map_params_with_source`): any required parameter resolved to a low-confidence source → `UnderSpecifiedIntentError` → HTTP 422 with `detail.missing_params=[{name, description, expr_type, role_hint}, ...]`. Low-confidence = `source ∈ {placeholder, semantic_fallback}` OR `source==llm AND value ∈ {"", 0, "0", "null", literal param name}`. The LLM is **not allowed** to fake-fill parameters with stubs.
+
+Each gate has an env switch (`OFFTOPIC_GATE_ENABLED` / `CODE_TYPE_MISMATCH_GATE_ENABLED` / `UNDER_SPECIFIED_GATE_ENABLED`) for emergency rollback to the old "always produce code" behavior. All exception classes are caught in [api/v1/generate.py](backend/app/api/v1/generate.py)'s except chain in this exact order — **don't reorder**, don't generalize to `except ValueError` (it'll mask the structured detail).
+
+**v3.0 redirect_to field on error detail**: every gate's `detail` now carries `redirect_to: str | None`. Only `under_specified` populates a path (`/intent-builder?...`); off_topic / code_type_mismatch / empty_retrieval all return `null`. Frontend `handleApiError` reads `redirect_to` first via `'redirect_to' in detail` type guard — if present, `navigate(detail.redirect_to)` without any Modal. Backend constructs the URL inside `UnderSpecifiedIntentError.__init__` using `urllib.parse.quote` (Chinese-safe). Don't move the redirect URL construction to the endpoint layer; the exception class owns it.
+
+**v3.0 IntentBuilder (RAG-grounded multi-turn chat)**: `POST /intent-builder/chat` accepts `{session_id, user_message, code_type}`. session_id is mintable (empty → server mints UUID4). Each turn: load Redis session (`intent_builder_session:{user_id}:{session_id}`, TTL 24h) → run RAG retrieval on `accumulated_intent or user_message` → inject top-3 candidates into LLM system prompt → call `llm.chat(messages)` → extract `<<intent>>...<<end>>` segment via regex → save session → respond. The LLM is constrained to ONLY align to existing templates (no inventing scenarios) via [`_build_system_prompt`](backend/app/services/intent/conversation.py). After 5 turns with all top-1 RAG scores < 0.5, response sets `suggest_contribute=true` so frontend shows "Contribute new template" button. Session has no explicit close endpoint — 24h TTL handles cleanup.
+
+**v3.0 simplified contribution submission**: `POST /contributions` requires only 4 fields (`code_type / template_name / description / demo_code`). Backend immediately calls [`derive_parameters_from_demo`](backend/app/services/platform/parameter_extractor.py) which: LLM extracts parameter list + Jinja2-fies the code + suggests keywords/subcategory/protocol → 3-gate validation (param_defs naming, Jinja2 strict-render, keywords shape) → success enqueues `pending_review`, failure returns 422 `contribution_parse_failed` with `stage` and `reason`. Original user code preserved in `contribution.original_row_json["user_demo"]` for admin reference. Admin three-column review UI: left=user submission (RO), middle=LLM-derived Jinja2 body (editable), right=LLM-derived parameter_defs JSON + keywords + subcategory + protocol (editable). PATCH endpoint extended so admins can edit any field at any status (contributors still locked to `pending`/`needs_revision`).
 
 Four-layer determinism guard:
 
@@ -100,14 +113,25 @@ Consequence: **never call an LLM from `app/services/core/`**. LLM calls live in 
 
 Two-step flow (UI plan 3, see ARCHITECTURE §3.15–3.16):
 
-- `pipeline_preview(PipelineInput) → PreviewResult` does **off-topic dense gate** → normalize → intent-cache → RAG → keyword-supplement → LLM step1 (pick id) → LLM step2 (fill params) → multi-source param mapping. Returns each parameter tagged with one of 5 `source`s: `llm` / `regex` / `signal_list` / `default` / `placeholder`. Frontend `ConfirmationPanel` + `ParametersForm` render these with colored badges.
+- `pipeline_preview(PipelineInput) → PreviewResult` does **off-topic gate** → **code-type mismatch gate** → normalize → intent-cache → RAG → keyword-supplement → LLM step1 (pick id) → LLM step2 (fill params) → multi-source param mapping → **under-specified gate**. Returns each parameter tagged with one of 6 `source`s: `llm` / `regex` / `signal_list` / `default` / `semantic_fallback` / `placeholder`. Frontend `ConfirmationPanel` + `ParametersForm` render these with colored badges.
 - `pipeline_render(RenderInput) → (code, cache_hit)` renders the user-confirmed params with Jinja2, writes generation cache, saves intent history.
 - `quick_render=True` on a preview means intent-cache hit; the frontend skips the confirmation panel.
 
-**Fallback chain** (every step has one — the system is contractually obliged to always produce code):
-RAG empty → keyword supplement (DB scan over `template.keywords`) → LLM picks none/invalid → take RAG top-1 (and rewrite confidence to RAG score with `confidence_source="rag_fallback"`) → LLM step2 returns nothing → regex `_extract_params_from_intent` → role-hint signal-list mapping → template `default` → semantic fallback (`group_name`/`signal`/`state_list`/`bins_expr`) → required-param placeholder = parameter name itself.
+**Recovery chain** (intra-pipeline — applies *before* the under-specified gate decides whether to reject):
+RAG empty → keyword supplement (DB scan over `template.keywords`) → LLM picks none/invalid → take RAG top-1 (and rewrite confidence to RAG score with `confidence_source="rag_fallback"`) → LLM step2 returns nothing → regex `_extract_params_from_intent` → role-hint signal-list mapping → template `default` field → semantic fallback (`group_name`/`signal`/`state_list`/`bins_expr`). After all this, any required param still landing on `placeholder` or `semantic_fallback` (or LLM-with-trivial-value) **trips the under-specified gate** — system does NOT silently render with placeholders.
 
-Param precedence (mirrored in `_map_params_with_source`): **llm > regex > signal_list > default > placeholder**.
+Param source taxonomy (`_map_params_with_source`):
+
+| Source | What it means | High-confidence? |
+|---|---|---|
+| `llm` | LLM step2 extracted from user intent text | Yes, unless value is `""` / `0` / `"0"` / `"null"` / literal param name |
+| `regex` | `_extract_params_from_intent` matched explicit pattern in original text | Yes |
+| `signal_list` | Role-hint / position match against user-provided `PipelineInput.signals` | Yes |
+| `default` | Either `PipelineInput.{clk,rst,rst_polarity}` (form input) or template YAML's `default` field | Yes |
+| `semantic_fallback` | System-fabricated guess (`state_list="IDLE, ACTIVE, DONE"`, etc.) | **No** — trips gate |
+| `placeholder` | Step 6 last-ditch: param name as literal value | **No** — trips gate |
+
+Precedence within `_map_params_with_source`: **llm > regex > signal_list > default > semantic_fallback > placeholder**. Don't merge `semantic_fallback` back into `default` — they have to be distinct labels for the under-specified gate to work.
 
 **Last-line defense — `expr_type` sanitize/validate** (pipeline.py step 7, after the precedence resolution):
 Each `template.parameters[i].expr_type` drives a final pass over the resolved value, regardless of which source produced it:
