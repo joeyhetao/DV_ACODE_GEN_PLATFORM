@@ -1,25 +1,42 @@
 import { useState, useEffect } from 'react'
 import {
   Card, Table, Tag, Button, Space, Modal, Form, Input, Select,
-  Drawer, Descriptions, Typography, message,
+  Drawer, Descriptions, Typography, message, Alert,
 } from 'antd'
 import { PlusOutlined, EyeOutlined } from '@ant-design/icons'
+import { useLocation, useSearchParams } from 'react-router-dom'
 import { contributionsApi, ContributionListItem, Contribution } from '../../api/contributions'
 import { generateApi } from '../../api/generate'
 
 const { TextArea } = Input
 const { Text } = Typography
 
+// v3.0 ↔ DB Enum 对齐：(pending_review, under_review, needs_revision, approved, rejected)
 const statusColors: Record<string, string> = {
-  pending: 'blue', approved: 'green', rejected: 'red',
-  needs_revision: 'orange', withdrawn: 'gray',
+  pending_review: 'blue', under_review: 'cyan', approved: 'green', rejected: 'red',
+  needs_revision: 'orange',
 }
 const statusLabels: Record<string, string> = {
-  pending: '待审核', approved: '已批准', rejected: '已拒绝',
-  needs_revision: '需修改', withdrawn: '已撤回',
+  pending_review: '待审核', under_review: '审核中', approved: '已批准', rejected: '已拒绝',
+  needs_revision: '需修改',
+}
+
+interface PrefillState {
+  prefillDescription?: string
+  prefillCodeType?: string
 }
 
 export default function MyContributionsPage() {
+  const location = useLocation()
+  const [searchParams] = useSearchParams()
+  // P2-17：URL query 优先（刷新恢复），location.state 作为 fallback
+  const prefillFromState = (location.state || {}) as PrefillState
+  const prefill: PrefillState = {
+    prefillDescription:
+      searchParams.get('description') || prefillFromState.prefillDescription,
+    prefillCodeType:
+      searchParams.get('code_type') || prefillFromState.prefillCodeType,
+  }
   const [list, setList] = useState<ContributionListItem[]>([])
   const [loading, setLoading] = useState(false)
   const [submitVisible, setSubmitVisible] = useState(false)
@@ -28,6 +45,7 @@ export default function MyContributionsPage() {
   const [submitForm] = Form.useForm()
   const [submitting, setSubmitting] = useState(false)
   const [codeTypes, setCodeTypes] = useState<{ id: string; display_name: string }[]>([])
+  const [parseError, setParseError] = useState<{ stage: string; reason: string } | null>(null)
 
   const load = async () => {
     setLoading(true)
@@ -44,6 +62,18 @@ export default function MyContributionsPage() {
     generateApi.codeTypes().then(setCodeTypes).catch(() => {})
   }, [])
 
+  // v3.0：从 IntentBuilder 跳过来时，自动打开提交 Modal 并预填 description / code_type
+  useEffect(() => {
+    if (prefill.prefillDescription || prefill.prefillCodeType) {
+      submitForm.setFieldsValue({
+        description: prefill.prefillDescription || '',
+        code_type: prefill.prefillCodeType || 'assertion',
+      })
+      setSubmitVisible(true)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [prefill.prefillDescription, prefill.prefillCodeType])
+
   const showDetail = async (id: string) => {
     const c = await contributionsApi.get(id)
     setDetail(c)
@@ -53,14 +83,28 @@ export default function MyContributionsPage() {
   const handleSubmit = async () => {
     const values = await submitForm.validateFields()
     setSubmitting(true)
+    setParseError(null)
     try {
-      await contributionsApi.submit({ ...values, keywords: values.keywords?.split(',').map((k: string) => k.trim()).filter(Boolean) })
-      message.success('提交成功，等待管理员审核')
+      // v3.0：只提交 4 必填——keywords / parameter_defs / subcategory / protocol 全部由后端 LLM 反推
+      await contributionsApi.submit({
+        template_name: values.template_name,
+        code_type: values.code_type,
+        description: values.description,
+        demo_code: values.demo_code,
+      })
+      message.success('提交成功，AI 已协助参数化，等待管理员审核')
       setSubmitVisible(false)
       submitForm.resetFields()
       load()
-    } catch {
-      message.error('提交失败')
+    } catch (e: unknown) {
+      const err = e as { response?: { data?: { detail?: { type?: string; stage?: string; reason?: string; message?: string } | string } } }
+      const detail = err.response?.data?.detail
+      if (detail && typeof detail === 'object' && detail.type === 'contribution_parse_failed') {
+        setParseError({ stage: detail.stage || 'unknown', reason: detail.reason || '' })
+        // 不关 Modal，让用户在 Modal 里看到错误并修改代码示例
+      } else {
+        message.error(typeof detail === 'string' ? detail : '提交失败')
+      }
     } finally {
       setSubmitting(false)
     }
@@ -90,45 +134,71 @@ export default function MyContributionsPage() {
         <Table dataSource={list} rowKey="id" columns={columns} loading={loading} size="small" pagination={{ pageSize: 15 }} />
       </Card>
 
-      {/* Submit Modal */}
+      {/* v3.0 提交贡献——4 必填字段，AI 自动反推 parameters JSON */}
       <Modal
-        title="提交模板贡献"
+        title="提交模板贡献（AI 协助参数化）"
         open={submitVisible}
         onOk={handleSubmit}
-        onCancel={() => setSubmitVisible(false)}
-        width={720}
+        onCancel={() => { setSubmitVisible(false); setParseError(null) }}
+        width={760}
         confirmLoading={submitting}
+        okText="提交，由 AI 协助参数化"
         destroyOnClose
       >
+        {parseError && (
+          <Alert
+            type="error"
+            showIcon
+            closable
+            onClose={() => setParseError(null)}
+            message={`AI 解析失败（阶段：${parseError.stage}）`}
+            description={
+              <>
+                {parseError.reason}
+                <br />
+                <Text type="secondary">请简化「代码示例」或完善「场景描述」后重新提交。</Text>
+              </>
+            }
+            style={{ marginBottom: 16 }}
+          />
+        )}
+        <Alert
+          type="info"
+          showIcon
+          message="只需填 4 个字段，剩下的 AI 会自动反推"
+          description="后端会从你的代码示例里识别可参数化位置（信号名、状态枚举、位宽常量等），自动改写为 Jinja2 占位符并生成 parameters JSON。审核员会再过一遍。"
+          style={{ marginBottom: 16 }}
+        />
         <Form form={submitForm} layout="vertical">
-          <Form.Item name="template_name" label="模板名称" rules={[{ required: true }]}>
-            <Input placeholder="简洁、唯一的模板名称" />
+          <Form.Item name="template_name" label="模板名称" rules={[{ required: true, message: '必填' }]}>
+            <Input placeholder="如：AXI 写通道地址稳定断言" />
           </Form.Item>
-          <Form.Item name="code_type" label="代码类型" rules={[{ required: true }]}>
-            <Select>
+          <Form.Item name="code_type" label="代码类型" rules={[{ required: true, message: '必填' }]}>
+            <Select placeholder="选择代码类型">
               {codeTypes.map((ct) => (
                 <Select.Option key={ct.id} value={ct.id}>{ct.display_name}</Select.Option>
               ))}
             </Select>
           </Form.Item>
-          <Form.Item name="original_intent" label="原始意图描述" rules={[{ required: true }]}>
-            <TextArea rows={2} placeholder="描述该模板所解决的验证场景" />
+          <Form.Item
+            name="description"
+            label="验证场景描述"
+            rules={[{ required: true, message: '必填' }]}
+            extra="用自然语言描述这个模板要解决什么问题；写得越具体，RAG 匹配率越高。"
+          >
+            <TextArea rows={3} placeholder="如：检测 AXI valid-ready 握手期间数据信号必须保持稳定" />
           </Form.Item>
-          <Form.Item name="description" label="详细描述" rules={[{ required: true }]}>
-            <TextArea rows={3} />
-          </Form.Item>
-          <Form.Item name="demo_code" label="模板代码 (Jinja2)" rules={[{ required: true }]}>
-            <TextArea rows={10} style={{ fontFamily: 'monospace' }} placeholder="支持 Jinja2 语法，变量用 {{ var_name }} 表示" />
-          </Form.Item>
-          <Form.Item name="keywords" label="关键词（逗号分隔）">
-            <Input placeholder="如: valid, ready, 握手" />
-          </Form.Item>
-          <Form.Item name="protocol" label="协议">
-            <Select allowClear>
-              <Select.Option value="AXI4">AXI4</Select.Option>
-              <Select.Option value="AXI4-Lite">AXI4-Lite</Select.Option>
-              <Select.Option value="AXI4-Stream">AXI4-Stream</Select.Option>
-            </Select>
+          <Form.Item
+            name="demo_code"
+            label="代码示例"
+            rules={[{ required: true, message: '必填' }]}
+            extra="直接粘贴你设计里能跑的 SystemVerilog 代码，含真实信号名 / 状态枚举值 / 数字字面量。AI 会自动识别哪些是参数。"
+          >
+            <TextArea
+              rows={12}
+              style={{ fontFamily: 'monospace', fontSize: 13 }}
+              placeholder={'module my_check (input logic clk, ...);\n  property p_handshake;\n    @(posedge clk) disable iff(!rst_n)\n    awvalid && !awready |-> $stable(awaddr);\n  endproperty\n  ...\nendmodule'}
+            />
           </Form.Item>
         </Form>
       </Modal>

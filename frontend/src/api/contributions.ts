@@ -8,6 +8,7 @@ export interface Contribution {
   keywords?: string[]; parameter_defs?: unknown
   status: string; reviewer_comment?: string
   promoted_template_id?: string; created_at: string; updated_at: string
+  original_row_json?: Record<string, unknown> | null  // v3.0: 保留用户原始 demo
 }
 export interface ContributionListItem {
   id: string; contributor_id: string; code_type: string; template_name: string; status: string; created_at: string
