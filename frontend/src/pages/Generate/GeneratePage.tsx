@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react'
+import { useNavigate, NavigateFunction, useLocation, useSearchParams } from 'react-router-dom'
 import {
   Card, Form, Input, Select, Button, Row, Col, Space, Tag,
   Statistic, Divider, Typography, Table, Collapse, message, Modal, Spin,
@@ -38,15 +39,46 @@ interface ResultDisplay {
   rag_candidates: Array<{ template_id: string; name: string; score: number }>
 }
 
+interface IntentBuilderReturnState {
+  prefillText?: string
+  prefillCodeType?: string
+  source?: string
+}
+
 export default function GeneratePage() {
+  const navigate = useNavigate()
+  const location = useLocation()
+  const [searchParams] = useSearchParams()
+  // P2-17：URL query 优先于 location.state——刷新页面 location.state 会丢但 URL 不会
+  const returnState = (location.state || {}) as IntentBuilderReturnState
+  const queryPrefill = searchParams.get('prefill') || ''
+  const queryCodeType = searchParams.get('code_type') || ''
+  const querySource = searchParams.get('source') || ''
+  const initialSource = querySource || returnState.source || 'direct'
   const [form] = Form.useForm()
   const [state, setState] = useState<GenerateState>({ phase: 'idle' })
   const [codeTypes, setCodeTypes] = useState<{ id: string; display_name: string }[]>([])
+  // v3.0：source 用于区分 direct vs intent_builder 回流（仅用于上报 PipelineInput.source 字段）
+  const [requestSource, setRequestSource] = useState<string>(initialSource)
   const [signals, setSignals] = useState<SignalRow[]>([])
 
   useEffect(() => {
     generateApi.codeTypes().then(setCodeTypes).catch(() => {})
   }, [])
+
+  // v3.0 + P2-17：从 IntentBuilder 回流时自动 prefill TextArea + code_type
+  // URL query 优先（刷新可恢复），location.state 作为 fallback
+  useEffect(() => {
+    const text = queryPrefill || returnState.prefillText
+    const codeType = queryCodeType || returnState.prefillCodeType
+    if (text) {
+      form.setFieldsValue({
+        text,
+        code_type: codeType || form.getFieldValue('code_type'),
+      })
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [queryPrefill, returnState.prefillText])
 
   // ── 步骤 1：分析（preview）──────────────────────────────────────
   const handleAnalyze = async (values: Record<string, unknown>) => {
@@ -60,9 +92,13 @@ export default function GeneratePage() {
       rst: (values.rst as string) || 'rst_n',
       rst_polarity: (values.rst_polarity as string) || '低有效',
       signals: signalsForApi,
+      source: requestSource,  // v3.0：direct 或 intent_builder（回流），仅供后端日志
     }
     try {
       const preview = await generateApi.preview(reqBody)
+      // P2-16：只在**成功**后才把 source 清零回 'direct'——失败重试时保留原 source，
+      // 不丢失 IntentBuilder 回流统计标签。
+      if (requestSource !== 'direct') setRequestSource('direct')
       // 缓存命中：跳过确认面板，直接渲染
       if (preview.quick_render) {
         await runRender(preview, preview.template_id, extractValueDict(preview), reqBody)
@@ -70,7 +106,7 @@ export default function GeneratePage() {
       }
       setState({ phase: 'confirming', preview })
     } catch (e: unknown) {
-      handleApiError(e, '分析失败，请重试')
+      handleApiError(e, '分析失败，请重试', navigate)
       setState({ phase: 'idle' })
     }
   }
@@ -136,7 +172,7 @@ export default function GeneratePage() {
         },
       })
     } catch (e: unknown) {
-      handleApiError(e, '渲染失败，请重试')
+      handleApiError(e, '渲染失败，请重试', navigate)
       setState({ phase: 'idle' })
     }
   }
@@ -354,18 +390,61 @@ function extractValueDict(preview: PreviewResponse): Record<string, unknown> {
   return out
 }
 
-/** 解析 FastAPI 错误响应。detail 可能是字符串或结构化对象（如 off_topic 拒绝）。 */
+/** 解析 FastAPI 错误响应。detail 可能是字符串或结构化对象（off_topic / code_type_mismatch 等）。 */
 type OffTopicDetail = {
   type: 'off_topic'
   message: string
   detector?: string
   top_dense_score?: number
   threshold?: number
+  redirect_to?: string | null
 }
-type ApiErrorDetail = string | OffTopicDetail | undefined
-function handleApiError(e: unknown, fallbackMsg: string): void {
+type CodeTypeMismatchDetail = {
+  type: 'code_type_mismatch'
+  message: string
+  detector?: string
+  selected_code_type: string
+  suggested_code_type: string
+  selected_score: number
+  suggested_score: number
+  redirect_to?: string | null
+}
+type MissingParam = {
+  name: string
+  description: string
+  expr_type?: string
+  role_hint?: string
+}
+type UnderSpecifiedDetail = {
+  type: 'under_specified'
+  message: string
+  detector?: string
+  template_id: string
+  template_name: string
+  missing_params: MissingParam[]
+  redirect_to?: string | null
+}
+type ApiErrorDetail = string | OffTopicDetail | CodeTypeMismatchDetail | UnderSpecifiedDetail | undefined
+
+function handleApiError(e: unknown, fallbackMsg: string, navigate?: NavigateFunction): void {
   const err = e as { response?: { data?: { detail?: ApiErrorDetail } } }
   const detail = err.response?.data?.detail
+
+  // v3.0：detail.redirect_to 优先于一切——后端明示前端应跳转的路由，前端无脑 router.push
+  // off_topic / code_type_mismatch / empty_retrieval 三种 detail.redirect_to=null 不触发本分支
+  // 用 in 操作符做 type guard，避免 TS 在联合类型上窄化失败
+  if (
+    detail
+    && typeof detail === 'object'
+    && 'redirect_to' in detail
+    && typeof detail.redirect_to === 'string'
+    && detail.redirect_to.length > 0
+    && navigate
+  ) {
+    navigate(detail.redirect_to)
+    return
+  }
+
   if (detail && typeof detail === 'object' && detail.type === 'off_topic') {
     const diag =
       detail.top_dense_score !== undefined && detail.threshold !== undefined
@@ -375,6 +454,35 @@ function handleApiError(e: unknown, fallbackMsg: string): void {
       title: '检测到非验证请求',
       content: `${detail.message}\n\n${diag}\n\n如果你确认这是 IC 验证请求被误拒，请补充信号名、协议、要验证的属性等更多上下文重试。`,
       width: 520,
+    })
+    return
+  }
+  if (detail && typeof detail === 'object' && detail.type === 'code_type_mismatch') {
+    Modal.warning({
+      title: '代码类型选错了',
+      content:
+        `${detail.message}\n\n` +
+        `语义匹配度对比：\n` +
+        `  · 当前选择「${detail.selected_code_type}」 ${detail.selected_score}\n` +
+        `  · 建议改为「${detail.suggested_code_type}」 ${detail.suggested_score}\n\n` +
+        `先在左侧「代码类型」下拉框切换到「${detail.suggested_code_type}」再重试。`,
+      width: 520,
+    })
+    return
+  }
+  if (detail && typeof detail === 'object' && detail.type === 'under_specified') {
+    const lines = detail.missing_params.map((p) => {
+      const desc = p.description ? ` — ${p.description}` : ''
+      return `  · ${p.name}${desc}`
+    })
+    Modal.warning({
+      title: '描述信息不完整',
+      content:
+        `已识别推荐模板「${detail.template_name}」(${detail.template_id})，但下列必填参数无法从你的描述中提取：\n\n` +
+        lines.join('\n') +
+        `\n\n请在意图描述里补充这些信息再重试。例如把"生成一个 FSM 转换覆盖率"改成` +
+        `"对状态信号 cur_state 做 FSM 转换覆盖率，状态包括 IDLE, ACTIVE, DONE"。`,
+      width: 600,
     })
     return
   }

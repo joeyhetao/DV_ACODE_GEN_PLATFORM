@@ -24,8 +24,8 @@ export interface GenerateResponse {
 }
 
 // ── 方案 3 两步式 schema ────────────────────────────────────────────
-export type ParamSource = 'signal_list' | 'regex' | 'llm' | 'default' | 'placeholder'
-export type ConfidenceSource = 'llm_step1' | 'rag_fallback' | 'intent_cache'
+export type ParamSource = 'signal_list' | 'regex' | 'llm' | 'default' | 'semantic_fallback' | 'placeholder'
+export type ConfidenceSource = 'llm_step1' | 'rag_fallback' | 'intent_cache' | 'keyword_supplement'
 
 export interface ParamWithSource {
   value: string | number | string[]

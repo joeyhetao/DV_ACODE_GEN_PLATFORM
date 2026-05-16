@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react'
 import { Card, Select, Button, Space, Tag, Typography, Alert, Tooltip } from 'antd'
-import { CheckOutlined, RollbackOutlined, InfoCircleOutlined } from '@ant-design/icons'
+import { CheckOutlined, RollbackOutlined, InfoCircleOutlined, BulbOutlined, PlusOutlined } from '@ant-design/icons'
+import { useNavigate } from 'react-router-dom'
 import type {
   ConfidenceSource,
   ParamWithSource,
@@ -21,9 +22,10 @@ interface Props {
 }
 
 const CONFIDENCE_SOURCE_LABEL: Record<ConfidenceSource, { label: string; color: string; tip: string }> = {
-  llm_step1:    { label: 'LLM 主动选中', color: 'green',  tip: 'LLM Step1 在 RAG 候选中明确选了此模板，confidence=0.9 是固定值' },
-  rag_fallback: { label: 'RAG 兜底',     color: 'orange', tip: 'LLM Step1 选不出（返回空 / 选了不存在的 ID），自动取 RAG 第一名；confidence 是 RAG 排序分数' },
-  intent_cache: { label: '历史缓存',     color: 'blue',   tip: '同样意图之前已成功生成过，直接复用历史决策（应当走 quick_render 跳过本面板）' },
+  llm_step1:          { label: 'LLM 主动选中',  color: 'green',  tip: 'LLM Step1 在 RAG 候选中明确选了此模板，confidence=0.9 是固定值' },
+  rag_fallback:       { label: 'RAG 兜底',      color: 'orange', tip: 'LLM Step1 选不出（返回空 / 选了不存在的 ID），自动取 RAG 第一名；confidence 是 RAG 排序分数' },
+  intent_cache:       { label: '历史缓存',      color: 'blue',   tip: '同样意图之前已成功生成过，直接复用历史决策（应当走 quick_render 跳过本面板）' },
+  keyword_supplement: { label: '关键词补充召回', color: 'purple', tip: 'RAG 三阶段没召回，DB 扫 template.keywords 凑出候选并被 LLM step1 选中' },
 }
 
 /**
@@ -35,6 +37,11 @@ const CONFIDENCE_SOURCE_LABEL: Record<ConfidenceSource, { label: string; color: 
  *   - 如果原 params 里有同名值，标 source 为 'llm'（即"沿用之前的"）
  *   - 否则按 signal-list role-hint / default 等规则填，标 source 对应类别
  *   - required 但仍空 → placeholder
+ *
+ * P2-15：前端只用 4/6 种源（signal_list / default / placeholder / llm），不构造
+ * regex / semantic_fallback——切模板场景下 regex 已被 RAG 命中原模板时跑过，semantic_fallback
+ * 是后端"系统猜"标签。前端用 placeholder 兜底，让 ConfirmationPanel 的低置信检测兜住即可
+ * （效果等同于 semantic_fallback）。
  */
 function reMapParamsForNewTemplate(
   newTemplate: RAGCandidateWithParams,
@@ -85,6 +92,7 @@ function reMapParamsForNewTemplate(
 }
 
 export default function ConfirmationPanel({ preview, signals, onCancel, onConfirm }: Props) {
+  const navigate = useNavigate()
   const [selectedTemplateId, setSelectedTemplateId] = useState(preview.template_id)
   const [editedParams, setEditedParams] = useState<Record<string, ParamWithSource>>(preview.params)
 
@@ -110,12 +118,16 @@ export default function ConfirmationPanel({ preview, signals, onCancel, onConfir
     }))
   }
 
-  // 校验：是否有 required 且仍是 placeholder 的参数
+  // 校验：required 参数低置信源（placeholder 或 semantic_fallback）一律拦
+  // —— 与后端 under_specified 闸的判定保持一致，主路径已被早返但单参数被切回
+  // 这两个源时（如 ConfirmationPanel.reMapParamsForNewTemplate 切模板）仍需拦
   const blockingErrors = useMemo(() => {
     const issues: string[] = []
     for (const [name, meta] of Object.entries(editedParams)) {
       if (meta.required && meta.source === 'placeholder') {
         issues.push(`参数 "${name}" 仍是占位符，请改为实际值`)
+      } else if (meta.required && meta.source === 'semantic_fallback') {
+        issues.push(`参数 "${name}" 是系统按经验猜的，请改为实际值`)
       }
       const validationErr = validateParamValue(name, meta.type, meta.value)
       if (validationErr) {
@@ -147,6 +159,24 @@ export default function ConfirmationPanel({ preview, signals, onCancel, onConfir
       {/* 推荐模板 */}
       <Card size="small" title={<><InfoCircleOutlined /> 系统推荐模板</>}>
         <Space direction="vertical" style={{ width: '100%' }} size={8}>
+          {/* v3.0：低置信路径软提示——LLM 没主动选中、走 RAG 兜底时，给用户"去 IntentBuilder 精修"或"贡献新模板"的入口 */}
+          {preview.confidence_source === 'rag_fallback' && (
+            <Alert
+              type="warning"
+              showIcon
+              message="LLM 没主动选中模板，当前是 RAG 兜底——结果可能不准"
+              description={
+                <Space wrap>
+                  <Button size="small" icon={<BulbOutlined />} onClick={() => navigate(`/intent-builder?prefill=${encodeURIComponent(preview.normalized_intent || '')}`)}>
+                    去意图构建器精修
+                  </Button>
+                  <Button size="small" danger icon={<PlusOutlined />} onClick={() => navigate(`/contribute/new?description=${encodeURIComponent(preview.normalized_intent || '')}`)}>
+                    贡献新模板
+                  </Button>
+                </Space>
+              }
+            />
+          )}
           <div>
             <Text type="secondary">置信度来源：</Text>
             <Tooltip title={CONFIDENCE_SOURCE_LABEL[preview.confidence_source].tip}>

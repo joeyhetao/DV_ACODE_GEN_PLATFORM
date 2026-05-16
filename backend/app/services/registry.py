@@ -73,6 +73,9 @@ class CodeTypeRegistry:
         return raw.get("scenarios", [])
 
     def build_normalization_rules(self) -> str:
+        # v3.0 契约：normalize_intent 仅做同义改写以稳定 cache key，不做"猜你想说什么"
+        # 的扩写。anti-fill 约束（最后 3 条）明文禁止填空 / 推断 / 扩写——若描述里没说，
+        # 保持原文写法不要补；后续 under_specified 闸自然会捕获参数空缺。
         lines = []
         for i, ct in enumerate(self._types.values(), start=1):
             lines.append(
@@ -82,6 +85,11 @@ class CodeTypeRegistry:
         lines.append(f"{n}. 只改表达方式，不改变语义")
         lines.append(f"{n + 1}. 如果无法判断类型，输出原文")
         lines.append(f"{n + 2}. 输出一句话，不加任何解释")
+        n += 3
+        # v3.0 anti-fill 约束
+        lines.append(f"{n}. 【禁止】不允许填空——如果用户没提到信号名 / 状态列表 / 位宽等参数值，不要替他写出来")
+        lines.append(f"{n + 1}. 【禁止】不允许扩写或推断——不要按「AXI 协议常见信号」之类的领域知识替用户编造未提及的内容")
+        lines.append(f"{n + 2}. 【禁止】不允许凭空命名——任何在原文中未出现的具体信号名 / 状态名都不应在输出里出现")
         return "\n".join(lines)
 
 

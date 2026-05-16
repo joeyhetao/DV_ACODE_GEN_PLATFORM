@@ -28,7 +28,13 @@ async def _run_batch_job_async(job_id: str) -> None:
     from app.core.config import get_settings
     from app.models.batch_job import BatchJob
     from app.services.parser.excel_parser import parse_excel
-    from app.services.core.pipeline import PipelineInput, run_pipeline
+    from app.services.core.pipeline import (
+        PipelineInput,
+        run_pipeline,
+        UnderSpecifiedIntentError,
+        OffTopicIntentError,
+        CodeTypeMismatchError,
+    )
 
     settings = get_settings()
     engine = create_async_engine(settings.database_url, echo=False)
@@ -87,6 +93,51 @@ async def _run_batch_job_async(job_id: str) -> None:
                         "template_id": result.template_id,
                         "confidence": result.confidence,
                         "code": result.code,
+                    })
+                except UnderSpecifiedIntentError as e:
+                    # v3.0 P0-4：under_specified 是"用户问题"——把缺失参数清单回传，
+                    # 前端批量结果表可让用户对单行修改意图后重跑，不要整批失败。
+                    logger.info(
+                        "row %s under_specified: template=%s missing=%s",
+                        row.row_id, e.template_id, [m["name"] for m in e.missing_params],
+                    )
+                    results.append({
+                        "row_id": row.row_id,
+                        "status": "under_specified",
+                        "template_id": e.template_id,
+                        "template_name": e.template_name,
+                        "missing_params": e.missing_params,
+                        "reason": (
+                            f"已识别推荐模板「{e.template_name}」，但描述里缺少这些必填参数："
+                            + "、".join(m["name"] for m in e.missing_params)
+                            + "。请修改该行意图后单独重跑。"
+                        ),
+                    })
+                except OffTopicIntentError as e:
+                    # off-topic 也是用户问题——回传结构化原因
+                    logger.info("row %s off_topic top1=%.4f", row.row_id, e.top_dense_score)
+                    results.append({
+                        "row_id": row.row_id,
+                        "status": "off_topic",
+                        "top_dense_score": e.top_dense_score,
+                        "threshold": e.threshold,
+                        "reason": "输入似乎与 IC 验证需求无关，请重写意图。",
+                    })
+                except CodeTypeMismatchError as e:
+                    # code_type 选错——让用户切 code_type 后重跑该行
+                    logger.info(
+                        "row %s code_type_mismatch selected=%s suggested=%s",
+                        row.row_id, e.selected_code_type, e.suggested_code_type,
+                    )
+                    results.append({
+                        "row_id": row.row_id,
+                        "status": "code_type_mismatch",
+                        "selected_code_type": e.selected_code_type,
+                        "suggested_code_type": e.suggested_code_type,
+                        "reason": (
+                            f"意图更像是「{e.suggested_code_type}」类型，"
+                            f"当前选了「{e.selected_code_type}」。请切换 code_type 后重跑该行。"
+                        ),
                     })
                 except Exception as e:
                     logger.warning("pipeline failed for row %s: %s", row.row_id, e, exc_info=True)

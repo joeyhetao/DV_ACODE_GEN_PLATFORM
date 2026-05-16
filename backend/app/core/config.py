@@ -48,6 +48,19 @@ class Settings(BaseSettings):
     offtopic_gate_enabled: bool = True
     offtopic_dense_threshold: float = 0.44
 
+    # Code-type 一致性闸：紧跟 off-topic 之后。dense 跨 code_type 比较，若用户选的
+    # code_type 在 dense top1 上显著输给另一类（gap ≥ margin），抛 422 提示改类型。
+    # 典型反例："统计 ... 覆盖率"选了 assertion → coverage 库 dense 0.76 vs 当前 0.62。
+    # margin 凭经验，可按 corpus 校准；初值 0.10 已经能区分明显错配同时不误伤模糊场景。
+    code_type_mismatch_gate_enabled: bool = True
+    code_type_mismatch_margin: float = 0.10
+
+    # Under-specified intent 闸（契约反转 v2.11）：必填参数缺少高置信源（落在
+    # semantic_fallback / placeholder / 或 LLM 返 trivial 值）时直接 422，
+    # 不再编占位符兜底渲染。让用户知道具体缺哪些信息再补充。
+    # 关闸：UNDER_SPECIFIED_GATE_ENABLED=false 退回旧"始终返代码"行为。
+    under_specified_gate_enabled: bool = True
+
     # Celery
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"

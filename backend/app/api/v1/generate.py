@@ -21,6 +21,8 @@ from app.schemas.generate import (
 from app.services.core.pipeline import (
     OffTopicIntentError,
     EmptyRetrievalError,
+    CodeTypeMismatchError,
+    UnderSpecifiedIntentError,
     PipelineInput,
     RenderInput,
     run_pipeline,
@@ -30,20 +32,62 @@ from app.services.core.pipeline import (
 
 
 def _off_topic_detail(e: OffTopicIntentError) -> dict:
+    # v3.0：off-topic 不带 redirect_to——IntentBuilder 救不了真离题，让用户停留生成页改提问
     return {
         "type": "off_topic",
         "message": "输入似乎与 IC 验证需求无关。请描述要验证的信号、协议或具体属性。",
         "detector": e.detector,
         "top_dense_score": round(e.top_dense_score, 4),
         "threshold": e.threshold,
+        "redirect_to": None,
     }
 
 
 def _empty_retrieval_detail(e: EmptyRetrievalError) -> dict:
+    # v3.0：基础设施异常不带 redirect_to——前端只能弹"请稍后或联系管理员"
     return {
         "type": "empty_retrieval",
         "message": "模板库检索返空——疑似 Qdrant 或检索服务异常。请稍后重试或联系管理员。",
         "code_type": e.code_type,
+        "redirect_to": None,
+    }
+
+
+def _code_type_mismatch_detail(e: CodeTypeMismatchError) -> dict:
+    # v3.0：code_type 错配不带 redirect_to——前端在原页面弹 Modal 引导切换 code_type
+    return {
+        "type": "code_type_mismatch",
+        "message": (
+            f"意图语义看起来更像「{e.suggested_code_type}」类型，"
+            f"但你选的是「{e.selected_code_type}」。请先切换 code_type 再生成。"
+        ),
+        "detector": e.detector,
+        "selected_code_type": e.selected_code_type,
+        "suggested_code_type": e.suggested_code_type,
+        "selected_score": round(e.selected_score, 4),
+        "suggested_score": round(e.suggested_score, 4),
+        "redirect_to": None,
+    }
+
+
+def _under_specified_detail(e: UnderSpecifiedIntentError) -> dict:
+    # v3.0：under_specified 带 redirect_to=/intent-builder?...——前端 handleApiError
+    # 读到后无脑 router.push，让用户进 IntentBuilder 多轮对话补足参数信息
+    names = "、".join(
+        f"「{p['name']}」（{p['description']}）" if p.get("description") else f"「{p['name']}」"
+        for p in e.missing_params
+    )
+    return {
+        "type": "under_specified",
+        "message": (
+            f"已识别模板「{e.template_name}」（{e.template_id}），但你的描述里"
+            f"没说清楚以下必填参数：{names}。请补充后重试。"
+        ),
+        "detector": e.detector,
+        "template_id": e.template_id,
+        "template_name": e.template_name,
+        "missing_params": e.missing_params,
+        "redirect_to": e.redirect_to,
     }
 from app.services.core.renderer import render_template
 from app.services.registry import get_registry
@@ -69,12 +113,17 @@ async def generate(
         rst=payload.rst,
         rst_polarity=payload.rst_polarity,
         signals=[s.model_dump() for s in payload.signals],
+        source=payload.source,
     )
 
     try:
         result = await run_pipeline(inp, db)
     except OffTopicIntentError as e:
         raise HTTPException(status_code=422, detail=_off_topic_detail(e))
+    except CodeTypeMismatchError as e:
+        raise HTTPException(status_code=422, detail=_code_type_mismatch_detail(e))
+    except UnderSpecifiedIntentError as e:
+        raise HTTPException(status_code=422, detail=_under_specified_detail(e))
     except EmptyRetrievalError as e:
         raise HTTPException(status_code=503, detail=_empty_retrieval_detail(e))
     except ValueError as e:
@@ -137,12 +186,17 @@ async def preview(
         rst=payload.rst,
         rst_polarity=payload.rst_polarity,
         signals=[s.model_dump() for s in payload.signals],
+        source=payload.source,
     )
 
     try:
         result = await pipeline_preview(inp, db)
     except OffTopicIntentError as e:
         raise HTTPException(status_code=422, detail=_off_topic_detail(e))
+    except CodeTypeMismatchError as e:
+        raise HTTPException(status_code=422, detail=_code_type_mismatch_detail(e))
+    except UnderSpecifiedIntentError as e:
+        raise HTTPException(status_code=422, detail=_under_specified_detail(e))
     except EmptyRetrievalError as e:
         raise HTTPException(status_code=503, detail=_empty_retrieval_detail(e))
     except ValueError as e:

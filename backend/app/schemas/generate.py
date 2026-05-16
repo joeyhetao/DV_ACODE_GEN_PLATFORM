@@ -27,6 +27,8 @@ class GenerateRequest(BaseModel):
     rst: str = "rst_n"
     rst_polarity: str = "低有效"
     signals: list[SignalInfo] = []
+    # v3.0 入口标识，仅供日志/统计：direct（用户直接提交）或 intent_builder（从对话精修回流）
+    source: str = "direct"
 
 
 class RAGCandidate(BaseModel):
