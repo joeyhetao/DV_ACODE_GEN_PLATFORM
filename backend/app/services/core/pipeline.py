@@ -331,6 +331,10 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
         # off-topic 闸已经在 step 0 处理，能到这里意味着 dense top1 ≥ threshold 但
         # 既无 RAG 候选也无 keyword 命中 —— 只可能是基础设施问题（Qdrant 空 /
         # 检索服务异常 / 模板库没导入），与"用户离题"在语义上完全不同。
+        print(
+            f"[Gate] empty_retrieval: code_type={inp.code_type} dense_top1={selected_dense}",
+            flush=True,
+        )
         raise EmptyRetrievalError(code_type=inp.code_type)
 
     # Step 5: LLM Step1 + Step2 （llm 已在前面 resolve，无需重取）
@@ -390,6 +394,11 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
         template, inp, regex_mapping=regex_mapping, llm_mapping=selection.param_mapping
     )
     print(f"[Pipeline] params={_values_only(params_with_source)}", flush=True)
+    print(
+        f"[Pipeline] params_resolved: "
+        f"{[(n, m.get('source'), m.get('value')) for n, m in params_with_source.items()]}",
+        flush=True,
+    )
 
     # Step 6b: Under-specified intent gate（契约反转：必填参数缺高置信源 → 422 拒）
     # 紧跟 _map_params 之后、_values_only 之前——拿全部 source 标签做判定，让用户
@@ -618,6 +627,7 @@ async def _keyword_supplement(
 
 
 _ASSERTION_SIGNAL_PATTERNS: list[tuple[str, list[str]]] = [
+    # —— 强分隔符模式（保守，明确"X 信号名为 Y"句式）——
     (r'使能(?:信号)?名?\s*[为是：:]\s*([A-Za-z_]\w*)',           ['enable']),
     (r'数据(?:信号)?名?\s*[为是：:]\s*([A-Za-z_]\w*)',           ['data']),
     (r'valid(?:\s*信号)?\s*[为是：:]\s*([A-Za-z_]\w*)',          ['valid']),
@@ -626,6 +636,11 @@ _ASSERTION_SIGNAL_PATTERNS: list[tuple[str, list[str]]] = [
     (r'起始(?:信号|事件)?\s*[为是：:]\s*([A-Za-z_]\w*)',         ['start_event']),
     (r'(?:结束|应答)(?:信号|事件)?\s*[为是：:]\s*([A-Za-z_]\w*)', ['end_event']),
     (r'状态信号(?:名)?\s*[为是：:]\s*([A-Za-z_]\w*)',            ['state_sig']),
+    # —— 叙述式（中文角色词紧邻标识符，标识符 ≥ 2 字符避免误捕单字母变量）——
+    # 例：「当写使能 wr_en 无效时」→ enable=wr_en
+    (r'(?:写|读)?使能\s+([A-Za-z_]\w{1,})\b',                    ['enable']),
+    # 例：「被保护的数据信号 data_in」→ data=data_in（前缀"数据"/"信号"必须存在）
+    (r'(?:被保护的?)?数据(?:信号)?\s+([A-Za-z_]\w{1,})\b',       ['data']),
 ]
 
 
@@ -636,7 +651,12 @@ def _extract_params_from_intent(intent: str) -> dict:
       coverage 模板：signal / group_name / signal_width / state_list / bins_expr
       assertion 模板：module_name / max_cycles / max_delay / init_value /
                      enable / data / valid / ready / target / start_event /
-                     end_event / state_sig（强分隔符模式，要求"X 信号 [名] [为/是/:] Y"）
+                     end_event / state_sig
+
+    enable / data 同时支持两种模式：
+      1) 强分隔符："X 信号名 [为/是/:] Y"（如"使能信号为 wr_en"）
+      2) 叙述式："X Y"（X=中文角色词，Y=ASCII 标识符 ≥2 字符），如"使能 wr_en 拉高"
+         覆盖用户常见 narrative-Chinese 写法，避免完全压在 LLM Step2 上
 
     不覆盖（依赖 LLM Step2 + signal-list role-hint 兜底）：
       from_state / to_state / condition（fsm_state_transition）— 太语义化

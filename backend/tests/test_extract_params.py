@@ -121,12 +121,17 @@ def test_no_module_extraction_when_no_strong_pattern():
     assert "module_name" not in p
 
 
-def test_no_signal_extraction_when_no_strong_delimiter():
-    """文本无"使能信号为 X" 强分隔，仅有"使能 X" → 不提取 enable（避免误伤）"""
+def test_enable_signal_narrative_extraction():
+    """叙述式"使能 X 拉高/无效..."也提取 enable（v3.0 放宽：让 regex 接住更多
+    narrative-Chinese case，不再独占 LLM step2 的负担）。"""
     p = _extract_params_from_intent("使能 wr_en 拉高时数据稳定")
-    # 弱模式不应触发：保留 LLM Step2 + signal-list role-hint 的机会
-    # 仅当用户写"使能信号为 X"或"使能为 X"时才提取
-    assert "enable" not in p
+    assert p["enable"] == "wr_en"
+
+
+def test_enable_signal_narrative_with_invalid():
+    """用户实际场景：当写使能 wr_en 无效时 → enable=wr_en"""
+    p = _extract_params_from_intent("当写使能 wr_en 无效时，data_in 不会被意外修改")
+    assert p["enable"] == "wr_en"
 
 
 def test_no_max_cycles_when_no_unit():
@@ -144,13 +149,16 @@ def test_empty_intent():
 # ── 集成场景：完整 §1.x 用例输入 ──────────────────────────────────────────
 
 def test_section_1_1_v3_full():
-    """§1.1 v3 完整输入应正确提取 module_name"""
+    """§1.1 v3 完整输入应正确提取 module_name；enable/data 因无 ASCII 标识符紧邻
+    角色词（"使能"后是中文"无效"，"数据"后是中文"信号"），仍保持不提取，
+    保留 LLM Step2 + signal-list role-hint 兜底机会。"""
     p = _extract_params_from_intent(
         "寄存器写保护场景的数据完整性断言：模块名为 reg_block，"
         "当写使能无效时数据信号不被意外修改"
     )
     assert p["module_name"] == "reg_block"
-    # enable / data 不在文本里强结构，依赖 signal-list role-hint，符合 §1 章首约定
+    # "写使能无效" / "数据信号不被" 后面紧邻的都是中文，叙述式 regex 需要 ASCII 标识符
+    # 紧邻角色词才匹配，所以此处不会误提取
     assert "enable" not in p
     assert "data" not in p
 
