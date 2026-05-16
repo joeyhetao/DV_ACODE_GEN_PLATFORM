@@ -507,7 +507,9 @@ def test_map_params_sanitizes_llm_chinese_group_name():
     assert is_sv_identifier(result["group_name"]["value"])
     assert result["group_name"]["value"] == "awvalid_awready_cov"
     assert result["group_name"]["sanitized"] is True
-    assert result["group_name"]["source"] == "default"  # 智能构造改源为 default
+    # v2.11 契约反转后：系统经验式构造统一标 semantic_fallback（与"用户给"分开），
+    # under_specified 闸据此判定为低置信源。
+    assert result["group_name"]["source"] == "semantic_fallback"
 
     # 其他参数没动
     assert result["valid"]["value"] == "awvalid"

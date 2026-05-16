@@ -10,10 +10,13 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.services.core.pipeline import (
+    CodeTypeMismatchError,
     OffTopicIntentError,
     PipelineInput,
     PreviewResult,
     RenderInput,
+    UnderSpecifiedIntentError,
+    _detect_under_specified,
     _map_params_with_source,
     _values_only,
     pipeline_preview,
@@ -298,9 +301,11 @@ def _make_rag_candidate(template_id: str, score: float, parameters=None):
     }
 
 
-def _make_preview_inp():
+def _make_preview_inp(text: str = "some user input"):
+    """默认 intent='some user input'。需要 grounding check 通过的测试传具体原文，
+    确保 LLM mock 返回的 value 能在原文中 substring/token 命中。"""
     return PipelineInput(
-        original_intent="some user input",
+        original_intent=text,
         code_type="assertion",
         clk="clk",
         rst="rst_n",
@@ -746,7 +751,9 @@ async def test_pipeline_preview_intent_cache_schema_drift_bypasses_cache():
     fake_db.get = AsyncMock(return_value=fake_tmpl)
 
     with stack:
-        result = await pipeline_preview(_make_preview_inp(), fake_db)
+        result = await pipeline_preview(
+            _make_preview_inp("信号 valid 状态 IDLE RUN"), fake_db,
+        )
 
     # 关键：走了 RAG / LLM 完整路径，没有 quick_render
     assert result.quick_render is False
@@ -787,7 +794,11 @@ async def test_pipeline_preview_propagates_validation_error_to_params_meta():
 
     stack, fake_db = _patch_preview_deps(rag, llm_pick, db_get_return_value=fake_tmpl)
     with stack:
-        result = await pipeline_preview(_make_preview_inp(), fake_db)
+        # intent 含 awvalid + ready 让 grounding check 放过这两个 token；
+        # validation_error 是 expr_validator 的功能，本测试只关心错误是否被透传。
+        result = await pipeline_preview(
+            _make_preview_inp("awvalid && && ready 表达式校验测试"), fake_db,
+        )
 
     cond_meta = result.params["condition"]
     # 值不动（validator 不修改值）
@@ -801,3 +812,407 @@ async def test_pipeline_preview_propagates_validation_error_to_params_meta():
     from app.schemas.generate import ParamWithSource
     pwa = ParamWithSource(**cond_meta)
     assert pwa.validation_error == cond_meta["validation_error"]
+
+
+# ── code_type 一致性闸 ───────────────────────────────────────────────────
+
+def _patch_dense_per_code_type(stack, scores: dict[str, float]):
+    """让 dense_top1_score 按 code_type 返不同分数，测试跨类比较逻辑。
+
+    scores: {"assertion": 0.62, "coverage": 0.76} → 调用时按 code_type kwarg 查表，
+    未列出的类型默认 0.0。
+    """
+    async def fake(query_text, code_type=None):
+        return scores.get(code_type, 0.0)
+    stack.enter_context(patch("app.services.core.pipeline.dense_top1_score", new=fake))
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_code_type_mismatch_raises_with_suggestion():
+    """选 assertion 但 coverage 库 dense 显著更高（≥margin=0.10）→ CodeTypeMismatchError。
+
+    复现 case："统计 valid-ready 四种握手场景的覆盖率" + code_type=assertion，
+    coverage 库 0.76 vs assertion 库 0.62，gap=0.14 > 0.10。
+    """
+    from contextlib import ExitStack
+    stack = ExitStack()
+    _patch_dense_per_code_type(stack, {"assertion": 0.62, "coverage": 0.76})
+
+    with stack, pytest.raises(CodeTypeMismatchError) as excinfo:
+        await pipeline_preview(_make_preview_inp(), MagicMock())
+
+    e = excinfo.value
+    assert e.selected_code_type == "assertion"
+    assert e.suggested_code_type == "coverage"
+    assert abs(e.selected_score - 0.62) < 1e-6
+    assert abs(e.suggested_score - 0.76) < 1e-6
+    assert e.detector == "rag_dense_cross_code_type"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_code_type_match_passes():
+    """选 assertion 且 assertion 库 dense 高于 coverage（或差距 < margin）→ 不抛，正常走流水线。
+
+    防止误伤："用 SVA 断言 valid-ready 握手稳定性"这种 assertion 正例不应触发 mismatch。
+    """
+    from contextlib import ExitStack
+    stack = ExitStack()
+    _patch_dense_per_code_type(stack, {"assertion": 0.85, "coverage": 0.50})
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.85)]
+    llm_pick = TemplateSelectionOutput(
+        template_id="sva_handshake_stable_v1",
+        param_mapping={"valid": "v"}, confidence=0.9,
+    )
+    stack.enter_context(patch(
+        "app.services.core.pipeline.normalize_intent",
+        new=AsyncMock(return_value=("normalized", "h_match")),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.lookup_history", new=AsyncMock(return_value=None),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.rag_retrieve", new=AsyncMock(return_value=rag),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline._keyword_supplement", new=AsyncMock(return_value=[]),
+    ))
+    fake_llm = MagicMock()
+    fake_llm.select_template = AsyncMock(return_value=llm_pick)
+    stack.enter_context(patch(
+        "app.services.core.pipeline.get_default_llm_client",
+        new=AsyncMock(return_value=fake_llm),
+    ))
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = []
+    fake_tmpl.id = "sva_handshake_stable_v1"
+    fake_tmpl.name = "stable"
+    fake_tmpl.version = "1.0.0"
+    fake_db = MagicMock()
+    fake_db.get = AsyncMock(return_value=fake_tmpl)
+
+    with stack:
+        result = await pipeline_preview(_make_preview_inp(), fake_db)
+    assert result.template_id == "sva_handshake_stable_v1"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_code_type_borderline_under_margin_passes():
+    """coverage 比 assertion 高，但差距 < margin（0.10）→ 不抛。margin 防误伤的边界。"""
+    from contextlib import ExitStack
+    stack = ExitStack()
+    # gap = 0.06 < 0.10
+    _patch_dense_per_code_type(stack, {"assertion": 0.70, "coverage": 0.76})
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.7)]
+    llm_pick = TemplateSelectionOutput(
+        template_id="sva_handshake_stable_v1",
+        param_mapping={"valid": "v"}, confidence=0.8,
+    )
+    stack.enter_context(patch(
+        "app.services.core.pipeline.normalize_intent",
+        new=AsyncMock(return_value=("normalized", "h_border")),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.lookup_history", new=AsyncMock(return_value=None),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.rag_retrieve", new=AsyncMock(return_value=rag),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline._keyword_supplement", new=AsyncMock(return_value=[]),
+    ))
+    fake_llm = MagicMock()
+    fake_llm.select_template = AsyncMock(return_value=llm_pick)
+    stack.enter_context(patch(
+        "app.services.core.pipeline.get_default_llm_client",
+        new=AsyncMock(return_value=fake_llm),
+    ))
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = []
+    fake_tmpl.id = "sva_handshake_stable_v1"
+    fake_tmpl.name = "stable"
+    fake_tmpl.version = "1.0.0"
+    fake_db = MagicMock()
+    fake_db.get = AsyncMock(return_value=fake_tmpl)
+
+    with stack:
+        result = await pipeline_preview(_make_preview_inp(), fake_db)
+    # 没抛 mismatch、正常返
+    assert result.template_id == "sva_handshake_stable_v1"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_code_type_gate_disabled_skips_check():
+    """code_type_mismatch_gate_enabled=False → 即使分数差距巨大也不抛。逃生通道。"""
+    from contextlib import ExitStack
+    from app.core.config import get_settings
+    stack = ExitStack()
+    _patch_dense_per_code_type(stack, {"assertion": 0.62, "coverage": 0.76})
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.62)]
+    llm_pick = TemplateSelectionOutput(
+        template_id="sva_handshake_stable_v1",
+        param_mapping={}, confidence=0.6,
+    )
+    stack.enter_context(patch(
+        "app.services.core.pipeline.normalize_intent",
+        new=AsyncMock(return_value=("normalized", "h_off")),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.lookup_history", new=AsyncMock(return_value=None),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.rag_retrieve", new=AsyncMock(return_value=rag),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline._keyword_supplement", new=AsyncMock(return_value=[]),
+    ))
+    fake_llm = MagicMock()
+    fake_llm.select_template = AsyncMock(return_value=llm_pick)
+    stack.enter_context(patch(
+        "app.services.core.pipeline.get_default_llm_client",
+        new=AsyncMock(return_value=fake_llm),
+    ))
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = []
+    fake_tmpl.id = "sva_handshake_stable_v1"
+    fake_tmpl.name = "stable"
+    fake_tmpl.version = "1.0.0"
+    fake_db = MagicMock()
+    fake_db.get = AsyncMock(return_value=fake_tmpl)
+
+    settings = get_settings()
+    original = settings.code_type_mismatch_gate_enabled
+    settings.code_type_mismatch_gate_enabled = False
+    try:
+        with stack:
+            result = await pipeline_preview(_make_preview_inp(), fake_db)
+        assert result.template_id == "sva_handshake_stable_v1"
+    finally:
+        settings.code_type_mismatch_gate_enabled = original
+
+
+# ── under_specified 闸（契约反转 v2.11）───────────────────────────────────
+
+# _detect_under_specified 纯函数单测——不经过 pipeline，直接测判定规则
+
+def test_detect_under_specified_placeholder_required():
+    """required + source=placeholder → 必拦"""
+    params = {"signal": {"value": "signal", "source": "placeholder", "required": True}}
+    defs = [{"name": "signal", "required": True, "description": "信号名"}]
+    missing = _detect_under_specified(params, defs)
+    assert [m["name"] for m in missing] == ["signal"]
+
+
+def test_detect_under_specified_semantic_fallback_required():
+    """required + source=semantic_fallback → 必拦（系统瞎猜）"""
+    params = {"state_list": {"value": "IDLE, ACTIVE, DONE", "source": "semantic_fallback", "required": True}}
+    defs = [{"name": "state_list", "required": True, "description": "状态列表"}]
+    missing = _detect_under_specified(params, defs)
+    assert [m["name"] for m in missing] == ["state_list"]
+    assert missing[0]["description"] == "状态列表"
+
+
+def test_detect_under_specified_llm_trivial_empty_string():
+    """LLM 返空串 → 视为弃权 → 拦"""
+    params = {"state_list": {"value": "", "source": "llm", "required": True}}
+    defs = [{"name": "state_list", "required": True}]
+    assert [m["name"] for m in _detect_under_specified(params, defs)] == ["state_list"]
+
+
+def test_detect_under_specified_llm_trivial_zero():
+    """LLM 返 0（int 或 '0'）→ 视为弃权 → 拦。修复 FSM signal_width=0 真实 bug"""
+    for val in (0, "0"):
+        params = {"signal_width": {"value": val, "source": "llm", "required": True}}
+        defs = [{"name": "signal_width", "required": True}]
+        assert [m["name"] for m in _detect_under_specified(params, defs)] == ["signal_width"]
+
+
+def test_detect_under_specified_llm_returns_param_name_literal():
+    """LLM 偷懒返字面参数名 → 视为弃权 → 拦（前提：模板默认不是该名字）。
+
+    反例：clk 这种 param_def.default='clk' 时，LLM 返 'clk' 是合法值，不拦——
+    见 test_detect_under_specified_llm_returns_default_aware_name。
+    """
+    params = {"signal": {"value": "signal", "source": "llm", "required": True}}
+    defs = [{"name": "signal", "required": True}]  # default 缺省 None
+    assert [m["name"] for m in _detect_under_specified(params, defs)] == ["signal"]
+
+
+def test_detect_under_specified_llm_returns_default_aware_name():
+    """LLM 返字面参数名但等于模板 default → 是合法选用默认，不拦。
+
+    防御误拦真实案例：clk/rst_n 这种约定名既是参数名也是默认值，LLM 返 'clk' 不该被视为弃权。
+    """
+    params = {"clk": {"value": "clk", "source": "llm", "required": True}}
+    defs = [{"name": "clk", "required": True, "default": "clk"}]
+    assert _detect_under_specified(params, defs) == []
+
+
+def test_detect_under_specified_high_conf_sources_pass():
+    """regex / signal_list / default / llm-with-real-value 全放过"""
+    params = {
+        "valid":  {"value": "awvalid", "source": "regex", "required": True},
+        "ready":  {"value": "awready", "source": "signal_list", "required": True},
+        "clk":    {"value": "aclk", "source": "default", "required": True},
+        "module": {"value": "axi_dma", "source": "llm", "required": True},
+    }
+    defs = [
+        {"name": "valid", "required": True}, {"name": "ready", "required": True},
+        {"name": "clk", "required": True},   {"name": "module", "required": True},
+    ]
+    assert _detect_under_specified(params, defs) == []
+
+
+def test_detect_under_specified_optional_param_not_blocked():
+    """optional 参数 source=placeholder 也放过——只拦 required"""
+    params = {"opt": {"value": "opt", "source": "placeholder", "required": False}}
+    defs = [{"name": "opt", "required": False}]
+    assert _detect_under_specified(params, defs) == []
+
+
+def test_detect_under_specified_returns_missing_metadata():
+    """missing 列表带 description / expr_type / role_hint metadata 供前端做提示语"""
+    params = {
+        "signal": {"value": "signal", "source": "placeholder", "required": True},
+        "valid":  {"value": "awvalid", "source": "regex", "required": True},
+    }
+    defs = [
+        {"name": "signal", "required": True, "description": "状态信号名",
+         "expr_type": "sv_identifier", "role_hint": "state"},
+        {"name": "valid", "required": True},
+    ]
+    missing = _detect_under_specified(params, defs)
+    assert len(missing) == 1
+    m = missing[0]
+    assert m == {"name": "signal", "description": "状态信号名",
+                 "expr_type": "sv_identifier", "role_hint": "state"}
+
+
+# pipeline_preview 集成层测试
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_under_specified_raises_with_missing_list():
+    """FSM 覆盖率场景：选中 cov_transition_coverage_v1，LLM step2 返空 mapping →
+    state_list / signal 等必填参数无高置信源 → 抛 UnderSpecifiedIntentError，
+    detail 含完整 missing 列表。复现今日真实 FSM bug 场景。"""
+    rag = [_make_rag_candidate("cov_transition_coverage_v1", score=1.0,
+                                parameters=[
+                                    {"name": "group_name", "required": True, "description": "覆盖率组名"},
+                                    {"name": "signal", "required": True, "description": "状态信号名"},
+                                    {"name": "state_list", "required": True, "description": "状态列表"},
+                                ])]
+    llm_empty = TemplateSelectionOutput(
+        template_id="cov_transition_coverage_v1",
+        param_mapping={},  # LLM 啥都没填出来
+        confidence=0.9,
+    )
+
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "group_name", "required": True, "description": "覆盖率组名"},
+        {"name": "signal", "required": True, "description": "状态信号名"},
+        {"name": "state_list", "required": True, "description": "状态列表"},
+    ]
+    fake_tmpl.id = "cov_transition_coverage_v1"
+    fake_tmpl.name = "状态转换覆盖率组"
+    fake_tmpl.version = "1.0.0"
+
+    stack, fake_db = _patch_preview_deps(rag, llm_empty, db_get_return_value=fake_tmpl)
+    with stack, pytest.raises(UnderSpecifiedIntentError) as excinfo:
+        await pipeline_preview(_make_preview_inp(), fake_db)
+
+    e = excinfo.value
+    assert e.template_id == "cov_transition_coverage_v1"
+    assert e.template_name == "状态转换覆盖率组"
+    names = {m["name"] for m in e.missing_params}
+    # signal 走 semantic_fallback (inp.signals=[] 时不填) / state_list 走 semantic_fallback / group_name 走 semantic_fallback
+    assert "state_list" in names
+    assert "group_name" in names
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_under_specified_gate_disabled_allows_placeholder():
+    """UNDER_SPECIFIED_GATE_ENABLED=false → 退回旧"始终返代码"行为，让 placeholder 进入 PreviewResult。
+    紧急逃生通道——线上误拦时一键关闸。"""
+    from app.core.config import get_settings
+    rag = [_make_rag_candidate("cov_transition_coverage_v1", score=1.0)]
+    llm_empty = TemplateSelectionOutput(
+        template_id="cov_transition_coverage_v1", param_mapping={}, confidence=0.9,
+    )
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "signal", "required": True, "description": "信号"},
+    ]
+    fake_tmpl.id = "cov_transition_coverage_v1"
+    fake_tmpl.name = "状态转换覆盖率组"
+    fake_tmpl.version = "1.0.0"
+
+    stack, fake_db = _patch_preview_deps(rag, llm_empty, db_get_return_value=fake_tmpl)
+    settings = get_settings()
+    original = settings.under_specified_gate_enabled
+    settings.under_specified_gate_enabled = False
+    try:
+        with stack:
+            result = await pipeline_preview(_make_preview_inp(), fake_db)
+        assert result.template_id == "cov_transition_coverage_v1"
+        # 闸关时 placeholder 进入 params 不抛异常
+        assert result.params["signal"]["source"] == "placeholder"
+    finally:
+        settings.under_specified_gate_enabled = original
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_under_specified_passes_when_all_params_high_conf():
+    """所有 required 参数都有高置信源 → 闸开着也放行。回归保护。"""
+    rag = [_make_rag_candidate("sva_handshake_timeout_v1", score=0.9)]
+    llm_full = TemplateSelectionOutput(
+        template_id="sva_handshake_timeout_v1",
+        param_mapping={"module_name": "axi_dma", "valid": "awvalid", "ready": "awready"},
+        confidence=0.9,
+    )
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "module_name", "required": True},
+        {"name": "valid", "required": True, "role_hint": "valid"},
+        {"name": "ready", "required": True, "role_hint": "ready"},
+        {"name": "clk", "required": True, "default": "clk"},
+        {"name": "rst_n", "required": True, "default": "rst_n"},
+    ]
+    fake_tmpl.id = "sva_handshake_timeout_v1"
+    fake_tmpl.name = "Valid-Ready握手超时检测断言"
+    fake_tmpl.version = "1.0.0"
+
+    stack, fake_db = _patch_preview_deps(rag, llm_full, db_get_return_value=fake_tmpl)
+    with stack:
+        # intent 含 axi_dma / awvalid / awready 让 grounding check 放过
+        result = await pipeline_preview(
+            _make_preview_inp("axi_dma 模块 valid=awvalid ready=awready 握手超时断言"),
+            fake_db,
+        )
+    assert result.template_id == "sva_handshake_timeout_v1"
+
+
+@pytest.mark.asyncio
+async def test_pipeline_preview_under_specified_llm_trivial_value_caught():
+    """LLM 返 signal_width=0 / state_list='' 这种 trivial 值 → 仍被识别拦截。
+    防止 LLM 假填充冒充高置信源。"""
+    rag = [_make_rag_candidate("cov_transition_coverage_v1", score=1.0)]
+    llm_trivial = TemplateSelectionOutput(
+        template_id="cov_transition_coverage_v1",
+        param_mapping={"signal_width": 0, "state_list": ""},
+        confidence=0.9,
+    )
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "signal_width", "required": True, "type": "integer"},
+        {"name": "state_list", "required": True, "type": "string"},
+    ]
+    fake_tmpl.id = "cov_transition_coverage_v1"
+    fake_tmpl.name = "状态转换覆盖率组"
+    fake_tmpl.version = "1.0.0"
+
+    stack, fake_db = _patch_preview_deps(rag, llm_trivial, db_get_return_value=fake_tmpl)
+    with stack, pytest.raises(UnderSpecifiedIntentError) as excinfo:
+        await pipeline_preview(_make_preview_inp(), fake_db)
+    names = {m["name"] for m in excinfo.value.missing_params}
+    assert "signal_width" in names
+    assert "state_list" in names
