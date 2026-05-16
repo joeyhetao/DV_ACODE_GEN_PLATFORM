@@ -66,8 +66,23 @@ docker compose exec redis redis-cli --scan --pattern 'intent_builder_session:*' 
 
 ```bash
 # 跟踪 backend 日志，过滤 pipeline 关键步骤
-docker compose logs -f backend | grep -E "\[Pipeline\]|\[Timing\]|\[GLM Step|\[WARN\]"
+docker compose logs -f backend | grep -E "\[Pipeline\]|\[Gate\]|\[Timing\]|\[GLM Step|\[WARN\]|ERROR"
 ```
+
+关键日志行（用于排查 §2 闸触发与 §1 参数解析）：
+
+| 标记 | 含义 |
+|---|---|
+| `[Pipeline] source=... code_type=...` | preview 入口 |
+| `[Pipeline] extracted from intent: {...}` | regex 提取结果 |
+| `[Pipeline] params_resolved: [(name, source, value), ...]` | 每参数最终源标识，是判断 §1 高置信路径 / §2.3 under_specified 的关键 |
+| `[Pipeline] under_specified gate: missing=[...]` | §2.3 闸命中 |
+| `[Gate] off_topic: dense_top1=... threshold=...` | §2.1 闸命中 |
+| `[Pipeline] code_type mismatch: selected=... vs suggested=...` | §2.2 闸命中 |
+| `[Gate] empty_retrieval: code_type=...` | §2.4 闸命中（基础设施异常） |
+| `[Timing] llm=... ms=... reasoning_tokens=...` | LLM 单次调用耗时 + 是否真关 thinking |
+| `[Timing] stage=... ms=...` | preview 各阶段耗时（normalize / rag / llm_select / preview_total） |
+| `ERROR ... pipeline_preview unexpected failure: user=... code_type=...` | 后端崩了，附 full traceback；前端会收 500 |
 
 ### 0.6 测试 JWT 获取
 
@@ -99,7 +114,7 @@ echo $TOKEN
 - preview 后展示 RAG Top-3 候选 + 推荐模板
 - 参数徽标颜色对应：🟢 信号列表 / 🟡 正则 / 🟠 LLM / ⚪ 默认 / 🔴 占位（主路径下不出现，出现即被拦截）
 - confidence_source = `llm_step1`（LLM 主动选中）或 `rag_fallback`（RAG 兜底，置信度低）
-- 后端日志含 `[Pipeline] source=direct code_type=<type>` + `[Timing] llm=...` 三段
+- 后端日志含 `[Pipeline] source=direct code_type=<type>` + `[Pipeline] params_resolved: [(name, source, value), ...]` + `[Timing] llm=...` 等段（完整对照见 §0.5）
 
 ### §1.1 数据完整性断言
 
@@ -107,8 +122,10 @@ echo $TOKEN
 |---|---|
 | 输入 | `寄存器写保护场景：当写使能 wr_en 无效时，data_in 不会被意外修改` |
 | code_type | SVA 断言 |
+| signals 表 | **可留空**（叙述式 regex + 模板 default 兜底） |
 | 期望模板 | `sva_data_integrity_v1` 数据完整性无损坏断言 |
-| 关键参数 | enable=wr_en（信号列表）/ data=data_in（LLM） |
+| 关键参数 | enable=`wr_en`（regex 叙述式）/ data=`data_in`（regex 或 LLM）/ module_name=`dut`（template default）/ clk=`clk`、rst_n=`rst_n`（template default） |
+| 备注 | 模板 `module_name` 自 2026-05 加了 `default: dut`；regex `_ASSERTION_SIGNAL_PATTERNS` 同步引入叙述式中文模式，让"使能 X 拉高/无效"、"被保护的数据 X" 这类未带「为/是/:」强分隔符的句子也能命中 |
 
 ### §1.2 FSM 状态转换断言
 
@@ -574,8 +591,8 @@ docker compose exec backend python lib_manager.py rebuild
 ## 附录 A：日志/缓存排查速查
 
 ```bash
-# 完整 pipeline 日志（含时间戳）
-docker compose logs --timestamps backend | grep -E "\[Pipeline\]|\[Timing\]" | tail -40
+# 完整 pipeline 日志（含时间戳）—— Gate / params_resolved / ERROR 三类信号最关键
+docker compose logs --timestamps backend | grep -E "\[Pipeline\]|\[Gate\]|\[Timing\]|ERROR" | tail -40
 
 # Redis 所有缓存 key 概览
 docker compose exec redis redis-cli --scan | head -20
@@ -621,3 +638,13 @@ docker compose exec backend pytest tests/ --ignore=tests/test_offtopic_corpus_re
 | contribution_parse_failed | 422 | `contribution_parse_failed` | — | 提交贡献 Modal 内 Alert 显示 `stage` + `reason` |
 
 每个 detail 还携带专属字段（如 off_topic 的 `top_dense_score` / `threshold`，code_type_mismatch 的 `selected_score` / `suggested_score`，under_specified 的 `missing_params` 列表）。完整结构见 `backend/app/api/v1/generate.py` 各 `_*_detail()` 函数。
+
+### 兜底 fallback 错误（非闸异常）
+
+当后端抛非结构化异常（如 LLM vendor 错、Pydantic 校验失败、httpx 超时）时，4 道闸都不命中，FastAPI 端点统一返回 `HTTP 500 detail="<ExceptionName>: <msg>"`（preview / render / 旧 `/generate` 都做了 `logger.exception` 记 traceback），前端 `handleApiError` 走 fallback 分支：
+
+```
+message.error(`${fallbackMsg}（HTTP <status>: <detail 200 字符摘要>）`)
+```
+
+即任意 generic 失败都会显示 HTTP 状态码 + detail 摘要，方便回归测试时直接看 toast 定位是 500 / 503 / 422 异常路径。后端则可用 §0.5 的 `ERROR` 过滤抓 traceback。
