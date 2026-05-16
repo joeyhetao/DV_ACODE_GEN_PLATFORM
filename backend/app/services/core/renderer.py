@@ -1,10 +1,23 @@
 from __future__ import annotations
 from datetime import datetime, timezone
-from jinja2 import Environment, StrictUndefined, TemplateSyntaxError
+from jinja2 import StrictUndefined, TemplateSyntaxError
+from jinja2.sandbox import SandboxedEnvironment
+
+# v3.0 安全：模板来自外部贡献，可能含 SSTI payload（如 {{ self.__class__.__bases__ }}）。
+# 用 SandboxedEnvironment 阻断 dunder 访问 / unsafe builtin / 危险 filter。
+# IC SV 模板只用简单的 {{ var }} + if/for，沙箱足够。
+
+
+def _make_safe_env(keep_trailing_newline: bool = False) -> SandboxedEnvironment:
+    return SandboxedEnvironment(
+        undefined=StrictUndefined,
+        keep_trailing_newline=keep_trailing_newline,
+        autoescape=False,  # SV 代码不需要 HTML 转义；沙箱阻断 SSTI 后这条不会放大风险
+    )
 
 
 def render_template(template_body: str, params: dict, template_id: str = "", version: str = "") -> str:
-    env = Environment(undefined=StrictUndefined, keep_trailing_newline=True)
+    env = _make_safe_env(keep_trailing_newline=True)
     try:
         tmpl = env.from_string(template_body)
     except TemplateSyntaxError as e:
@@ -21,7 +34,7 @@ def render_template(template_body: str, params: dict, template_id: str = "", ver
 
 
 def validate_template_syntax(template_body: str) -> None:
-    env = Environment(undefined=StrictUndefined)
+    env = _make_safe_env()
     try:
         env.parse(template_body)
     except TemplateSyntaxError as e:
