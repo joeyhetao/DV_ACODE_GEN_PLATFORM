@@ -52,6 +52,8 @@ export default function App() {
           <Route path="batch" element={<BatchPage />} />
           <Route path="library" element={<LibraryPage />} />
           <Route path="my-contributions" element={<MyContributionsPage />} />
+          {/* v3.0：贡献新模板的便捷别名——IntentBuilder N 轮无匹配时 router.push 到这里，自动打开提交 Modal */}
+          <Route path="contribute/new" element={<MyContributionsPage />} />
           <Route path="intent-builder" element={<IntentBuilderPage />} />
           <Route path="admin/templates" element={<RequireAdmin><AdminTemplatesPage /></RequireAdmin>} />
           <Route path="admin/contributions" element={<RequireAdmin><AdminContributionsPage /></RequireAdmin>} />
