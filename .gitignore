@@ -96,11 +96,14 @@ logs/
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Claude Code 本地工作文件
-# 注意：.claude/agents/ 与 .claude/commands/ 是项目级 skill，应保持追踪
-# 仅忽略个人 session memory 和本地权限授予
+# 注意：.claude/agents/、.claude/commands/、.claude/settings.json 是项目级
+#       skill / hook 配置，应保持追踪
+# 仅忽略：session memory、本地权限授予、多 agent 工作流的临时状态文件
 # ═══════════════════════════════════════════════════════════════════════════
 .claude/agent-memory/
 .claude/settings.local.json
+.claude/state/
+.claude/plans/
 
 # ═══════════════════════════════════════════════════════════════════════════
 # 操作系统元数据
