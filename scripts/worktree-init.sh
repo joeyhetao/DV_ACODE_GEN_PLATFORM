@@ -67,30 +67,59 @@ git worktree add -b "$docs_br" "$docs_dir" origin/develop
 
 mkdir -p "$repo_root/.claude/state"
 
+# Copy spec.md into both worktrees, if it exists. The source lives at
+# $repo_root/.claude/plans/<ticket>.spec.md (gitignored). Each worktree
+# reads from its OWN .claude/plans/ — keep the paths uniform.
+spec_src="$repo_root/.claude/plans/$ticket.spec.md"
+spec_copied="no"
+if [[ -f "$spec_src" ]]; then
+  mkdir -p "$feat_dir/.claude/plans" "$docs_dir/.claude/plans"
+  cp "$spec_src" "$feat_dir/.claude/plans/$ticket.spec.md"
+  cp "$spec_src" "$docs_dir/.claude/plans/$ticket.spec.md"
+  spec_copied="yes"
+else
+  echo "[worktree-init] WARN: $spec_src does not exist."
+  echo "                     Run /plan-ticket $ticket first, or proceed without a spec"
+  echo "                     (coder + docs sessions will fall back to git-log inference)."
+fi
+
 cat > "$repo_root/.claude/state/$ticket.code.md" <<EOF
 # Code session notes — $ticket
 
 Created: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 Branch:   $feat_br
 Worktree: $feat_dir
+Spec copied: $spec_copied
 
-## Spec / ticket link
+## Spec
 
-
-## Design plan
-<!-- Designer subagent writes path to .claude/plans/$ticket.md here -->
+See \`.claude/plans/$ticket.spec.md\` (copied at worktree init).
+Do NOT duplicate spec content here — reference section anchors (e.g., §2, §6).
 
 ## Decisions log
-<!-- Coordinator appends short bullets as impl progresses -->
+<!-- Coordinator appends short bullets as impl progresses. Each bullet:
+     date — decision — why. Keeps a paper trail for the docs session and
+     for the PR body's "Out of scope" reasoning. -->
 
-## Notes for Doc agent
-<!-- Code session populates this BEFORE feature PR is merged.
-     Format: bulleted list of "what changed in code that docs need to track".
-     Example:
-       - PRD §3.x: redirect_to field added to under_specified error detail
-       - ARCHITECTURE §5: POST /intent-builder/chat endpoint registered
-       - CHANGELOG: feat(engine): RAG-grounded intent builder
--->
+## Handoff JSON
+
+The docs session reads this block via \`/update-specs\` Step 0.5. Fill it
+in BEFORE running \`/open-pr feat\`. Reflects what actually changed in code
+(may differ from spec §8 if scope shifted during implementation).
+
+\`\`\`json
+{
+  "ticket": "$ticket",
+  "docs_targets": [],
+  "changelog": { "type": "", "scope": "" },
+  "affected_paths": [],
+  "needs_migration": false
+}
+\`\`\`
+
+## Open questions for Docs session
+<!-- Things the coder couldn't decide that should be reflected in docs.
+     The docs session reads this via path-walk-up from the docs worktree. -->
 EOF
 
 cat > "$repo_root/.claude/state/$ticket.docs.md" <<EOF
@@ -99,10 +128,20 @@ cat > "$repo_root/.claude/state/$ticket.docs.md" <<EOF
 Created: $(date -u +%Y-%m-%dT%H:%M:%SZ)
 Branch:   $docs_br
 Worktree: $docs_dir
+Spec copied: $spec_copied
 
-## Read from .code.md
-<!-- Docs session paraphrases the handoff hints here, then plans which
-     PRD/ARCHITECTURE/README/CHANGELOG/CONTRIBUTING sections to touch. -->
+## Spec
+
+See \`.claude/plans/$ticket.spec.md\` (copied at worktree init).
+§6 Docs Impact is your read scope checklist.
+
+## Cross-worktree handoff source
+
+The code session's filled-in Handoff JSON lives at:
+\`../$repo_name-feat-$ticket/.claude/state/$ticket.code.md\`
+
+\`/update-specs\` Step 0.5 reads it automatically via path-walk-up.
+Read it manually first if you want to sanity-check before running the skill.
 
 ## Open questions for Code session
 <!-- If docs reveal an ambiguity in code, log it here. The user reads this
@@ -112,12 +151,19 @@ EOF
 echo
 echo "[worktree-init] done."
 echo "  Code session:  cd \"$feat_dir\" && claude"
-echo "  Docs session:  cd \"$docs_dir\" && claude"
+echo "  Docs session:  cd \"$docs_dir\" && claude  (after feature PR merges)"
 echo
 echo "  State files (gitignored):"
 echo "    $repo_root/.claude/state/$ticket.code.md"
 echo "    $repo_root/.claude/state/$ticket.docs.md"
+if [[ "$spec_copied" == "yes" ]]; then
+  echo "    $feat_dir/.claude/plans/$ticket.spec.md  (copy)"
+  echo "    $docs_dir/.claude/plans/$ticket.spec.md  (copy)"
+fi
 echo
-echo "  Merge order: feature/$ticket → develop FIRST, then rebase docs/$ticket"
-echo "               onto origin/develop, run /update-specs and /update-docs,"
-echo "               then docs/$ticket → develop."
+echo "  Workflow:"
+echo "    1. (in feat worktree) implement, then /review-pre-pr → /commit → /open-pr feat"
+echo "    2. Merge feature PR to develop on GitHub"
+echo "    3. (in docs worktree) git fetch && git rebase origin/develop"
+echo "    4. /update-specs → /update-docs → /review-pre-pr → /commit → /open-pr docs"
+echo "    5. Merge docs PR to develop"

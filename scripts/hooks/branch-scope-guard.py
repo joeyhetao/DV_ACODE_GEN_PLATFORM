@@ -2,15 +2,16 @@
 """
 PreToolUse hook: branch file-scope guard.
 
-Enforces the multi-agent workflow contract (see plan
-`.claude/plans/session-debug-claude-session-doc-prd-co-typed-dusk.md`):
+Enforces the multi-agent workflow contract:
 
   feature/*, fix/*  → may NOT modify docs (PRD/ARCHITECTURE/README/...)
   docs/*            → may NOT modify code (backend/, frontend/src/, ...)
+  spec/*            → may ONLY modify .claude/plans/ and .claude/state/
+                      (requirements-analyst session, optional opt-in)
   hotfix/*          → all paths allowed (audit log only)
   master/main/develop/other → allowed (admin / bootstrap)
 
-Override: write `feature` | `docs` | `hotfix` into
+Override: write `feature` | `docs` | `spec` | `hotfix` into
 `.claude/state/<ticket>.mode` (where <ticket> is the path segment after the
 branch prefix) to force a mode regardless of branch name.
 
@@ -50,6 +51,10 @@ CODE_REGEX = re.compile(
     r"^backend/|^frontend/src/|^migrations/|^backend/data/code_types/.*\.yaml$"
 )
 OFFTOPIC_EXCEPTION = re.compile(r"^backend/tests/data/offtopic_corpus\.yaml$")
+
+# spec mode (requirements-analyst session): may ONLY write into these prefixes.
+# Everything else (PRD, ARCH, backend/, frontend/, docs/, root files, etc.) is blocked.
+SPEC_ALLOW_REGEX = re.compile(r"^\.claude/plans/|^\.claude/state/")
 
 NOISE_REDIRECT_TARGETS = {
     "/dev/null",
@@ -91,6 +96,8 @@ def _violates(rel: str, mode: str) -> bool:
         if OFFTOPIC_EXCEPTION.search(rel):
             return False
         return bool(CODE_REGEX.search(rel))
+    if mode == "spec":
+        return not bool(SPEC_ALLOW_REGEX.search(rel))
     return False
 
 
@@ -233,14 +240,24 @@ def _extract_git_targets(cmd: str, repo_root: Path) -> list[tuple[str, str]]:
 
 def _block(branch: str, mode: str, ticket: str, hits: list[tuple[str, str]], tool: str) -> None:
     """Emit a block message and exit 2."""
-    scope = "doc" if mode in ("feature", "fix") else "code"
     if mode in ("feature", "fix"):
+        scope = "doc"
         hint = (
             f"Resolution: switch to a docs/* worktree to edit doc files, "
             f"or write 'hotfix' into .claude/state/{ticket}.mode for an emergency."
         )
-    else:
+    elif mode == "docs":
+        scope = "code"
         hint = "Resolution: switch to a feature/* worktree to edit code files."
+    elif mode == "spec":
+        scope = "anything outside .claude/plans/ or .claude/state/"
+        hint = (
+            "Resolution: requirements-analyst sessions may only draft spec files. "
+            "Switch to a feature/* or docs/* worktree to edit code or docs."
+        )
+    else:
+        scope = "?"
+        hint = ""
     items = "\n".join(f"  - {kind}: {p}" for kind, p in hits)
     print(
         f"[branch-scope-guard] BLOCK ({tool}): branch={branch} (mode={mode}) "
@@ -307,6 +324,8 @@ def main() -> None:
             mode = "feature"
         elif branch.startswith("docs/"):
             mode = "docs"
+        elif branch.startswith("spec/"):
+            mode = "spec"
         elif branch.startswith("hotfix/"):
             mode = "hotfix"
         else:

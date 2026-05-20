@@ -34,6 +34,7 @@ ARCH_BACKUP=""
 cleanup() {
   rm -f "$MODE_FILE" 2>/dev/null
   rmdir .claude/state 2>/dev/null
+  rmdir .claude/plans 2>/dev/null
   # Restore any tracked file we perturbed before deleting backups
   if [[ -n "$ARCH_BACKUP" && -f "$ARCH_BACKUP" ]]; then
     cp "$ARCH_BACKUP" ARCHITECTURE.md
@@ -121,6 +122,24 @@ run "docs: tee migrations/foo.sql → BLOCK" docs \
 
 run "hotfix: sed -i PRD.md → ALLOW (override)" hotfix \
   '{"tool_name":"Bash","tool_input":{"command":"sed -i s/x/y/ PRD.md"}}' 0
+
+echo
+echo "=== spec mode (requirements-analyst session) ==="
+mkdir -p .claude/plans
+run "spec: Edit PRD.md → BLOCK" spec \
+  "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$ROOT/PRD.md\"}}" 2
+run "spec: Edit backend/app/main.py → BLOCK" spec \
+  "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$ROOT/backend/app/main.py\"}}" 2
+run "spec: Write .claude/plans/TICK-1.spec.md → ALLOW" spec \
+  "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$ROOT/.claude/plans/TICK-1.spec.md\"}}" 0
+run "spec: Write .claude/state/TICK-1.mode → ALLOW" spec \
+  "{\"tool_name\":\"Write\",\"tool_input\":{\"file_path\":\"$ROOT/.claude/state/TICK-1.mode\"}}" 0
+run "spec: Edit docs/spec_schema.md → BLOCK (also a doc)" spec \
+  "{\"tool_name\":\"Edit\",\"tool_input\":{\"file_path\":\"$ROOT/docs/spec_schema.md\"}}" 2
+run "spec: echo > PRD.md → BLOCK (bash redirect)" spec \
+  '{"tool_name":"Bash","tool_input":{"command":"echo wip > PRD.md"}}' 2
+run "spec: echo > .claude/plans/foo.spec.md → ALLOW" spec \
+  '{"tool_name":"Bash","tool_input":{"command":"echo wip > .claude/plans/foo.spec.md"}}' 0
 
 echo
 echo "=== Bash tool: git add ==="

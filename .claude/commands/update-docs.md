@@ -24,6 +24,34 @@ esac
 
 非 `docs/*` 分支跳过此检查。
 
+## 第零点五步：spec + handoff JSON 摄入（v3 multi-agent workflow）
+
+如果当前 ticket 是 multi-agent workflow 走过来的，spec.md 的 §8 Machine block 和对面 feat worktree 的 Handoff JSON 已经告诉了我们：
+
+- `docs_targets` 是否包含 `README` / `CHANGELOG` / `CONTRIBUTING`？
+- `changelog.{type, scope}` 是什么？（直接 seed CHANGELOG 条目 header）
+- `affected_paths` 改动了哪些目录？（CONTRIBUTING 目录树是否要更新）
+
+读取逻辑：
+
+```bash
+BRANCH=$(git symbolic-ref --short HEAD)
+TICKET=$(echo "$BRANCH" | sed -E 's|^(feature|fix|docs|hotfix|spec)/||')
+SPEC_PATH=".claude/plans/$TICKET.spec.md"
+REPO_NAME=$(basename "$(git rev-parse --show-toplevel)" | sed -E 's|-(feat|docs)-.+$||')
+FEAT_WT="../${REPO_NAME}-feat-${TICKET}"
+HANDOFF_PATH="$FEAT_WT/.claude/state/$TICKET.code.md"
+```
+
+1. **若 `$SPEC_PATH` 存在**：用 Read 提取 §6 Docs Impact 段 + §8 fenced JSON。
+2. **若 `$HANDOFF_PATH` 存在**：用 Read 提取 `## Handoff JSON` 下的 fenced JSON。冲突时 handoff 胜。
+3. 合并 `docs_targets`：限定本步只更新被点名的文件子集。
+   - 若 `docs_targets=["CHANGELOG"]` → 跳过 README + CONTRIBUTING 的更新
+   - 若 `docs_targets=[]` → 直接告诉用户"spec 标记本 ticket 不需要 docs 更新"并退出
+4. 用 `changelog.type` + `changelog.scope` 预填 CHANGELOG 新条目 header（仍需第三步根据 git log 校对 subject 措辞）。
+
+**若两份文件都不存在**：fall through 到下面的第一步（按 git log 推断变更），保持 v2 行为。
+
 ## 执行步骤
 
 ### 第一步：采集项目真实状态
