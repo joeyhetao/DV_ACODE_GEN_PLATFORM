@@ -1,5 +1,29 @@
 根据项目当前真实进展，更新 README.md、CHANGELOG.md、CONTRIBUTING.md 三份文档。
 
+## 第零步：preflight（docs 分支必须先 rebase）
+
+如果当前分支匹配 `docs/*`，**先运行以下检查**，未通过则立即终止，不要进入第一步：
+
+```bash
+BRANCH=$(git symbolic-ref --short HEAD)
+case "$BRANCH" in
+  docs/*)
+    git fetch origin develop --quiet
+    if ! git merge-base --is-ancestor origin/develop HEAD; then
+      echo "ABORT: '$BRANCH' is not based on latest origin/develop."
+      echo "Run: git rebase origin/develop"
+      echo "Then retry /update-docs. (Without rebase, git log will not"
+      echo "show upstream feature commits and CHANGELOG diff will be stale.)"
+      exit 1
+    fi
+    ;;
+esac
+```
+
+若 abort，向用户输出上述错误信息并停止，不要继续执行后续步骤。
+
+非 `docs/*` 分支跳过此检查。
+
 ## 执行步骤
 
 ### 第一步：采集项目真实状态
