@@ -1,3 +1,4 @@
+# FastAPI application entrypoint: builds the app, initializes Qdrant collections, and mounts API routers.
 from __future__ import annotations
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
