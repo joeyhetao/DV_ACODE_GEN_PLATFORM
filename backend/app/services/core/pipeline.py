@@ -872,7 +872,36 @@ def _map_params_with_source(
         }
 
     # 1. LLM 优先（与 legacy {**extracted, **selection.param_mapping} 保持一致）
+    #    trivial 弃权值（""/"null"/"unknown" 等）跳过槽位，让 regex → signal_list →
+    #    default 链路有机会接管；判定条件**只复刻** _detect_under_specified 里
+    #    **context-free** 的两条（None/0 + 字符串集合），目的是让两层语义一致：
+    #    "trivial 即弃权"不会因为 step1 抢先 _set 而被绕过。
+    #
+    #    关于 bool（Python 里 bool 是 int 子类，False == 0、True == 1）：
+    #      - False：被首行 `value in (None, 0)` 命中而跳过——与下游
+    #        _detect_under_specified `if value in (None, 0)` 分支行为一致
+    #        （False 同样被视为低置信）。
+    #      - True ：`True in (None, 0)` 为 False（True == 1），又不是 str，所以
+    #        会走到 _set 标 source=llm——下游 _detect_under_specified 同样
+    #        视 True 为高置信（True 不在 (None, 0) 也不是 trivial 字符串）。
+    #      `isinstance(value, str)` 必须保留：一来是 `.strip().lower()` 的前置
+    #      防御（None/int/bool 调用 .strip 会 AttributeError），二来明确告诉
+    #      读者非字符串值不参与字符串集合判定。当前模板库无 bool 参数；若未
+    #      来出现合法 default=False / default=0 的参数，需要同时修 step 1 与
+    #      _detect_under_specified。
+    #
+    #    关于 value == name（字面参数名弃权）的**有意不对称**：
+    #      _detect_under_specified `elif value == name and param_def.get("default") != name`
+    #      分支把 "LLM 返字面参数名 AND 模板 default != 参数名" 视为低置信，
+    #      但该判定**依赖 param_def 上下文**（要看模板有没有 default=参数名，
+    #      如 clk default='clk' 是合法值），不属于 context-free 集合。
+    #      在 step 1 复刻会误伤合法 default——故统一由 _detect_under_specified
+    #      裁决，本 guard 只做无上下文的过滤。
     for name, value in llm_mapping.items():
+        if value in (None, 0):
+            continue
+        if isinstance(value, str) and value.strip().lower() in _TRIVIAL_LLM_VALUES:
+            continue
         _set(name, value, "llm")
 
     # 2. regex（不覆盖 LLM）

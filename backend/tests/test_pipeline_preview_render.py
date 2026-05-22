@@ -166,6 +166,63 @@ def test_map_params_meta_fields_populated():
     assert entry["type"] == "string"
 
 
+def test_map_params_trivial_llm_value_falls_through_to_default():
+    """LLM 给 trivial 值 ("unknown") 时跳过槽位，让模板 default 接管。
+
+    回归 FIX-1：寄存器写保护场景 LLM 把 module_name 填成 "unknown"，原实现把它
+    标 source=llm 锁死槽位，under_specified 闸再把它拦下 → 用户被赶到 IntentBuilder。
+    修复后 trivial LLM 值跳过，default="dut" 接管，pipeline 直接出码。
+    """
+    template = _FakeTemplate([
+        {"name": "module_name", "required": True, "default": "dut", "type": "string"},
+    ])
+    result = _map_params_with_source(
+        template,
+        _make_inp(),
+        regex_mapping={},
+        llm_mapping={"module_name": "unknown"},
+    )
+    assert result["module_name"]["value"] == "dut"
+    assert result["module_name"]["source"] == "default"
+
+
+def test_map_params_nontrivial_llm_value_is_kept():
+    """非 trivial 的 LLM 值仍保留 source=llm，不被 default 吞掉。
+
+    防止 FIX-1 的守卫误伤合法 LLM 输出——只有 _TRIVIAL_LLM_VALUES 里的值才跳过。
+    """
+    template = _FakeTemplate([
+        {"name": "module_name", "required": True, "default": "dut", "type": "string"},
+    ])
+    result = _map_params_with_source(
+        template,
+        _make_inp(),
+        regex_mapping={},
+        llm_mapping={"module_name": "my_dut"},
+    )
+    assert result["module_name"]["value"] == "my_dut"
+    assert result["module_name"]["source"] == "llm"
+
+
+def test_map_params_trivial_llm_value_whitespace_and_case_normalized():
+    """LLM 返 '  UNKNOWN  '（大写 + 前后空格）也应被识别为 trivial，走 default。
+
+    覆盖 .strip().lower() 归一化路径——LLM 真实输出常带多余空白/大小写，
+    若守卫只匹配字面 'unknown' 会漏掉这类变体。
+    """
+    template = _FakeTemplate([
+        {"name": "module_name", "required": True, "default": "dut", "type": "string"},
+    ])
+    result = _map_params_with_source(
+        template,
+        _make_inp(),
+        regex_mapping={},
+        llm_mapping={"module_name": "  UNKNOWN  "},
+    )
+    assert result["module_name"]["value"] == "dut"
+    assert result["module_name"]["source"] == "default"
+
+
 # ── _values_only 单测 ──────────────────────────────────────────────────
 
 def test_values_only_strips_metadata():
@@ -1216,3 +1273,107 @@ async def test_pipeline_preview_under_specified_llm_trivial_value_caught():
     names = {m["name"] for m in excinfo.value.missing_params}
     assert "signal_width" in names
     assert "state_list" in names
+
+
+# ── FIX-1 §2 Acceptance Criteria（端到端 pipeline_preview mock 集成测试）──────
+#
+# 这两个测试逐字对应 .claude/plans/FIX-1.spec.md §2 AC1 / AC2：
+#   AC1: 寄存器写保护 intent → PreviewResult.template_id == "sva_data_integrity_v1"，
+#        不抛 UnderSpecifiedIntentError、不重定向 IntentBuilder
+#   AC2: 同 intent 下 module_name → value="dut", source="default"
+# 单元测试 (test_map_params_trivial_llm_value_falls_through_to_default 等) 已覆盖
+# 内部函数行为；这两个把"happy path 端到端走通"锁进回归套。
+
+def _make_data_integrity_template_mock():
+    """构造 sva_data_integrity_v1 的 fake template，参数布局对齐生产 YAML。"""
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "module_name", "type": "string", "required": True,
+         "description": "模块名", "default": "dut"},
+        {"name": "clk", "type": "string", "required": True,
+         "description": "时钟信号", "default": "clk"},
+        {"name": "rst_n", "type": "string", "required": True,
+         "description": "复位信号", "default": "rst_n"},
+        {"name": "enable", "type": "string", "required": True,
+         "description": "写使能信号名（高有效）", "role_hint": "enable"},
+        {"name": "data", "type": "string", "required": True,
+         "description": "被保护的数据信号名", "role_hint": "data"},
+    ]
+    fake_tmpl.id = "sva_data_integrity_v1"
+    fake_tmpl.name = "数据完整性无损坏断言"
+    fake_tmpl.version = "1.0.0"
+    return fake_tmpl
+
+
+@pytest.mark.asyncio
+async def test_ac1_register_write_protect_intent_returns_data_integrity_template():
+    """AC1：寄存器写保护 intent + module_name='unknown' 不应再触发 UnderSpecifiedIntentError。
+
+    pre-FIX-1：step1 把 'unknown' 写成 source=llm 锁死 module_name 槽位，下游
+    under_specified 闸把它拦下，PreviewResult 永远不返回。
+    post-FIX-1：'unknown' 被 step1 守卫识别为 trivial 跳过，default='dut' 接管，
+    流水线正常返回 PreviewResult(template_id='sva_data_integrity_v1')。
+    """
+    rag = [_make_rag_candidate("sva_data_integrity_v1", score=0.85)]
+    # LLM step2 用 'unknown' 弃权 module_name；enable / data 由信号列表 grounding 通过
+    llm_pick = TemplateSelectionOutput(
+        template_id="sva_data_integrity_v1",
+        param_mapping={"module_name": "unknown", "enable": "wr_en", "data": "data_in"},
+        confidence=0.9,
+    )
+    fake_tmpl = _make_data_integrity_template_mock()
+
+    inp = PipelineInput(
+        original_intent="寄存器写保护场景：当写使能 wr_en 无效时，data_in 不会被意外修改",
+        code_type="assertion",
+        clk="clk",
+        rst="rst_n",
+        rst_polarity="低有效",
+        signals=[
+            {"name": "wr_en", "width": 1, "role": "enable"},
+            {"name": "data_in", "width": 32, "role": "data"},
+        ],
+    )
+
+    stack, fake_db = _patch_preview_deps(rag, llm_pick, db_get_return_value=fake_tmpl)
+    with stack:
+        result = await pipeline_preview(inp, fake_db)
+
+    assert result.template_id == "sva_data_integrity_v1"
+    # 没抛 UnderSpecifiedIntentError —— 走到这里就意味着 redirect_to/IntentBuilder
+    # 那条路没被触发。
+
+
+@pytest.mark.asyncio
+async def test_ac2_module_name_resolved_to_default_dut():
+    """AC2：同 AC1 场景下，module_name 在 params_with_source 里应是 value='dut'、source='default'。
+
+    这是 FIX-1 的核心契约：trivial LLM 值不堵塞 default 链路。
+    """
+    rag = [_make_rag_candidate("sva_data_integrity_v1", score=0.85)]
+    llm_pick = TemplateSelectionOutput(
+        template_id="sva_data_integrity_v1",
+        param_mapping={"module_name": "unknown", "enable": "wr_en", "data": "data_in"},
+        confidence=0.9,
+    )
+    fake_tmpl = _make_data_integrity_template_mock()
+
+    inp = PipelineInput(
+        original_intent="寄存器写保护场景：当写使能 wr_en 无效时，data_in 不会被意外修改",
+        code_type="assertion",
+        clk="clk",
+        rst="rst_n",
+        rst_polarity="低有效",
+        signals=[
+            {"name": "wr_en", "width": 1, "role": "enable"},
+            {"name": "data_in", "width": 32, "role": "data"},
+        ],
+    )
+
+    stack, fake_db = _patch_preview_deps(rag, llm_pick, db_get_return_value=fake_tmpl)
+    with stack:
+        result = await pipeline_preview(inp, fake_db)
+
+    module_meta = result.params["module_name"]
+    assert module_meta["value"] == "dut"
+    assert module_meta["source"] == "default"
