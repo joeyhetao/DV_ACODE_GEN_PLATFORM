@@ -24,6 +24,10 @@ parameters:
     type: string
     required: true
     description: 覆盖率组名
+    # default 用 'protocol_handshake' 描述测量模式，而非 subcategory 的 'protocol_coverage'：
+    # body 是 cg_{{ group_name }}_handshake，渲染成 cg_protocol_handshake_handshake，
+    # 标识符可读且不与 subcategory 命名层级冲突。
+    default: protocol_handshake
   - name: clk
     type: string
     required: true

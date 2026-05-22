@@ -25,7 +25,7 @@ parameters:
     type: string
     required: true
     description: 模块名
-    role_hint: null
+    default: dut
   - name: clk
     type: string
     required: true
