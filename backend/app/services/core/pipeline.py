@@ -405,10 +405,8 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
     # 知道具体缺哪个参数而不是看到一堆 placeholder 想"系统好像很懂"再交付错代码。
     # intent_text=original_intent：grounding 检查用，防 LLM 凭空编泛用默认值。
     if settings.under_specified_gate_enabled:
-        # form_values：用户通过 GenerateForm 显式提供的所有结构化值，作 grounding 额外来源
-        form_values = [inp.clk, inp.rst, inp.rst_polarity] + [
-            s.get("name", "") for s in inp.signals if s.get("name")
-        ]
+        # 用 _build_form_values 取统一构造（与 _map_params_with_source step-1 守卫共享真相源）
+        form_values = _build_form_values(inp)
         missing = _detect_under_specified(
             params_with_source, template.parameters or [],
             intent_text=inp.original_intent,
@@ -840,6 +838,28 @@ def _llm_value_in_form_values(value, form_values: list[str]) -> bool:
     return any(s == str(fv).strip().lower() for fv in form_values if fv)
 
 
+def _build_form_values(inp: PipelineInput) -> list[str]:
+    """收集用户通过 GenerateForm 显式提供的所有结构化值，作 LLM grounding 额外来源。
+
+    本函数是 _map_params_with_source step-1 FIX-2 守卫与 _detect_under_specified
+    闸的**共享真相源**——两层判定都必须看同一个 form_values 集合，否则会出现
+    "step1 放过但 gate 拦下"或反之的不一致。**禁止在两层各自内联构造**，
+    新增 form 字段时（如表单加 clock domain、protocol mode 等）只改这里。
+
+    收集来源：
+      - inp.clk / inp.rst / inp.rst_polarity：时钟、复位、复位极性
+      - inp.protocol：协议名（仅当用户在表单设置，None/空跳过）。当前模板库无
+        protocol 参数，但 _build_signal_context 已经把它注入 LLM system prompt，
+        LLM 引用它合法 → 这里也得 ground 通过，否则两层判定漂移。
+      - inp.signals[].name：用户填的所有信号名
+    """
+    values = [inp.clk, inp.rst, inp.rst_polarity]
+    if inp.protocol:
+        values.append(inp.protocol)
+    values.extend(s.get("name", "") for s in inp.signals if s.get("name"))
+    return values
+
+
 def _map_params_with_source(
     template,
     inp: PipelineInput,
@@ -897,11 +917,37 @@ def _map_params_with_source(
     #      如 clk default='clk' 是合法值），不属于 context-free 集合。
     #      在 step 1 复刻会误伤合法 default——故统一由 _detect_under_specified
     #      裁决，本 guard 只做无上下文的过滤。
+    #
+    #    FIX-2 追加守卫（"ungrounded + 有 default → defer"）：
+    #      非 trivial 但**完全不在用户原文/form 字段里**的 LLM 值（典型: LLM 把
+    #      module_name 填成 'top'、group_name 填成 'cov_group'），原实现把它锁
+    #      死 source=llm，使模板 yaml 的 default 永远没机会接管；下游
+    #      _detect_under_specified 的 grounding check 又会把它打成低置信源 → 422
+    #      把用户赶进 IntentBuilder，**即使模板 default 已经能给出可用值**。
+    #      此处先把"模板有 default 且 LLM 值未 grounded"识别出来 → 跳过 _set，
+    #      让 step 4 的 default 接管。判定**复用** _llm_value_grounded_in_intent /
+    #      _llm_value_in_form_values 两个 helper，与 _detect_under_specified
+    #      的 grounding check 同一标准（避免两层判定漂移）。
+    #      触发顺序：trivial 守卫 → has-default+ungrounded 守卫 → _set。
+    #      mock 单测（intent_text==""）跳过本守卫，与 _detect_under_specified 一致。
+    #      模板没有 default 的参数仍走老路径（_set 标 llm，由 _detect_under_specified
+    #      最终裁决拦/放）——这条不动是因为没有 default 兜底，让 LLM 值占位
+    #      才能保留前端"显示具体出错值"的能力。
+    intent_text = inp.original_intent or ""
+    form_values = _build_form_values(inp)
     for name, value in llm_mapping.items():
         if value in (None, 0):
             continue
         if isinstance(value, str) and value.strip().lower() in _TRIVIAL_LLM_VALUES:
             continue
+        if intent_text:
+            param_def = param_meta.get(name, {})
+            if (
+                "default" in param_def
+                and not _llm_value_grounded_in_intent(value, intent_text)
+                and not _llm_value_in_form_values(value, form_values)
+            ):
+                continue
         _set(name, value, "llm")
 
     # 2. regex（不覆盖 LLM）
@@ -949,6 +995,9 @@ def _map_params_with_source(
         if not name or name in result:
             continue
         if name == "group_name":
+            # FIX-2 之后这条 fallback 对生产 4 个 coverage 模板（value/cross/
+            # transition/protocol_handshake）实际不可达——它们都加了 default。
+            # 留作未来"group_name 无 default"新模板的兜底。
             value = "cov_group"
             for sig_key in ("signal", "valid", "data", "state"):
                 if sig_key in result:

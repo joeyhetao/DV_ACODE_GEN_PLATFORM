@@ -33,9 +33,10 @@ class _FakeTemplate:
         self.parameters = parameters
 
 
-def _make_inp(signals=None, clk="clk", rst="rst_n", rst_polarity="低有效"):
+def _make_inp(signals=None, clk="clk", rst="rst_n", rst_polarity="低有效",
+              original_intent="dummy"):
     return PipelineInput(
-        original_intent="dummy",
+        original_intent=original_intent,
         code_type="assertion",
         clk=clk,
         rst=rst,
@@ -187,16 +188,23 @@ def test_map_params_trivial_llm_value_falls_through_to_default():
 
 
 def test_map_params_nontrivial_llm_value_is_kept():
-    """非 trivial 的 LLM 值仍保留 source=llm，不被 default 吞掉。
+    """非 trivial 的 LLM 值（且 grounded 在原文中）仍保留 source=llm，不被 default 吞掉。
 
-    防止 FIX-1 的守卫误伤合法 LLM 输出——只有 _TRIVIAL_LLM_VALUES 里的值才跳过。
+    双重回归保护：
+      - FIX-1：trivial 守卫只跳过 _TRIVIAL_LLM_VALUES 里的值，不能误伤合法 LLM 输出。
+      - FIX-2：grounding 守卫只在 LLM 值 **未** grounded 时介入；本例 intent 含 'my_dut'
+        让 LLM 值通过 grounding check，确认 FIX-2 守卫不会把合法 grounded 值也丢掉。
+
+    与新增的 test_map_params_grounded_llm_value_kept_even_with_default 测同一个不变量
+    （grounded+has default → source=llm），保留作为 FIX-1 trivial 路径的命名回归锚点；
+    若后续合并两条测试，请同步保留对 _TRIVIAL_LLM_VALUES 不误伤的覆盖。
     """
     template = _FakeTemplate([
         {"name": "module_name", "required": True, "default": "dut", "type": "string"},
     ])
     result = _map_params_with_source(
         template,
-        _make_inp(),
+        _make_inp(original_intent="my_dut 模块的握手稳定性断言"),
         regex_mapping={},
         llm_mapping={"module_name": "my_dut"},
     )
@@ -221,6 +229,193 @@ def test_map_params_trivial_llm_value_whitespace_and_case_normalized():
     )
     assert result["module_name"]["value"] == "dut"
     assert result["module_name"]["source"] == "default"
+
+
+# ── FIX-2: ungrounded-LLM-value + has-default → defer to default ───────
+#
+# step 1 第二道守卫的判定矩阵：
+#   trivial?     yes → 跳过（FIX-1 已覆盖）
+#   non-trivial:
+#     has default? │ grounded?  →  expected behavior
+#         no      │    n/a      →  保留 source=llm（让 _detect_under_specified 兜底）
+#         yes     │   no        →  跳过 _set，让 step 4 default 接管
+#         yes     │   yes (intent) → 保留 source=llm
+#         yes     │   yes (form)   → 保留 source=llm（form_values grounding 等同）
+
+
+def test_map_params_ungrounded_llm_value_with_default_falls_through():
+    """非 trivial 但 ungrounded 的 LLM 值 + 模板有 default → 守卫跳过 → default 接管。
+
+    复现真实 case：FSM 断言场景 LLM step2 给 module_name='top'，原文里没有 'top'、
+    form 字段（clk/rst/rst_polarity + signals）里也没有。原实现把 'top' 锁死
+    source=llm，下游 _detect_under_specified grounding check 再把它打成低置信源 →
+    422 把用户赶进 IntentBuilder（即使模板已经给了 default='dut'）。
+    本守卫识别这种 "LLM 善意编造" → 跳过 _set，让 default 接管。
+    """
+    template = _FakeTemplate([
+        {"name": "module_name", "required": True, "default": "dut", "type": "string"},
+    ])
+    result = _map_params_with_source(
+        template,
+        _make_inp(original_intent="FSM 状态转换断言：从 IDLE 到 ACTIVE"),
+        regex_mapping={},
+        llm_mapping={"module_name": "top"},
+    )
+    assert result["module_name"]["value"] == "dut"
+    assert result["module_name"]["source"] == "default"
+
+
+def test_map_params_ungrounded_llm_value_without_default_kept_for_under_specified_gate():
+    """非 trivial 但 ungrounded 的 LLM 值 + 模板**无** default → 保留 source=llm。
+
+    没有 default 兜底时，让 LLM 值占位是有意为之：
+      - 前端能在 ConfirmationPanel 显示具体出错值（"模型猜的 'fabricated_sig'"）
+      - _detect_under_specified 用 grounding check 把它判低置信源 → 422 → IntentBuilder
+    本守卫只在 "has default" 时才介入，避免吞掉用户必须填的参数的诊断信息。
+    """
+    template = _FakeTemplate([
+        # 注意：没有 default 字段
+        {"name": "signal", "required": True, "type": "string"},
+    ])
+    result = _map_params_with_source(
+        template,
+        _make_inp(original_intent="覆盖率统计四个状态"),
+        regex_mapping={},
+        llm_mapping={"signal": "fabricated_sig"},
+    )
+    assert result["signal"]["value"] == "fabricated_sig"
+    assert result["signal"]["source"] == "llm"
+
+
+def test_map_params_grounded_llm_value_kept_even_with_default():
+    """LLM 值在原文里出现 + 模板有 default → 守卫不跳过，LLM 值优先于 default。
+
+    防止 FIX-2 守卫过度激进：用户在原文里明说了 "my_dut 模块"，LLM 正确抽出
+    module_name='my_dut'，此时应保留 LLM 值，不能被 default='dut' 覆盖。
+    grounding 判定复用 _llm_value_grounded_in_intent。
+    """
+    template = _FakeTemplate([
+        {"name": "module_name", "required": True, "default": "dut", "type": "string"},
+    ])
+    result = _map_params_with_source(
+        template,
+        _make_inp(original_intent="my_dut 模块的 FSM 状态转换断言"),
+        regex_mapping={},
+        llm_mapping={"module_name": "my_dut"},
+    )
+    assert result["module_name"]["value"] == "my_dut"
+    assert result["module_name"]["source"] == "llm"
+
+
+def test_map_params_llm_value_grounded_in_form_values_kept():
+    """LLM 值在 form 字段里出现（clk/rst/rst_polarity + signals.name）+ 模板有 default
+    → 守卫不跳过，LLM 值优先于 default。
+
+    form_values 是用户通过 GenerateForm 显式提供的结构化值，被注入到 LLM system prompt
+    作 signal_context，LLM 引用它们是合法 grounding。grounding 检查复用
+    _llm_value_in_form_values，与 _detect_under_specified 同一标准（避免两层判定漂移）。
+
+    本例：原文不含 'aclk'，但用户在表单填了 clk='aclk' → LLM 给 valid='aclk' 合法。
+    """
+    template = _FakeTemplate([
+        {"name": "valid", "required": True, "default": "valid", "type": "string"},
+    ])
+    result = _map_params_with_source(
+        template,
+        _make_inp(
+            clk="aclk",
+            original_intent="握手稳定性断言",  # 原文不含 'aclk'
+        ),
+        regex_mapping={},
+        llm_mapping={"valid": "aclk"},  # 命中 form_values 里的 clk='aclk'
+    )
+    assert result["valid"]["value"] == "aclk"
+    assert result["valid"]["source"] == "llm"
+
+
+def test_map_params_group_name_ungrounded_llm_value_falls_to_yaml_default():
+    """coverage 模板：LLM 给 group_name='cov_group'（原文/form 都没这词）+ 模板有 default
+    → 守卫跳过，YAML default 接管。
+
+    与 _module_name_ 路径对称的 group_name 路径单测——确保 4 个 coverage 模板
+    （value/cross/transition/protocol_handshake）的 default 在生产路径都能被 step 4 拿到。
+    本测试同时模拟"LLM 编造 group_name"和"用户没提供 group_name"两种情况的合流。
+    """
+    template = _FakeTemplate([
+        {"name": "group_name", "required": True, "default": "value",
+         "type": "string", "description": "覆盖率组名"},
+    ])
+    result = _map_params_with_source(
+        template,
+        _make_inp(original_intent="对状态信号 cur_state 做值覆盖率统计"),
+        regex_mapping={},
+        llm_mapping={"group_name": "cov_group"},  # 原文/form 都没这词
+    )
+    assert result["group_name"]["value"] == "value"
+    assert result["group_name"]["source"] == "default"
+
+
+@pytest.mark.parametrize("fname,expected_default,expected_covergroup,extra_params", [
+    # 每行：(YAML 文件名, group_name 期望 default, 渲染后期望出现的完整 covergroup 声明字串, body 引用的额外参数)
+    # extra_params 须包含 body 实际引用的所有变量，但 group_name 除外（已由
+    # actual_default 单独注入）。Jinja2 不读 YAML parameter defaults——所有 body
+    # 引用的变量（含 YAML default 的）都必须显式在 params 里出现，否则
+    # StrictUndefined 会 raise。
+    (
+        "value_coverage.yaml", "value", "covergroup cg_value_value",
+        {"clk": "clk", "signal": "sig", "bins_expr": "{[0:15]}"},
+    ),
+    (
+        "cross_coverage.yaml", "cross", "covergroup cg_cross_cross",
+        {"clk": "clk", "signal_a": "sa", "signal_b": "sb",
+         "bins_a": "{[0:3]}", "bins_b": "{0, 1}"},
+    ),
+    (
+        "transition_coverage.yaml", "transition", "covergroup cg_transition_transition",
+        {"clk": "clk", "signal": "state_sig", "state_list": "IDLE, ACTIVE, DONE"},
+    ),
+    (
+        "protocol_handshake_coverage.yaml", "protocol_handshake",
+        "covergroup cg_protocol_handshake_handshake",
+        {"clk": "clk", "valid": "v", "ready": "r"},
+    ),
+])
+def test_coverage_template_renders_default_without_double_prefix(
+    fname, expected_default, expected_covergroup, extra_params,
+):
+    """端到端契约：4 个 coverage 模板用 YAML default 渲染时，产出的 SV covergroup
+    名字**只带一个 `cg_` 前缀**，不出现 `cg_cg_*_value` 这种重复前缀。
+
+    回归保护：模板 body 都是 `covergroup cg_{{ group_name }}_<suffix> ...` 结构，
+    若 YAML 把 default 写成 `cg_<x>`（前缀重复），渲染结果会变成
+    `cg_cg_<x>_<suffix>`——能编译但语义冗余。本测试读真实 YAML default 并 Jinja
+    渲染，断言：(1) 渲染输出**不**含 `cg_cg_`，(2) 完整的 `covergroup cg_<default>_<suffix>`
+    声明字串确实出现。
+
+    assertion (2) 同时锁住 default 与 body 后缀这对契约——任一侧改动而不同步另一侧
+    （例如把 body 改成 `cg_{{ group_name }}` 去掉 `_value` 后缀）也会被本测试挡住。
+    """
+    import yaml
+    from pathlib import Path
+    from app.services.core.renderer import render_template
+
+    yaml_path = Path(__file__).resolve().parent.parent / "template_library/coverage" / fname
+    data = yaml.safe_load(yaml_path.read_text(encoding="utf-8"))
+    group_name_param = next(p for p in data["parameters"] if p["name"] == "group_name")
+    actual_default = group_name_param["default"]
+    # 锁住 YAML default 本身——防 default 被改 cg_ 前缀重新引入但 parametrize 漏改
+    assert actual_default == expected_default, \
+        f"{fname}: YAML default={actual_default!r} 与测试参数 {expected_default!r} 不一致"
+
+    params = {"group_name": actual_default, **extra_params}
+    rendered = render_template(data["template_body"], params, data["id"], data["version"])
+
+    # 关键断言 (1)：标识符**不**包含双重 cg_ 前缀
+    assert "cg_cg_" not in rendered, \
+        f"{fname}: 双重 cg_ 前缀（YAML default 多了 cg_）：渲染片段=\n{rendered[:600]}"
+    # 关键断言 (2)：完整 covergroup 声明字串出现——锁 default + body 后缀的契约
+    assert expected_covergroup in rendered, \
+        f"{fname}: 期望渲染含 {expected_covergroup!r}，渲染片段=\n{rendered[:600]}"
 
 
 # ── _values_only 单测 ──────────────────────────────────────────────────
@@ -1377,3 +1572,91 @@ async def test_ac2_module_name_resolved_to_default_dut():
     module_meta = result.params["module_name"]
     assert module_meta["value"] == "dut"
     assert module_meta["source"] == "default"
+
+
+# ── FIX-2 §2 Acceptance Criteria（端到端 pipeline_preview mock 集成测试）──────
+#
+# 锁定 FIX-2 §1.2 happy path 端到端契约：FSM 状态转换 intent，原文里没有 module_name，
+# LLM step2 偏要返一个"看起来合理"的 ungrounded 值（'top'），原实现把它锁死 → 422 →
+# IntentBuilder。FIX-2 守卫让模板 YAML default='dut' 接管 → PreviewResult 正常返回。
+#
+# 与 FIX-1 AC1/AC2 互补：FIX-1 拦的是 trivial LLM 值（"unknown"），FIX-2 拦的是
+# non-trivial-but-fabricated LLM 值（"top"）。两类都不让前端误以为系统"懂用户意图"
+# 而提示填错的代码。
+
+
+@pytest.mark.asyncio
+async def test_fix2_fsm_intent_ungrounded_module_name_falls_to_default():
+    """FIX-2 端到端：FSM 状态转换 intent + LLM 返 module_name='top'（原文/form 都没这词）
+    → pipeline_preview 正常返回 PreviewResult，module_name 走模板 default='dut'。
+
+    前置：sva_fsm_state_transition_v1 已加 default: dut（Part B YAML 改动）。
+    本测试用 mock template 直接注入 default 字段，独立验证守卫语义，
+    不依赖 lib_manager.py 把 YAML 导入 PG（那是 post-merge deploy 步骤）。
+    """
+    rag = [_make_rag_candidate(
+        "sva_fsm_state_transition_v1", score=0.92,
+        parameters=[
+            {"name": "module_name", "type": "string", "required": True,
+             "description": "模块名", "default": "dut",
+             "expr_type": "sv_identifier"},
+            {"name": "clk", "type": "string", "required": True,
+             "default": "clk", "expr_type": "sv_identifier"},
+            {"name": "rst_n", "type": "string", "required": True,
+             "default": "rst_n", "expr_type": "sv_identifier"},
+            {"name": "state_sig", "type": "string", "required": True,
+             "role_hint": "state", "expr_type": "sv_identifier"},
+            {"name": "from_state", "type": "string", "required": True,
+             "default": "IDLE", "expr_type": "sv_identifier"},
+            {"name": "condition", "type": "string", "required": True,
+             "expr_type": "sv_boolean_expr"},
+            {"name": "to_state", "type": "string", "required": True,
+             "default": "ACTIVE", "expr_type": "sv_identifier"},
+        ],
+    )]
+    # LLM step2 给 module_name='top'（原文/form 都没这词）+ 其余 grounded 参数。
+    # condition/state_sig 必须有高置信源否则 under_specified 闸会拦 —— 给它们
+    # 原文里出现过的值，让本测试只暴露 module_name 这一根维度。
+    llm_pick = TemplateSelectionOutput(
+        template_id="sva_fsm_state_transition_v1",
+        param_mapping={
+            "module_name": "top",  # FIX-2 守卫的目标：ungrounded + has default
+            "state_sig": "cur_state",
+            "condition": "trigger == 1",
+            "from_state": "IDLE",
+            "to_state": "ACTIVE",
+        },
+        confidence=0.9,
+    )
+
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = rag[0]["template"].parameters
+    fake_tmpl.id = "sva_fsm_state_transition_v1"
+    fake_tmpl.name = "FSM状态转换合法性断言"
+    fake_tmpl.version = "1.0.0"
+
+    inp = PipelineInput(
+        # 原文含 cur_state / trigger / IDLE / ACTIVE 让其他参数 grounding 通过；
+        # 关键：原文里**不出现** 'top' / 'dut'，让 module_name 守在测试条件上。
+        original_intent="FSM 从 IDLE 转到 ACTIVE 的断言，状态信号 cur_state，触发条件 trigger == 1",
+        code_type="assertion",
+        clk="clk",
+        rst="rst_n",
+        rst_polarity="低有效",
+        signals=[
+            {"name": "cur_state", "width": 4, "role": "state"},
+        ],
+    )
+
+    stack, fake_db = _patch_preview_deps(rag, llm_pick, db_get_return_value=fake_tmpl)
+    with stack:
+        result = await pipeline_preview(inp, fake_db)
+
+    # 关键断言 1：pipeline 正常返回（未抛 UnderSpecifiedIntentError 走到 IntentBuilder）
+    assert result.template_id == "sva_fsm_state_transition_v1"
+    # 关键断言 2：module_name 落在模板 default
+    module_meta = result.params["module_name"]
+    assert module_meta["value"] == "dut", \
+        f"expected module_name=dut from template default, got {module_meta}"
+    assert module_meta["source"] == "default", \
+        f"expected source=default, got source={module_meta['source']}"
