@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Changed
 - ARCHITECTURE v2.17 → v2.18：先行落地 PRD v3.0 实现细节文档（§3.10 LLM 反推贡献流、§3.11 `normalize_intent` 角色降级 + IntentBuilder `/chat` 多轮对话端点、§3.12 `LLMClient.chat()` 抽象、§3.15.3 `code_type_mismatch` + `under_specified` 闸 + `redirect_to` 字段约定、§5.1 端点表 + §8.4 六个新环境变量）。代码实现仍未提交。
 
+### Fixed
+- **`_map_params_with_source` step 1 漏掉 trivial LLM 弃权值守卫**（#6, FIX-1）：LLM step2 返回 `""` / `"unknown"` / `"null"` / `0` 等 trivial 占位时被无条件写入槽位并标 `source=llm`，槽位写入卫语句（`if name in result: return`）立即生效封死 regex → signal_list → default 兜底链路；下游 `_detect_under_specified` 把这条 `source=llm` 低置信值判失败抛 `UnderSpecifiedIntentError`，即便模板已配置合法 `default` 也被误导向 IntentBuilder。修复在 step 1 顶部加 2 条 context-free 守卫（`None`/`0` 跳过 + `isinstance(value, str) and value.strip().lower() in _TRIVIAL_LLM_VALUES` 跳过），与 `_detect_under_specified` 低置信判定保持镜像；典型现象是寄存器写保护意图（`sva_data_integrity_v1`，`module_name` 应回落 `default="dut"`）不再被错误拦截。`value == name`（字面参数名弃权）依赖 `param_def` 上下文（`clk default="clk"` 是合法值），有意不在此复刻，仍由 `_detect_under_specified` 统一裁决
+
 ---
 
 ## [0.6.0] - 2026-05-14
