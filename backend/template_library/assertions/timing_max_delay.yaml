@@ -21,6 +21,7 @@ parameters:
     type: string
     required: true
     description: 模块名
+    default: dut
   - name: clk
     type: string
     required: true

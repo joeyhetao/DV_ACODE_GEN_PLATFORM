@@ -20,6 +20,7 @@ parameters:
     type: string
     required: true
     description: 覆盖率组名
+    default: transition
   - name: clk
     type: string
     required: true
