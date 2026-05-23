@@ -13,8 +13,18 @@ keywords:
   - 枚举
   - bins
   - value_coverage
+  - 取值分布
+  - 值域统计
+  - 点覆盖
+  - 信号值域
+  - 枚举值
+  - 控制信号
+  - 寄存器取值
 description: |
-  对信号的值域进行分bin覆盖率统计，适用于状态机、控制信号、枚举类型信号的覆盖率收集。
+  统计信号在各采样时刻的取值分布（点覆盖）：验证信号的每个合法取值或区间是否被触发过。
+  本模板关注单一信号的值域覆盖，不涉及相邻时刻之间的状态转移路径。
+  典型场景：error_code 的 0~15 每个值都必须被覆盖、status 寄存器所有枚举值覆盖率。
+  若需覆盖 FSM 状态之间的转移路径（A→B 边覆盖），请使用 cov_transition_coverage_v1。
 parameters:
   - name: group_name
     type: string

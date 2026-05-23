@@ -17,9 +17,21 @@ keywords:
   - stable
   - 握手
   - 数据稳定
+  - 保持不变
+  - 数据保护
+  - payload
+  - 总线数据
+  - 不能变化
+  - wdata
+  - rdata
+  - 稳定性
+  - 数据完整性
+  - 握手等待
 description: |
-  当valid拉高而ready未响应期间，数据信号必须保持稳定。
-  适用于所有基于Valid/Ready握手协议的接口，如AXI4、AXI4-Stream等。
+  当 valid 拉高且 ready 尚未响应（握手等待期间），数据/payload 信号不能发生变化。
+  本模板关注数据总线的稳定性约束，不检测超时、不计数等待周期。
+  典型场景：wvalid=1 但 wready=0 期间 wdata 不能改变；arvalid 期间地址信号必须保持稳定。
+  若需验证 ready 必须在 N 周期内响应（超时检测），请使用 sva_handshake_timeout_v1。
 parameters:
   - name: module_name
     type: string

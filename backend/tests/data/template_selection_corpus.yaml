@@ -210,6 +210,67 @@ correct_mapping:
     code_type: coverage
     expected_template: cov_protocol_handshake_v1
 
+  - id: cov_axi_arvalid_ready_four_states
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "AXI4 握手四状态覆盖，区别于通用交叉覆盖"
+    intent: "统计 arvalid 和 arready 握手成功、等待、预备、空闲四种场景的覆盖率"
+    code_type: coverage
+    expected_template: cov_protocol_handshake_v1
+
+  # ── 区分对（防回归）────────────────────────────────────────────────────────
+
+  # reset vs fsm: 业务条件触发跳转 → fsm_state_transition
+  - id: fsm_idle_to_active_condition
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "业务条件（valid）触发跳转，不是复位触发，区别于 reset_behavior"
+    intent: "状态机在 IDLE 状态时 valid 拉高必须跳转到 ACTIVE"
+    code_type: assertion
+    expected_template: sva_fsm_state_transition_v1
+
+  - id: fsm_busy_cannot_jump_to_idle
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "非法跳转禁止场景，条件触发，不是复位"
+    intent: "state 不能从 BUSY 直接跳到 IDLE，必须先经过 DRAIN 状态"
+    code_type: assertion
+    expected_template: sva_fsm_state_transition_v1
+
+  # handshake_stable vs handshake_timeout: 数据稳定性场景
+  - id: handshake_wdata_must_not_change
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "握手等待期间数据不变，关注数据保护而非超时"
+    intent: "wvalid 拉高后在 wready 到来前 wdata 不能发生变化"
+    code_type: assertion
+    expected_template: sva_handshake_stable_v1
+
+  - id: handshake_araddr_stable_during_wait
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "地址信号稳定性，握手等待期间 payload 保持不变"
+    intent: "arvalid=1 且 arready=0 期间 araddr 地址总线必须保持稳定"
+    code_type: assertion
+    expected_template: sva_handshake_stable_v1
+
+  # value vs transition coverage 区分
+  - id: cov_fsm_value_not_transition
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "只关注状态值覆盖（哪些状态被访问），不关注转移路径"
+    intent: "统计 pwr_state 信号取到 ON/STANDBY/SLEEP/OFF 各值的覆盖率"
+    code_type: coverage
+    expected_template: cov_value_coverage_v1
+
+  - id: cov_fsm_transition_not_value
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "关注转移路径（从A跳到B），不是单点值域覆盖"
+    intent: "需要验证 ctrl_state 从 INIT 到 READY、从 READY 到 RUN 的跳转路径都被覆盖"
+    code_type: coverage
+    expected_template: cov_transition_coverage_v1
+
   - id: cov_req_ack_combinations
     added: "2026-05-23"
     source: "initial seed"

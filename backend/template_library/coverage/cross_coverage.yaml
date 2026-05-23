@@ -14,7 +14,8 @@ keywords:
   - 组合覆盖
   - corner_case
 description: |
-  对两个信号的值域进行交叉覆盖率统计，用于发现信号组合的未覆盖corner case。
+  对任意两个独立信号的值域进行交叉覆盖率统计，用于发现信号组合的未覆盖 corner case。
+  适用于通用信号对（非协议专用）；若需覆盖 AXI valid/ready 握手的特定场景（握手成功/等待/预备），请使用 cov_protocol_handshake_v1。
 parameters:
   - name: group_name
     type: string

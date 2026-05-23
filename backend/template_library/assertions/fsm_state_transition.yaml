@@ -14,8 +14,21 @@ keywords:
   - 状态转换
   - state
   - transition
+  - 条件跳转
+  - 触发条件
+  - 合法跳转
+  - 非法状态
+  - 状态跳转
+  - 禁止跳转
+  - 跳转到
+  - condition
+  - 当信号满足时
+  - 跳转合法性
 description: |
-  在特定条件下，FSM必须从指定状态转换到目标状态，防止非法状态跳转。
+  在特定业务条件（非复位）满足时，FSM 必须从指定状态跳转到目标状态，防止非法状态转换。
+  触发条件是业务逻辑信号（如 valid、enable、last_beat），而非复位信号。
+  典型场景：IDLE 且 valid=1 时必须跳到 ACTIVE、BUSY 不能直接跳到 IDLE 必须经过 DRAIN。
+  若验证的是"复位释放后状态必须回到初始值"（rst_n 触发），请使用 sva_reset_behavior_v1。
 parameters:
   - name: module_name
     type: string

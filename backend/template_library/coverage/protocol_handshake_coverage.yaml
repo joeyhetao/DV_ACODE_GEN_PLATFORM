@@ -17,8 +17,17 @@ keywords:
   - ready
   - 协议覆盖
   - AXI
+  - AXI握手场景
+  - 握手成功
+  - valid等待
+  - ready预备
+  - 四种握手状态
+  - 握手覆盖率
+  - AXI4握手
 description: |
-  收集Valid/Ready握手协议的关键场景覆盖率，包含握手成功、valid等待、ready预备等场景。
+  收集 AXI4/AXI4-Lite/AXI4-Stream Valid/Ready 握手协议的四种关键场景覆盖率：
+  握手成功（valid=1,ready=1）、valid 等待（valid=1,ready=0）、ready 预备（valid=0,ready=1）、双方空闲（valid=0,ready=0）。
+  本模板专用于 AXI 协议握手场景的专项覆盖；若需对任意两个独立信号做值域交叉覆盖，请使用 cov_cross_coverage_v1。
 parameters:
   - name: group_name
     type: string

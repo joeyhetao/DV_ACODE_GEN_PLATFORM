@@ -13,8 +13,18 @@ keywords:
   - transition
   - FSM
   - 状态机
+  - 转移路径
+  - 状态转移边
+  - 跳转覆盖
+  - 路径覆盖
+  - 从A到B
+  - 相邻状态
+  - 状态迁移
 description: |
-  收集信号值之间的状态转换覆盖率，适用于FSM状态转换完整性验证。
+  收集 FSM 状态之间的转移路径覆盖率（边覆盖）：验证哪些"从状态 A 跳到状态 B"的转移边被触发过。
+  本模板统计的是相邻时刻之间的状态迁移，而非单一时刻的状态取值。
+  典型场景：验证 IDLE→ACTIVE、ACTIVE→DONE、DONE→IDLE 等所有合法转移路径都被测试覆盖。
+  若只需覆盖状态信号在各采样时刻的取值分布（不关心转移路径），请使用 cov_value_coverage_v1。
 parameters:
   - name: group_name
     type: string
