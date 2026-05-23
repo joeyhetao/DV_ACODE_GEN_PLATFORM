@@ -62,6 +62,8 @@ which files to even open.
 - README: touched? which section?
 - CHANGELOG: <type>(<scope>): subject hint
 - CONTRIBUTING: touched? (rare)
+- test-manual: touched? (add test cases for any new user-visible feature — admin UI / pipeline gates / new endpoints)
+- multi-agent-workflow: touched? (workflow-type tickets only)
 
 ## 7. PR Body Template
 
@@ -107,7 +109,7 @@ it to restrict which doc files to read.
 | Key | Type | Required | Notes |
 |---|---|---|---|
 | `ticket` | string | yes | Must match frontmatter `ticket`. |
-| `docs_targets` | array of strings | yes | Subset of `["PRD", "ARCHITECTURE", "README", "CHANGELOG", "CONTRIBUTING"]`. Empty array means "code-only ticket, no docs PR needed" (in that case the docs worktree never gets touched). |
+| `docs_targets` | array of strings | yes | Subset of `["PRD", "ARCHITECTURE", "README", "CHANGELOG", "CONTRIBUTING", "test-manual", "multi-agent-workflow"]`. Empty array means "code-only ticket, no docs PR needed". `test-manual` must be included for any ticket that adds or changes user-visible functionality (admin UI / pipeline gates / new endpoints). `multi-agent-workflow` is for scaffold/workflow-type tickets only. |
 | `changelog.type` | string | yes if `"CHANGELOG"` in `docs_targets` | Conventional-commit type: `feat` \| `fix` \| `docs` \| `chore` \| `refactor` \| `test` \| `perf` \| `ci`. |
 | `changelog.scope` | string | yes if `"CHANGELOG"` in `docs_targets` | Scopes used in this repo: `engine`, `llm`, `template`, `api`, `frontend`, `db`, `deploy`, `auth`, `workflow`. |
 | `affected_paths` | array of strings | yes | Repo-relative POSIX directory paths the coder is expected to touch. ARCH §7 directory-tree update uses this. Empty allowed for pure-docs tickets. |

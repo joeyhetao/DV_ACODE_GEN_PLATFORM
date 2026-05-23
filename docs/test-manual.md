@@ -448,6 +448,95 @@ curl -s -X POST http://localhost/api/v1/contributions \
 2. 看自己提交记录的状态列：`pending_review` / `under_review` / `needs_revision` / `approved` / `rejected`
 3. needs_revision 状态可点「编辑」修改后重提，状态归回 `pending_review`
 
+### §5.4 管理员审核——三层防冲突分析面板（FEAT-4）
+
+> 本节覆盖 FEAT-4 新增的 pre-approve-analysis 流程。普通用户提交贡献的流程不变（§5.1）。
+
+#### §5.4.1 无冲突场景
+
+**前置**：库中已有若干模板；待审核贡献的语义与所有已有模板意图无显著重叠。
+
+**步骤**：
+
+1. lib_admin 账号，进 Admin → 贡献审核，打开待审核贡献的 Drawer
+2. 点「批准并入库」
+3. 按钮变灰，出现 spinner "正在分析…"（预期耗时 3-15s，取决于 LLM 速度）
+4. spinner 消失后，Drawer 底部出现**绿色折叠面板**，显示：
+   - "✅ 无冲突，已生成 N 条回归语料"
+5. 1 秒倒计时后自动确认，可在倒计时期间点「取消」中止
+
+**预期后端日志**（`docker compose logs -f backend | grep corpus`）：
+```
+[corpus] generate_corpus_cases: contribution=<id> template=<name> cases=3
+[corpus] detect_conflicts: checked=<n> conflicts=0
+[corpus] corpus_cases saved: contribution=<id> count=3
+```
+
+**验证 DB**：
+```sql
+SELECT COUNT(*) FROM template_corpus_cases
+WHERE auto_generated_from = '<contribution_id>' AND is_active = true;
+-- 期望：≥ 1
+```
+
+#### §5.4.2 有冲突场景
+
+**前置**：待审核贡献与现有某模板的语义高度相近（如两者都覆盖"复位后寄存器初始值"场景）。
+
+**步骤**：
+
+1. 同上，点「批准并入库」→ spinner
+2. spinner 消失后，Drawer 底部出现**橙色折叠面板**，显示：
+   - "⚠️ 发现 N 条已有意图可能被新模板抢走"
+   - 受影响意图列表（业务描述语言，不含 embedding 分数）
+   - 大模型根因分析（中文，无技术术语）
+   - 建议修改的字段（`description` 或 `keywords`）及建议文本
+3. 操作选项 A：点「**一键应用建议修改**」
+   - 中间列 description / keywords 字段自动填入建议内容
+   - 面板自动重新触发 pre-approve-analysis
+   - 若第二次无冲突，进入 §5.4.1 的绿色面板流程
+4. 操作选项 B：点「**忽略冲突**」
+   - 直接调 approve 端点，忽略冲突继续入库
+   - 审计日志记录"管理员知情忽略冲突"（可在 Admin → 审计日志查到）
+5. 操作选项 C：点「**取消**」
+   - 回到待审核状态，不改变 contribution 状态
+
+**预期后端日志**（`docker compose logs -f backend | grep corpus`）：
+```
+[corpus] generate_corpus_cases: contribution=<id> cases=3
+[corpus] detect_conflicts: checked=<n> conflicts=1
+[corpus] generate_llm_analysis: conflicts=1 recommendation_field=description confidence=0.87
+```
+
+#### §5.4.3 API 直接验证
+
+```bash
+TOKEN=<lib_admin_jwt>
+CID=<contribution_id>
+
+# 触发分析（非破坏性，可重复调用）
+curl -s -X POST http://localhost/api/v1/admin/contributions/$CID/pre-approve-analysis \
+  -H "Authorization: Bearer $TOKEN" | jq .
+
+# 期望响应结构
+# {
+#   "has_conflicts": false,
+#   "conflicts": [],
+#   "new_corpus_preview": ["意图1", "意图2", "意图3"],
+#   "llm_analysis": null,
+#   "recommendation_field": null,
+#   "recommendation_text": null,
+#   "confidence": null,
+#   "analysis_id": "<uuid>"
+# }
+
+# approve 时传 analysis_id（触发语料入库）
+curl -s -X PUT http://localhost/api/v1/admin/contributions/$CID/approve \
+  -H "Authorization: Bearer $TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d "{\"analysis_id\": \"<analysis_id>\"}" | jq .
+```
+
 ---
 
 ## 6. 批量生成

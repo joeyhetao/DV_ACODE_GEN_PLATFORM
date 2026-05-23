@@ -884,7 +884,8 @@ backend/app/
 │   └── contributions.py         # 贡献者端点（提交/查看/修改）及管理员审核端点（合并单文件）
 └── services/platform/
     ├── contribution_service.py  # 贡献入库流水线（调用 create_template()）
-    └── parameter_extractor.py   # v3.0 LLM 反推 parameter_defs + Jinja2 template_body（调 LLMClient.chat）
+    ├── parameter_extractor.py   # v3.0 LLM 反推 parameter_defs + Jinja2 template_body（调 LLMClient.chat）
+    └── corpus_service.py        # FEAT-4 三层模板选择质量保障（语料生成 / 冲突检测 / LLM 根因分析）
 ```
 
 > **注**：贡献者端点与管理员审核端点合并在同一 `contributions.py` 文件中，通过 `require_role` 依赖注入区分权限。所有表结构均在 `migrations/versions/001_initial_schema.py` 初始迁移中统一建立。
@@ -1783,6 +1784,29 @@ WHERE is_default = true;
 
 > 审计日志只写不改，不支持删除，保证操作轨迹完整性。
 
+**template_corpus_cases（模板选择质量语料表，FEAT-4）**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | UUID | 主键 |
+| intent | TEXT | 意图文本（用于 RAG 检索验证） |
+| code_type | VARCHAR(16) | `assertion` / `coverage` |
+| expected_template_id | VARCHAR(32) | 期望命中的模板 ID（FK → templates.id） |
+| source | VARCHAR(32) | `auto_generated`（管理员审核时 LLM 生成）/ `manual`（人工添加）/ `user_report`（用户报告误判） |
+| auto_generated_from | VARCHAR(64) | 来源 contribution_id（仅 `auto_generated` 时填充） |
+| note | TEXT | 备注（可空，说明该用例的添加原因） |
+| is_active | BOOLEAN | 是否参与 CI 回归（默认 true） |
+| created_at | TIMESTAMPTZ | 创建时间 |
+
+与 `backend/tests/data/template_selection_corpus.yaml`（静态语料库）共同构成回归测试基线：
+- 静态 YAML：版本控制，FIX-3 等已知 bug 的种子用例
+- DB 动态表：每次管理员审核新模板时自动生成，持续积累
+
+`corpus_service.py` 三个核心函数：
+- `generate_corpus_cases(contribution, llm, existing_templates)`：LLM 为新模板生成 3 条正例意图 + 每个语义近邻各 1 条反例意图
+- `detect_conflicts(new_template_text, corpus_cases, embedding_client, rag_fn)`：对每条现有语料，比较新模板 embedding 与当前 RAG top-1 分数；若新模板得分更高则标记冲突
+- `generate_llm_analysis(new_template, conflicts, llm)`：生成业务友好的根因分析 + 字段修改建议（不向管理员暴露 embedding 分数）
+
 ### 4.2 Qdrant Collection 结构
 
 | Collection | 用途 |
@@ -1838,7 +1862,8 @@ WHERE is_default = true;
 | PUT | `/api/v1/contributions/{id}` | 修改贡献（仅 needs_revision 状态） | 贡献者本人 |
 | GET | `/api/v1/admin/contributions` | 贡献列表（支持 status/type 过滤） | 库管理员+ |
 | GET | `/api/v1/admin/contributions/{id}` | 贡献详情（含 Excel 行快照 + 查重结果 Top-3） | 库管理员+ |
-| PUT | `/api/v1/admin/contributions/{id}/approve` | 批准并触发入库流水线 | 库管理员+ |
+| POST | `/api/v1/admin/contributions/{id}/pre-approve-analysis` | 批准前分析（非破坏性）：冲突检测 + 语料生成 + LLM 根因分析 | 库管理员+ |
+| PUT | `/api/v1/admin/contributions/{id}/approve` | 批准并触发入库流水线（同时激活 pre-approve 阶段生成的语料） | 库管理员+ |
 | PUT | `/api/v1/admin/contributions/{id}/reject` | 退回，body：`{comment}` | 库管理员+ |
 | PUT | `/api/v1/admin/contributions/{id}/request-revision` | 请求修改，body：`{comment}` | 库管理员+ |
 | GET | `/api/v1/notifications` | 获取当前用户通知列表 | 登录用户+ |
@@ -2083,7 +2108,8 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   ├── platform/                 # 平台功能层（与生成核心完全解耦）
 │   │   │   │   ├── contribution_service.py  # 贡献入库流水线（复用 create_template()）
 │   │   │   │   ├── audit_service.py      # 审计日志写入服务（新增）
-│   │   │   │   └── backup_service.py     # 备份管理服务（新增）
+│   │   │   │   ├── backup_service.py     # 备份管理服务（新增）
+│   │   │   │   └── corpus_service.py     # FEAT-4：语料自动生成 + 冲突检测 + LLM 根因分析
 │   │   │   ├── registry.py               # CodeTypeRegistry（启动时加载 data/code_types/*.yaml，运行时只读）
 │   │   │   └── embedding_client.py       # Embedding Service HTTP 客户端
 │   │   ├── tasks/

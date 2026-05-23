@@ -128,13 +128,35 @@ git status
 
 不要修改 CONTRIBUTING.md 的其他章节（分支策略、提交规范等保持不变）。
 
+### 第四点五步（条件）：更新 docs/test-manual.md
+
+**仅当 `docs_targets` 包含 `"test-manual"` 时执行**，否则跳过。
+
+操作方式：
+1. 读取 handoff JSON 中的 `affected_paths`，判断涉及的功能范围（admin UI / 生成流程 / 新端点 / 新闸逻辑）
+2. 分段读取 `docs/test-manual.md`（先读目录结构，再读受影响章节，避免 token 爆炸）
+3. 在最相关的章节末尾（或新建子章节）追加新功能的测试步骤，格式与现有章节一致：
+   - 步骤编号（1. 2. 3. …）
+   - 每步写明操作 + **预期结果**
+   - 附日志验证命令（`docker compose logs -f backend | grep ...`）
+   - 附 DB 验证 SQL（如涉及新表）
+4. 如新增了 API 端点，在"附录 B：错误响应结构对照"补充新端点的响应格式
+5. 不要修改其他章节的内容和格式
+
 ### 第五步：提交
 
-完成三个文件的修改后，执行：
+完成修改后，执行（按实际修改的文件调整 git add 列表）：
 
 ```bash
-git add README.md CHANGELOG.md CONTRIBUTING.md
-git commit -m "docs: sync README/CHANGELOG/CONTRIBUTING with current project state"
+# 必选（至少有一项有变动）
+git add CHANGELOG.md
+
+# 按需追加
+# git add README.md
+# git add CONTRIBUTING.md
+# git add docs/test-manual.md
+
+git commit -m "docs: sync README/CHANGELOG/CONTRIBUTING/test-manual with current project state"
 ```
 
 ## 注意事项
