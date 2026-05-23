@@ -805,9 +805,16 @@ def _detect_under_specified(
                 if value.strip().lower() in _TRIVIAL_LLM_VALUES:
                     is_low_conf = True
                 elif value == name and param_def.get("default") != name:
-                    # LLM 返字面参数名：模板把它当 default 时是合法（clk default='clk'），
-                    # 否则视为 LLM 弃权（signal default=None 时返 'signal' 是 stub）。
-                    is_low_conf = True
+                    # LLM 返字面参数名：先做 grounding 检查——信号名恰好与参数名相同
+                    # （如 AXI valid/ready）且用户原文中出现该词，视为合法；否则视为 LLM 弃权。
+                    if (
+                        not intent_text
+                        or (
+                            not _llm_value_grounded_in_intent(value, intent_text)
+                            and not _llm_value_in_form_values(value, form_values or [])
+                        )
+                    ):
+                        is_low_conf = True
             # Grounding 检查：LLM 给的值是否在用户原文 **或 form_values** 里出现
             # 跳过：intent_text 为空（mock 单测）/ 已被 trivial 拦下 / 等于模板 default
             if (

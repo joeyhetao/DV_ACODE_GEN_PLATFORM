@@ -1279,14 +1279,35 @@ def test_detect_under_specified_llm_trivial_zero():
 
 
 def test_detect_under_specified_llm_returns_param_name_literal():
-    """LLM 偷懒返字面参数名 → 视为弃权 → 拦（前提：模板默认不是该名字）。
+    """LLM 偷懒返字面参数名且原文中不含该词 → 视为弃权 → 拦（前提：模板默认不是该名字）。
 
-    反例：clk 这种 param_def.default='clk' 时，LLM 返 'clk' 是合法值，不拦——
-    见 test_detect_under_specified_llm_returns_default_aware_name。
+    反例见 test_detect_under_specified_llm_returns_param_name_grounded_in_intent。
     """
     params = {"signal": {"value": "signal", "source": "llm", "required": True}}
     defs = [{"name": "signal", "required": True}]  # default 缺省 None
-    assert [m["name"] for m in _detect_under_specified(params, defs)] == ["signal"]
+    # intent_text 里不含 "signal" 词 → 视为弃权 → 拦
+    assert [m["name"] for m in _detect_under_specified(
+        params, defs, intent_text="FSM 状态信号在 IDLE 时必须等待"
+    )] == ["signal"]
+
+
+def test_detect_under_specified_llm_returns_param_name_grounded_in_intent():
+    """LLM 返字面参数名但该名字出现在用户原文里 → 合法信号名与参数名恰好相同 → 放过。
+
+    真实场景：AXI 协议的 valid/ready 信号名与 cov_protocol_handshake_v1 模板参数名
+    相同。用户输入"统计 valid-ready 握手成功、valid 等待、ready 预备三种场景的覆盖率"，
+    LLM 正确把 valid='valid' / ready='ready'，不应触发 under_specified gate。
+    """
+    params = {
+        "valid": {"value": "valid", "source": "llm", "required": True},
+        "ready": {"value": "ready", "source": "llm", "required": True},
+    }
+    defs = [
+        {"name": "valid", "required": True},   # no default
+        {"name": "ready", "required": True},   # no default
+    ]
+    intent = "统计 valid-ready 握手成功、valid 等待、ready 预备三种场景的覆盖率"
+    assert _detect_under_specified(params, defs, intent_text=intent) == []
 
 
 def test_detect_under_specified_llm_returns_default_aware_name():
