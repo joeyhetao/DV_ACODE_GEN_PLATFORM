@@ -44,8 +44,15 @@ import subprocess
 import sys
 from pathlib import Path
 
+# CHANGELOG.md is intentionally NOT in this regex (WORKFLOW-1 Opt-1).
+# Rationale: every shipping feature/fix PR needs a CHANGELOG entry, and forcing
+# the contributor to detour into the docs worktree for a single-line edit added
+# friction without buying any review value — CHANGELOG entries are append-only
+# and reviewed in the PR itself. PRD / ARCHITECTURE / README / CONTRIBUTING /
+# CLAUDE.md remain protected because they carry semantic load that the
+# code-session coder is not in the right context to revise.
 DOC_REGEX = re.compile(
-    r"^(PRD|ARCHITECTURE|README|CHANGELOG|CONTRIBUTING|CLAUDE)\.md$|^docs/"
+    r"^(PRD|ARCHITECTURE|README|CONTRIBUTING|CLAUDE)\.md$|^docs/"
 )
 CODE_REGEX = re.compile(
     r"^backend/|^frontend/src/|^migrations/|^backend/data/code_types/.*\.yaml$"
@@ -267,6 +274,22 @@ def _block(branch: str, mode: str, ticket: str, hits: list[tuple[str, str]], too
     sys.exit(2)
 
 
+def _audit_changelog_allow(branch: str, mode: str, tool: str, rel: str) -> None:
+    """WORKFLOW-1 Opt-1: emit a stderr audit line when CHANGELOG.md is allowed
+    on a feature/fix branch. Stays narrow on purpose — auditing every allow
+    decision would flood Claude Code's stderr (which is shown to the model on
+    block but otherwise swallowed), so we only flag the specific carve-out
+    that this opt introduced. Format mirrors the BLOCK message in `_block`."""
+    if rel == "CHANGELOG.md" and mode in ("feature", "fix"):
+        from datetime import datetime, timezone
+        ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        print(
+            f"[branch-scope-guard] {ts} branch={branch} mode={mode} tool={tool} "
+            f"path={rel} -> allow (CHANGELOG carve-out)",
+            file=sys.stderr,
+        )
+
+
 def _check_path_tool(payload: dict, repo_root: Path, mode: str, branch: str, ticket: str) -> None:
     file_path = (payload.get("tool_input") or {}).get("file_path", "")
     if not file_path:
@@ -274,8 +297,10 @@ def _check_path_tool(payload: dict, repo_root: Path, mode: str, branch: str, tic
     rel = _resolve_to_repo(file_path, repo_root)
     if rel is None:
         return
+    tool = payload.get("tool_name", "Edit")
     if _violates(rel, mode):
-        _block(branch, mode, ticket, [("file_path", rel)], payload.get("tool_name", "Edit"))
+        _block(branch, mode, ticket, [("file_path", rel)], tool)
+    _audit_changelog_allow(branch, mode, tool, rel)
 
 
 def _check_bash_tool(payload: dict, repo_root: Path, mode: str, branch: str, ticket: str) -> None:
@@ -285,15 +310,24 @@ def _check_bash_tool(payload: dict, repo_root: Path, mode: str, branch: str, tic
 
     candidates = _extract_write_targets(cmd) + _extract_git_targets(cmd, repo_root)
     hits: list[tuple[str, str]] = []
+    audit_candidates: list[str] = []
     for kind, raw in candidates:
         rel = _resolve_to_repo(raw, repo_root)
         if rel is None:
             continue
         if _violates(rel, mode):
             hits.append((kind, rel))
+        else:
+            audit_candidates.append(rel)
 
     if hits:
+        # Block path: don't emit any allow-audit lines — operators reading
+        # stderr should see a clean BLOCK record, not a confusing mix of
+        # "allow (CHANGELOG carve-out)" followed by "BLOCK". _block() exits 2.
         _block(branch, mode, ticket, hits, "Bash")
+
+    for rel in audit_candidates:
+        _audit_changelog_allow(branch, mode, "Bash", rel)
 
 
 def main() -> None:
