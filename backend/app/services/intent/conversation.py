@@ -52,7 +52,7 @@ def _build_system_prompt(
     """
     if rag_candidates:
         candidates_block = "\n\n".join(
-            f"候选 {i+1}：{c['template_id']} — {c['name']}\n"
+            f"候选 {i+1}（相似度 {c['score']:.2f}）：{c['template_id']} — {c['name']}\n"
             f"  描述：{c['description']}\n"
             f"  必填参数：{_format_params(c.get('template'))}"
             for i, c in enumerate(rag_candidates)

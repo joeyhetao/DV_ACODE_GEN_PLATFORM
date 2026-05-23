@@ -78,3 +78,24 @@ class ContributionListOut(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+# ── FEAT-4 Layer 3b：pre-approve-analysis schema ─────────────────────────────
+
+class ConflictItem(BaseModel):
+    """管理员可见的冲突描述（业务语言，不含分数）。"""
+    intent: str
+    current_template_name: str
+    explanation: str
+
+
+class PreApproveAnalysisResult(BaseModel):
+    """POST /contributions/{id}/pre-approve-analysis 响应体。"""
+    has_conflicts: bool
+    conflicts: list[ConflictItem]
+    new_corpus_preview: list[str]           # 意图短语预览（供管理员知情）
+    llm_analysis: str | None = None         # 根因分析（无冲突时为 null）
+    recommendation_field: str | None = None  # "description" | "keywords"
+    recommendation_text: str | None = None   # 建议文本（可一键应用）
+    confidence: float | None = None
+    analysis_id: str                        # Redis key，approve 时关联写 DB

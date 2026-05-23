@@ -14,6 +14,24 @@ export interface ContributionListItem {
   id: string; contributor_id: string; code_type: string; template_name: string; status: string; created_at: string
 }
 
+// FEAT-4 Layer 3b/c: pre-approve-analysis types
+export interface ConflictItem {
+  intent: string
+  current_template_name: string
+  explanation: string
+}
+
+export interface PreApproveAnalysisResult {
+  has_conflicts: boolean
+  conflicts: ConflictItem[]
+  new_corpus_preview: string[]
+  llm_analysis: string | null
+  recommendation_field: string | null
+  recommendation_text: string | null
+  confidence: number | null
+  analysis_id: string
+}
+
 export const contributionsApi = {
   submit: async (data: Record<string, unknown>) => {
     const res = await apiClient.post<Contribution>('/contributions', data)
@@ -35,8 +53,13 @@ export const contributionsApi = {
     const res = await apiClient.get<ContributionListItem[]>('/contributions/admin/all', { params })
     return res.data
   },
-  approve: async (id: string) => {
-    const res = await apiClient.post(`/contributions/${id}/approve`)
+  analyzeConflicts: async (id: string): Promise<PreApproveAnalysisResult> => {
+    const res = await apiClient.post<PreApproveAnalysisResult>(`/contributions/${id}/pre-approve-analysis`)
+    return res.data
+  },
+  approve: async (id: string, analysisId?: string) => {
+    const params = analysisId ? { analysis_id: analysisId } : undefined
+    const res = await apiClient.post(`/contributions/${id}/approve`, undefined, { params })
     return res.data
   },
   reject: async (id: string, comment?: string) => {
