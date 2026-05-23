@@ -126,17 +126,50 @@ backend code review (e.g., docstring conventions) on prose markdown.
 
 ---
 
-## 第四步：把 subagent 的输出转给用户
+## 第四步 (a)：把 subagent 的输出原样转给用户
 
 subagent 返回完整 review report。原样转发给用户，**不要改写、不要总结、不要给"看起来挺好"的安抚**。如果有 critical findings（subagent 用 `🔴` / `Critical:` 标的），把这部分放在前面醒目位置。
 
-最后附一行操作建议：
+`(a)` 与 `(b)` 是两段独立输出 —— `(a)` 必须是 subagent 的原文（不重排、不删减、不"merge similar findings"），`(b)` 是主 session 基于原文的二次分诊。两者拼在同一次回复里，但 `(a)` 在前。
 
-```
+## 第四步 (b)：主 session 三档分诊（WORKFLOW-1 Opt-4）
+
+读完 `(a)` 的原文后，由**主 session 自己**（不再调用 subagent）按以下分类规则把每条 finding 归到三个档位之一，然后追加输出一段名为 `## Severity Triage` 的小节。
+
+| 档位 | 标记 / 关键词 | 释义 |
+|---|---|---|
+| **MUST (阻塞合并)** | subagent 原文里带 `🔴` / `Critical:` / `Security:` / `BUG:` / `BLOCKER:` 的项 | 合并前必须修；不修就是把已知缺陷推进 develop |
+| **SHOULD (强烈建议)** | `🟡` / `Warning:` / `Important:` / "should fix"/"建议修复" 等 | 改了对长期维护友好；不改 PR 仍可合，但要在 PR body 里注明保留原因 |
+| **NIT (可选润色)** | 其他 finding（`🟢` / `Nit:` / "suggestion:" / 文风/命名/微优化） | 真的可选；现 PR 内不改也行 |
+
+输出格式（严格遵守这个模板，便于人眼快速扫一遍就能决定行动）：
+
+```markdown
+---
+
+## Severity Triage
+
+**MUST (阻塞合并)**
+- <subagent 原文里这条 finding 的一句话摘要> — <source: 文件:行号 或 "general">
+- ...
+
+**SHOULD (强烈建议)**
+- ...
+
+**NIT (可选润色)**
+- ...
+
 Next steps:
-  - If findings address: edit code, then rerun /review-pre-pr for a second pass.
-  - If happy with the diff: /commit, then /open-pr <feat|docs>.
+  - 修完 MUST 后再开 PR；SHOULD/NIT 视精力决定，PR body 里注明保留即可。
+  - 如果改了任何 finding：rerun /review-pre-pr 跑第二轮，确认新 diff 不引入回归。
+  - 若 review 全 clean（三档全空）：/commit → /open-pr <feat|docs>。
 ```
+
+分诊原则：
+1. **不改写 subagent 原文**：摘要在 triage 段里，但 `(a)` 区的原文保留不动 —— 用户随时可以回看完整上下文。
+2. **三档可空**：若 subagent 没标 `🔴`，MUST 段就空着写 "(none)"；不要硬塞。
+3. **歧义保守归类**：把握不准的 finding 就上抬一档（warning → MUST 比 critical → SHOULD 安全）。
+4. **不替用户决策**：分诊只是分类 + 建议，是否修、修到什么程度，用户决定。
 
 ---
 
@@ -145,3 +178,5 @@ Next steps:
 - 不要自动修复 subagent 指出的问题 —— 这是 review，不是 refactor。让用户决定改不改。
 - 不要把 diff 写到中间文件再让 subagent 读 —— 直接拼进 prompt。
 - 不要在 `docs/*` 分支跑 full mode —— 浪费 token，且会针对 markdown 误报"安全漏洞"。
+- 不要把 4(b) 的分诊外包给 subagent —— 主 session 直接做。再起一个 subagent 既慢又会重新解释原文，且会把已经原样转给用户的内容再压缩一次。
+- 不要在 4(b) 改写 subagent 的措辞 —— 摘要是为了扫读，不是为了"润色"。一句话一条，源行号附上，足够。
