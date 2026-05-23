@@ -1,10 +1,13 @@
 from __future__ import annotations
+import json
+import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
 from app.core.database import get_db
 from app.core.security import get_current_user, require_role
+from app.core.cache import get_redis
 from app.models.user import User
 from app.models.contribution import TemplateContribution
 from app.schemas.contribution import (
@@ -13,6 +16,8 @@ from app.schemas.contribution import (
     ContributionOut,
     ContributionListOut,
     ContributionReviewAction,
+    ConflictItem,
+    PreApproveAnalysisResult,
 )
 from app.services.llm.factory import get_default_llm_client
 from app.services.platform.contribution_service import (
@@ -27,6 +32,13 @@ from app.services.platform.parameter_extractor import (
     _validate_jinja_rendering,
     _validate_parameter_defs,
 )
+from app.services.platform.corpus_service import (
+    generate_corpus_cases,
+    detect_conflicts,
+    generate_llm_analysis,
+)
+
+_PRE_ANALYSIS_TTL = 60 * 60  # 1h — admin must approve within an hour of running pre-check
 
 router = APIRouter(prefix="/contributions", tags=["contributions"])
 
@@ -258,9 +270,105 @@ async def update_contribution(
     return contribution
 
 
+@router.post("/{contribution_id}/pre-approve-analysis", response_model=PreApproveAnalysisResult)
+async def pre_approve_analysis(
+    contribution_id: str,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(require_role("lib_admin", "super_admin")),
+):
+    """FEAT-4 Layer 3b：管理员点"批准"时先跑此端点做冲突预检。
+
+    步骤：
+    1. 检测新模板是否会抢走现有语料的正确命中（embedding 余弦 + RAG top-1 比较）
+    2. LLM 生成新语料用例（3 条命中新模板 + 最近邻各 1 条）
+    3. 若有冲突，LLM 用业务语言分析根因并给出修改建议
+    4. 所有数据存入 Redis（TTL 1h），approve 端点读取并写 DB
+
+    此端点是非破坏性的（不修改 contribution 状态）。
+    """
+    contribution = await db.get(TemplateContribution, contribution_id)
+    if not contribution:
+        raise HTTPException(status_code=404, detail="贡献不存在")
+
+    llm = await get_default_llm_client(db)
+
+    # 步骤 1：冲突检测
+    conflicts_raw = await detect_conflicts(
+        new_template_name=contribution.template_name,
+        new_template_description=contribution.description,
+        new_template_keywords=contribution.keywords,
+        db=db,
+    )
+
+    # 步骤 2：LLM 生成语料（复用 endpoint 的 db，不在 service 内开新 session）
+    generated = await generate_corpus_cases(
+        contribution_id=contribution.id,
+        contribution_name=contribution.template_name,
+        contribution_description=contribution.description,
+        contribution_code_type=contribution.code_type,
+        keywords=contribution.keywords,
+        tags=None,
+        db=db,
+        llm=llm,
+    )
+
+    # 步骤 3：有冲突时 LLM 分析
+    analysis = None
+    if conflicts_raw:
+        analysis = await generate_llm_analysis(
+            new_template_name=contribution.template_name,
+            new_template_description=contribution.description,
+            conflicts=conflicts_raw,
+            llm=llm,
+        )
+
+    # 步骤 4：存入 Redis（供 approve 端点读取，TTL 1h）
+    analysis_id = str(uuid.uuid4())
+    redis = get_redis()
+    payload = {
+        "contribution_id": contribution_id,
+        "corpus_cases": [
+            {
+                "intent": c.intent,
+                "code_type": c.code_type,
+                "expected_template_id": c.expected_template_id,
+                "note": c.note,
+                "source": c.source,
+            }
+            for c in generated.all_cases
+        ],
+    }
+    await redis.set(f"pre_analysis:{analysis_id}", json.dumps(payload), ex=_PRE_ANALYSIS_TTL)
+
+    # 构造响应（管理员视图：不暴露分数，只暴露业务描述）
+    conflict_items = [
+        ConflictItem(
+            intent=c.intent,
+            current_template_name=c.current_template_name,
+            explanation=(
+                f"此意图当前命中「{c.current_template_name}」，"
+                "新模板的语义与该意图高度相似，可能导致选择反转。"
+            ),
+        )
+        for c in conflicts_raw
+    ]
+
+    return PreApproveAnalysisResult(
+        has_conflicts=bool(conflicts_raw),
+        conflicts=conflict_items,
+        new_corpus_preview=[c.intent for c in generated.for_new_template],
+        llm_analysis=analysis.root_cause if analysis else None,
+        recommendation_field=analysis.recommendation_field if analysis else None,
+        recommendation_text=analysis.recommendation_text if analysis else None,
+        confidence=analysis.confidence if analysis else None,
+        analysis_id=analysis_id,
+    )
+
+
 @router.post("/{contribution_id}/approve")
 async def admin_approve(
     contribution_id: str,
+    analysis_id: str | None = Query(None, description="pre-approve-analysis 返回的 analysis_id，有则写入语料"),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role("lib_admin", "super_admin")),
 ):
@@ -279,6 +387,46 @@ async def admin_approve(
         template_create_fn=_create_template_from_contribution,
     )
     await db.commit()
+
+    # FEAT-4：将预生成的语料写入 DB（analysis_id 有且 Redis 仍有效）
+    # promoted_id 为 None 时（理论上 approve_contribution 已抛错，但兜底防御）
+    # 跳过语料写入，避免 FK 违反静默被吞。
+    if analysis_id and promoted_id:
+        try:
+            redis = get_redis()
+            raw = await redis.get(f"pre_analysis:{analysis_id}")
+            if raw:
+                pre_data = json.loads(raw)
+                if pre_data.get("contribution_id") == contribution_id:
+                    from app.models.template_corpus_case import TemplateCorpusCase
+                    from app.core.database import AsyncSessionLocal
+                    from datetime import datetime, timezone
+                    # 用独立 session + 显式 begin()——
+                    # 1) 不复用 endpoint 的 db（上面已 commit，begin_nested 在已 commit 的 session
+                    #    上是隐式开新 transaction，语义模糊且 FK 错误会被 except 吞掉）
+                    # 2) AsyncSessionLocal.begin() 失败时会自动 rollback，语料失败不影响
+                    #    contribution 已完成的 approve 主事务。
+                    async with AsyncSessionLocal() as corpus_db:
+                        async with corpus_db.begin():
+                            for case in pre_data.get("corpus_cases", []):
+                                tid = case.get("expected_template_id", "")
+                                if tid.startswith("pending_"):
+                                    # 用新 promote 的 template id 替换占位符
+                                    tid = promoted_id
+                                corpus_db.add(TemplateCorpusCase(
+                                    intent=case["intent"],
+                                    code_type=case["code_type"],
+                                    expected_template_id=tid,
+                                    source=case.get("source", "auto_generated"),
+                                    auto_generated_from=contribution_id,
+                                    note=case.get("note"),
+                                    is_active=True,
+                                    created_at=datetime.now(timezone.utc),
+                                ))
+                await redis.delete(f"pre_analysis:{analysis_id}")
+        except Exception as e:
+            print(f"[WARN] corpus case persist failed: {type(e).__name__}: {e}", flush=True)
+
     return {"status": "approved", "promoted_template_id": promoted_id}
 
 
