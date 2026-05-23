@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 > 正在按 PRD v3.0 起草稿实现：意图构建器（IntentBuilder）改为 RAG-grounded 多轮对话；模板贡献向导简化为"name+description+代码示例"由后端 LLM 反推 `parameters` 与 `template_body`；新增 `under_specified` / `code_type_mismatch` 两道 422 闸（详 v2.13 草稿），错误响应附 `redirect_to` 让前端无脑跳转。代码进行中，落地后归集到 [0.7.0]。
 
 ### Changed
+- **4-agent scaffold 5 项人工触点优化**（WORKFLOW-1, #10）：① `branch-scope-guard.py` 放宽 `DOC_REGEX`——`feature/*` / `fix/*` 分支现可直接编辑 `CHANGELOG.md`，每次 allow/block 决策写 stderr 审计日志；② `worktree-init.sh` 解析 spec §8 `docs_targets`——`[]` 时仅建 feat worktree（`--add-docs` 可事后补建 docs worktree）；③ `/commit` 在 `feature/*` 分支 commit 后自动从 `git diff origin/develop..HEAD` 派生 Handoff JSON 的 `affected_paths`、`changelog`、`needs_migration`（`docs_targets` 仍手动填写）；④ `/review-pre-pr` 在转发 subagent 原文后，主 session 追加 MUST / SHOULD / NIT 三档分诊段；⑤ `/open-pr` 开 PR 成功后自动排队 `gh pr merge --auto --squash`，`--no-auto-merge` 提供 opt-out
 - ARCHITECTURE v2.17 → v2.18：先行落地 PRD v3.0 实现细节文档（§3.10 LLM 反推贡献流、§3.11 `normalize_intent` 角色降级 + IntentBuilder `/chat` 多轮对话端点、§3.12 `LLMClient.chat()` 抽象、§3.15.3 `code_type_mismatch` + `under_specified` 闸 + `redirect_to` 字段约定、§5.1 端点表 + §8.4 六个新环境变量）。代码实现仍未提交。
 
 ### Fixed

@@ -54,7 +54,13 @@ cat .claude/settings.json | grep -A 3 PreToolUse
 
 应该看到 `python "$CLAUDE_PROJECT_DIR/scripts/hooks/branch-scope-guard.py"`。没有的话说明设置文件被改坏了，对照 Day-1 PR #1 恢复。
 
-### 1.3 验证 scaffold 安装齐备
+### 1.3 开启 GitHub repo 的 Auto-merge（Opt-5 前置，一次性）
+
+Settings → General → Pull Requests → 勾选 ✅ **Allow auto-merge**
+
+开启后 `/open-pr` 成功开 PR 后会自动运行 `gh pr merge --auto --squash`——无 branch protection 时立即 merge，有 CI 时等 check 通过后自动 merge。已完成此设置可跳过。
+
+### 1.4 验证 scaffold 安装齐备
 
 ```bash
 ls .claude/agents/requirements-analyst.md \
@@ -176,6 +182,15 @@ scripts/worktree-init.sh TICK-X
 
 并自动把 spec.md 复制到两个 worktree 里，seed handoff `.code.md` / `.docs.md` 模板。
 
+**docs_targets=[] 时**（纯代码 ticket），`worktree-init.sh` 只创建 feat worktree，会打印：
+
+```
+[worktree-init] docs_targets=[] — skipping docs worktree.
+                If scope shifts mid-ticket, run: scripts/worktree-init.sh --add-docs TICK-X
+```
+
+阶段 C.5 docs 会话可直接跳过，feature PR merge 后直接清理。
+
 ---
 
 ### 阶段 B：编码（feat 会话）
@@ -215,7 +230,7 @@ feature/TICK-X
 注意 §3 Out 的约束。
 ```
 
-它会读 spec 然后开始改代码。你可以中途打断、修正方向、提问。**branch-scope-guard hook 会阻止它编辑 PRD/ARCH/README/CHANGELOG/CONTRIBUTING** —— 那些是 docs 会话的活，feat 会话改了会 BLOCK 报错。
+它会读 spec 然后开始改代码。你可以中途打断、修正方向、提问。**branch-scope-guard hook 会阻止它编辑 PRD/ARCH/README/CONTRIBUTING/CLAUDE.md 及 `docs/` 目录** —— 那些是 docs 会话的活，feat 会话改了会 BLOCK 报错。**例外**：`CHANGELOG.md` 在 `feature/*` / `fix/*` 分支已放开，coder 可直接追加条目。spec §8 `docs_targets=["CHANGELOG"]` 时走这个快捷路径，不需要单开 docs 会话。
 
 #### B.3 自审
 
@@ -225,25 +240,29 @@ feature/TICK-X
 
 会调起 code-review-expert subagent 对当前 diff（uncommitted + staged）做 6 维 review：correctness / security / performance / style / maintainability / error handling。
 
+Review 报告末尾主 session 自动追加 **Severity Triage** 段（`MUST address before PR` / `SHOULD consider` / `NIT (skip unless trivial)`）——只需看 MUST 列表判断是否有阻塞问题，无需通读整份报告。
+
 按 review 反馈改完后**再跑一遍** `/review-pre-pr` 确认。可以迭代任意次。
 
-#### B.4 填 handoff JSON（**docs_targets 非空时必填**）
+#### B.4 填 handoff JSON（**仅需手动填 docs_targets**）
 
-打开 `.claude/state/TICK-X.code.md`（在主 worktree 的 `.claude/state/` 里），找 `## Handoff JSON` 段，填实际改动：
+**`/commit` 会自动派生并回写** `affected_paths`、`changelog`、`needs_migration` 到 `.claude/state/TICK-X.code.md`。**你只需手动填 `docs_targets`**，因为它是人意图，无法从代码推导。
+
+打开 `.claude/state/TICK-X.code.md`（在主 worktree 的 `.claude/state/` 里），找 `## Handoff JSON` 段，填 `docs_targets`：
 
 ```json
 {
   "ticket": "TICK-X",
   "docs_targets": ["PRD", "ARCHITECTURE", "CHANGELOG"],
   "changelog": { "type": "feat", "scope": "api" },
-  "affected_paths": ["backend/app/api/v1/generate.py"],
+  "affected_paths": [],
   "needs_migration": false
 }
 ```
 
 跟 spec §8 的差别：**handoff 反映实际改动**，spec §8 反映计划。开发中范围漂了，以 handoff 为准。
 
-`docs_targets=[]` 时这步可跳过。
+`docs_targets=[]` 时这步可跳过（`/commit` 自动派生的其余字段已足够）。
 
 #### B.5 commit + 开 PR
 
@@ -259,7 +278,7 @@ feature/TICK-X
 - 拼 title 和 body
 - 调用 `gh pr create`（**此时会弹权限确认框**，看清 title+body 再点允许）
 
-返回 `PR_OPENED: <url>`。
+返回 `PR_OPENED: <url>`，随后自动运行 `gh pr merge --auto --squash`——无 branch protection 时立即 merge，有 CI 时等 check 通过后自动 merge（需 §1.3 已开启 Allow auto-merge）。传 `--no-auto-merge` 跳过此步：`/open-pr feat --no-auto-merge`。
 
 ---
 
@@ -490,3 +509,6 @@ PR 历史：
 - PR #2：Day-2 hook 扩展 Bash 拦截
 - PR #3：Day-3 4-agent scaffold + spec schema
 - PR #4：smoke test ticket（TEST-1，验证整套流程）
+- PR #5：Day-4 operations manual（本手册初版）
+- PR #10：WORKFLOW-1 feat — 5 项 scaffold 优化（branch-scope-guard CHANGELOG 放行 + worktree-init docs-skip + /commit 自动派生 Handoff JSON + /review-pre-pr MUST/SHOULD/NIT 分诊 + /open-pr auto-merge）
+- PR #11（本 PR）：WORKFLOW-1 docs — CHANGELOG 条目 + 本手册同步更新
