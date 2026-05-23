@@ -8,13 +8,24 @@ tags:
   - reset
   - initialization
   - power_on
+  - fsm_reset
+  - state_initialization
 keywords:
   - 复位
   - reset
   - 初始值
   - initialization
+  - 初始状态
+  - 状态寄存器
+  - FSM复位
+  - 状态初始化
+  - cur_state
+  - IDLE
+  - 状态清零
 description: |
   验证复位信号释放后目标信号必须在指定周期内达到初始值，确保正确的复位行为。
+  也适用于 FSM 状态机复位后必须回到初始状态的场景，例如验证 cur_state 在复位
+  释放后必须等于 IDLE、INIT 等枚举值。
 parameters:
   - name: module_name
     type: string
@@ -34,12 +45,12 @@ parameters:
   - name: target
     type: string
     required: true
-    description: 目标信号名
+    description: 目标信号名（数据信号或状态寄存器，如 cur_state、data_out）
     role_hint: data
   - name: init_value
     type: string
     required: true
-    description: 复位后期望的初始值
+    description: 复位后期望的初始值（数值或枚举值，如 0、IDLE、INIT）
     default: "0"
   - name: settle_cycles
     type: integer
