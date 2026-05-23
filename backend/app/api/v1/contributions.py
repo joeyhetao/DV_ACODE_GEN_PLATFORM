@@ -300,7 +300,7 @@ async def pre_approve_analysis(
         db=db,
     )
 
-    # 步骤 2：LLM 生成语料
+    # 步骤 2：LLM 生成语料（复用 endpoint 的 db，不在 service 内开新 session）
     generated = await generate_corpus_cases(
         contribution_id=contribution.id,
         contribution_name=contribution.template_name,
@@ -308,6 +308,7 @@ async def pre_approve_analysis(
         contribution_code_type=contribution.code_type,
         keywords=contribution.keywords,
         tags=None,
+        db=db,
         llm=llm,
     )
 
@@ -388,7 +389,9 @@ async def admin_approve(
     await db.commit()
 
     # FEAT-4：将预生成的语料写入 DB（analysis_id 有且 Redis 仍有效）
-    if analysis_id:
+    # promoted_id 为 None 时（理论上 approve_contribution 已抛错，但兜底防御）
+    # 跳过语料写入，避免 FK 违反静默被吞。
+    if analysis_id and promoted_id:
         try:
             redis = get_redis()
             raw = await redis.get(f"pre_analysis:{analysis_id}")
@@ -396,27 +399,33 @@ async def admin_approve(
                 pre_data = json.loads(raw)
                 if pre_data.get("contribution_id") == contribution_id:
                     from app.models.template_corpus_case import TemplateCorpusCase
+                    from app.core.database import AsyncSessionLocal
                     from datetime import datetime, timezone
-                    async with db.begin_nested():
-                        for case in pre_data.get("corpus_cases", []):
-                            tid = case.get("expected_template_id", "")
-                            if tid.startswith("pending_"):
-                                # 用新 promote 的 template id 替换占位符
-                                tid = promoted_id
-                            db.add(TemplateCorpusCase(
-                                intent=case["intent"],
-                                code_type=case["code_type"],
-                                expected_template_id=tid,
-                                source=case.get("source", "auto_generated"),
-                                auto_generated_from=contribution_id,
-                                note=case.get("note"),
-                                is_active=True,
-                                created_at=datetime.now(timezone.utc),
-                            ))
-                    await db.commit()
+                    # 用独立 session + 显式 begin()——
+                    # 1) 不复用 endpoint 的 db（上面已 commit，begin_nested 在已 commit 的 session
+                    #    上是隐式开新 transaction，语义模糊且 FK 错误会被 except 吞掉）
+                    # 2) AsyncSessionLocal.begin() 失败时会自动 rollback，语料失败不影响
+                    #    contribution 已完成的 approve 主事务。
+                    async with AsyncSessionLocal() as corpus_db:
+                        async with corpus_db.begin():
+                            for case in pre_data.get("corpus_cases", []):
+                                tid = case.get("expected_template_id", "")
+                                if tid.startswith("pending_"):
+                                    # 用新 promote 的 template id 替换占位符
+                                    tid = promoted_id
+                                corpus_db.add(TemplateCorpusCase(
+                                    intent=case["intent"],
+                                    code_type=case["code_type"],
+                                    expected_template_id=tid,
+                                    source=case.get("source", "auto_generated"),
+                                    auto_generated_from=contribution_id,
+                                    note=case.get("note"),
+                                    is_active=True,
+                                    created_at=datetime.now(timezone.utc),
+                                ))
                 await redis.delete(f"pre_analysis:{analysis_id}")
         except Exception as e:
-            print(f"[WARN] corpus case persist failed: {e}", flush=True)
+            print(f"[WARN] corpus case persist failed: {type(e).__name__}: {e}", flush=True)
 
     return {"status": "approved", "promoted_template_id": promoted_id}
 

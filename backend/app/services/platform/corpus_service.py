@@ -200,12 +200,16 @@ async def generate_corpus_cases(
     contribution_code_type: str,
     keywords: list[str] | None,
     tags: list[str] | None,
+    db: AsyncSession,
     llm: LLMClient,
 ) -> GeneratedCorpusCases:
     """LLM 根据新模板信息生成回归语料用例集合。
 
     内部先调 check_semantic_duplicate 找语义最近邻（top-2），
     再让 LLM 生成 3 条命中新模板 + 每邻居 1 条命中邻居的意图。
+
+    `db` 必须由 caller 注入（不要在函数内开 AsyncSessionLocal()）——否则会在
+    endpoint session 仍然持有的情况下再占一条连接池连接，并发压力下打爆 pool。
     """
     from app.services.core.dedup import check_semantic_duplicate
 
@@ -220,24 +224,21 @@ async def generate_corpus_cases(
     # 补全邻居模板名称（check_semantic_duplicate 只返 id + score）
     neighbors: list[dict] = []
     if neighbors_raw:
-        from app.services.platform.parameter_extractor import _VALID_NAME_RE  # noqa: unused but harmless
         from sqlalchemy import select
-        from app.core.database import AsyncSessionLocal
         from app.models.template import Template
-        async with AsyncSessionLocal() as db:
-            ids = [n["template_id"] for n in neighbors_raw if n.get("template_id")]
-            if ids:
-                stmt = select(Template.id, Template.name, Template.description).where(Template.id.in_(ids))
-                rows = (await db.execute(stmt)).all()
-                by_id = {r.id: r for r in rows}
-                for n in neighbors_raw:
-                    row = by_id.get(n["template_id"])
-                    if row:
-                        neighbors.append({
-                            "template_id": row.id,
-                            "name": row.name,
-                            "description": row.description,
-                        })
+        ids = [n["template_id"] for n in neighbors_raw if n.get("template_id")]
+        if ids:
+            stmt = select(Template.id, Template.name, Template.description).where(Template.id.in_(ids))
+            rows = (await db.execute(stmt)).all()
+            by_id = {r.id: r for r in rows}
+            for n in neighbors_raw:
+                row = by_id.get(n["template_id"])
+                if row:
+                    neighbors.append({
+                        "template_id": row.id,
+                        "name": row.name,
+                        "description": row.description,
+                    })
 
     if not neighbors:
         neighbors = [{"template_id": "sva_data_integrity_v1", "name": "数据完整性无损坏断言", "description": "验证数据信号无损坏"}]
@@ -308,8 +309,14 @@ async def detect_conflicts(
                 "expected_template_id": row.expected_template_id,
                 "expected_template_name": row.expected_template_id,
             })
-    except Exception:
-        pass
+    except Exception as e:
+        # 不能静默 —— 表缺失 / 查询失败会让冲突检测只看到静态语料，
+        # 管理员可能看到错误的"无冲突"结果。至少要让运维在日志里能看到。
+        print(
+            f"[WARN] detect_conflicts: failed to load dynamic corpus from DB: "
+            f"{type(e).__name__}: {e}",
+            flush=True,
+        )
 
     conflicts: list[ConflictDetail] = []
 
