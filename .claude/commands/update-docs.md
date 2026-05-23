@@ -1,8 +1,8 @@
 根据项目当前真实进展，更新 README.md、CHANGELOG.md、CONTRIBUTING.md 三份文档。
 
-## 第零步：preflight（docs 分支必须先 rebase）
+## 第零步：preflight（docs 分支自动 rebase）
 
-如果当前分支匹配 `docs/*`，**先运行以下检查**，未通过则立即终止，不要进入第一步：
+如果当前分支匹配 `docs/*`，**先运行以下检查并自动修复**，再进入第一步：
 
 ```bash
 BRANCH=$(git symbolic-ref --short HEAD)
@@ -10,17 +10,22 @@ case "$BRANCH" in
   docs/*)
     git fetch origin develop --quiet
     if ! git merge-base --is-ancestor origin/develop HEAD; then
-      echo "ABORT: '$BRANCH' is not based on latest origin/develop."
-      echo "Run: git rebase origin/develop"
-      echo "Then retry /update-docs. (Without rebase, git log will not"
-      echo "show upstream feature commits and CHANGELOG diff will be stale.)"
-      exit 1
+      echo "[preflight] '$BRANCH' is behind origin/develop — rebasing automatically..."
+      git rebase origin/develop
+      if [ $? -ne 0 ]; then
+        echo "ABORT: rebase failed with conflicts. Resolve manually, then retry /update-docs."
+        exit 1
+      fi
+      echo "[preflight] rebase complete. Proceeding with up-to-date base."
+    else
+      echo "[preflight] branch is up to date with origin/develop."
     fi
     ;;
 esac
 ```
 
-若 abort，向用户输出上述错误信息并停止，不要继续执行后续步骤。
+- **自动 rebase 成功**：直接继续，无需用户干预。
+- **rebase 冲突**（极罕见，仅当 docs 和 feat 改动了同一文档行）：输出错误并终止，需要手动解决冲突后重试。
 
 非 `docs/*` 分支跳过此检查。
 
