@@ -209,6 +209,128 @@ git log --oneline -10
 2. 工作区是否完全清理（`git status --short` 为空验证）
 3. 是否已 push（默认未 push，提示用户如需 push 显式说明）
 
+### 第四点五步：自动填充 Handoff JSON（WORKFLOW-1 Opt-3）
+
+**仅在 `feature/*` 或 `fix/*` 分支执行**；其他分支（`docs/*` / `hotfix/*` / `master` / `develop`）整段跳过。
+
+目的：替代以前手填 `.claude/state/<ticket>.code.md` 的 Handoff JSON 块。
+`/update-specs` 在 docs 会话里会读这个块决定要改哪些文档；docs_targets 仍由用户填，
+其余三个字段（`affected_paths` / `changelog` / `needs_migration`）直接从 git diff 派生。
+
+```bash
+BRANCH=$(git symbolic-ref --short HEAD)
+case "$BRANCH" in
+  feature/*|fix/*) : ;;
+  *) echo "  (handoff-json: branch=$BRANCH not feature/fix — skipping auto-derive)"; exit 0 ;;
+esac
+TICKET="${BRANCH#feature/}"; TICKET="${TICKET#fix/}"
+STATE_FILE=".claude/state/$TICKET.code.md"
+[ -f "$STATE_FILE" ] || { echo "  (handoff-json: $STATE_FILE missing — run scripts/worktree-init.sh first)"; exit 0; }
+
+# 取当前 vs origin/develop 的全部改动文件 + 最后一个 commit subject
+git fetch origin develop --quiet 2>/dev/null || true
+CHANGED_FILES=$(git diff origin/develop..HEAD --name-only | sort -u)
+LAST_SUBJECT=$(git log -1 --format=%s)
+```
+
+派生规则：
+
+| 字段 | 派生方式 |
+|---|---|
+| `affected_paths` | `CHANGED_FILES` 取 top-2 path segments（`backend/app/services/x.py` → `backend/app/`），去重排序 |
+| `changelog.type` | 从 `LAST_SUBJECT` 解析 `^(feat\|fix\|docs\|refactor\|test\|chore\|perf\|ci)(\([^)]*\))?:` 的 type 捕获组；没匹配上回退 `""` |
+| `changelog.scope` | 同上的 scope 捕获组（括号内）；没 scope 回退 `""` |
+| `needs_migration` | `CHANGED_FILES` 里出现 `^migrations/` 或 `^backend/migrations/` 则 `true`，否则 `false` |
+| `docs_targets` | **不动**：保留 state 文件里现有值。spec 阶段已填的就尊重；空就空 |
+| `ticket` | 保留现有值（worktree-init 已写入正确 ticket id） |
+
+用一段 Python 就地替换 `.claude/state/<ticket>.code.md` 里的 `## Handoff JSON` fenced block：
+
+```bash
+python3 - "$STATE_FILE" <<'PY'
+import json, re, subprocess, sys
+state_path = sys.argv[1]
+text = open(state_path, encoding="utf-8").read()
+
+# 锚定到 ## Handoff JSON 这一节（从标题到下一个 ## 或文件末），再在节内找
+# 最后一个 ```json ... ``` 块。`\r?\n` 兼容 Windows CRLF state 文件
+# （VS Code 在 Windows 上保存可能用 CRLF；state 文件 gitignored 不走
+# .gitattributes 规范化）。用"最后一个块"而非"第一个"是为了让用户可以
+# 在 ## Handoff JSON 标题下方添加说明性文字 / 示例块而不破坏自动派生。
+section_m = re.search(
+    r"## Handoff JSON(.*?)(?=\r?\n## |\Z)", text, re.DOTALL
+)
+if not section_m:
+    print(f"  (handoff-json: no '## Handoff JSON' section in {state_path} — leaving unchanged)")
+    sys.exit(0)
+section = section_m.group(0)
+section_start = section_m.start()
+
+# 节内所有 ```json 块；取最后一个作为真正的数据块
+block_iter = list(re.finditer(r"```json\r?\n(.*?)\r?\n```", section, re.DOTALL))
+if not block_iter:
+    print(f"  (handoff-json: no ```json block in '## Handoff JSON' section of {state_path} — leaving unchanged)")
+    sys.exit(0)
+block_m = block_iter[-1]
+body_start = section_start + block_m.start(1)
+body_end = section_start + block_m.end(1)
+body_text = block_m.group(1)
+
+try:
+    existing = json.loads(body_text)
+except json.JSONDecodeError as e:
+    print(f"  (handoff-json: malformed JSON in {state_path}: {e} — leaving unchanged)")
+    sys.exit(0)
+
+# 重新跑 git，避免依赖上面 shell 的变量
+changed = subprocess.check_output(
+    ["git", "diff", "origin/develop..HEAD", "--name-only"], text=True
+).splitlines()
+changed = sorted({l for l in changed if l})
+
+# affected_paths: 把 path 收敛到 top-2 segments 的目录前缀，去重排序。
+# - 深度 1（如 CHANGELOG.md）→ 原值
+# - 深度 2（如 scripts/worktree-init.sh）→ scripts/   ← 不带文件名
+# - 深度 3+（如 backend/app/services/x.py）→ backend/app/
+def top2(p):
+    parts = p.split("/")
+    if len(parts) >= 3:
+        return "/".join(parts[:2]) + "/"
+    if len(parts) == 2:
+        return parts[0] + "/"
+    return p
+affected = sorted({top2(p) for p in changed})
+
+# changelog.type / scope from last commit subject
+subj = subprocess.check_output(["git", "log", "-1", "--format=%s"], text=True).strip()
+mm = re.match(r"^(feat|fix|docs|refactor|test|chore|perf|ci)(?:\(([^)]+)\))?:", subj)
+ctype = mm.group(1) if mm else ""
+cscope = (mm.group(2) or "") if mm else ""
+
+needs_mig = any(p.startswith("migrations/") or p.startswith("backend/migrations/") for p in changed)
+
+existing["affected_paths"] = affected
+existing["changelog"] = {"type": ctype, "scope": cscope}
+existing["needs_migration"] = needs_mig
+# docs_targets / ticket: 不动，保留 existing 里的值
+
+new_block = json.dumps(existing, indent=2, ensure_ascii=False)
+out = text[:body_start] + new_block + text[body_end:]
+open(state_path, "w", encoding="utf-8").write(out)
+print(f"  ✓ handoff-json: updated {state_path}")
+print(f"    affected_paths={affected}")
+print(f"    changelog={{type:{ctype!r}, scope:{cscope!r}}}")
+print(f"    needs_migration={needs_mig}")
+print(f"    docs_targets={existing.get('docs_targets', [])}  (preserved)")
+PY
+```
+
+注意事项：
+- 这一步**不 stage、不 commit** state 文件 —— `.claude/state/` 已经在 `.gitignore`，状态信息只对本机的 docs 会话有用。
+- `docs_targets` 永远不被覆盖。如果用户已经在 spec 里填了 `["CHANGELOG"]`，worktree-init 时它就会被写进 state；本步只读不写它。
+- 如果最后一个 commit subject 不是 conventional 格式（用户传了 `全部合并为一个` 但 subject 自由发挥），`type` / `scope` 会落到 `""`，不报错。
+- 派生失败（state 文件不存在 / json 块缺失）一律 fails-open 打一行提示，不阻塞 `/commit`。
+
 ### 第五步（可选）：push
 
 仅当用户传入 `push` 参数 **或** 提交后明确说"推上去"时执行：
