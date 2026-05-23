@@ -17,8 +17,14 @@ keywords:
   - timeout
   - 握手
   - 超时
+  - AXI
+  - AXI4
+  - valid_ready
+  - 死锁
+  - 协议
 description: |
-  检测Valid信号拉高后Ready信号必须在规定周期内响应，防止死锁或性能退化。
+  专用于 AXI4/AXI4-Lite/AXI4-Stream 的 Valid/Ready 握手协议超时检测：Valid 信号持续拉高直到 Ready 响应，验证 Ready 必须在规定周期内到来，防止死锁或性能退化。
+  本模板适用于 AXI 风格的 valid/ready 协议接口；若验证的是通用 req→ack 时序约束（两个独立边沿事件，非协议握手），请使用 sva_timing_max_delay_v1。
 parameters:
   - name: module_name
     type: string

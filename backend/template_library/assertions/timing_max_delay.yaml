@@ -14,8 +14,20 @@ keywords:
   - latency
   - max_delay
   - 响应时间
+  - req
+  - ack
+  - request
+  - response
+  - 请求
+  - 应答
+  - 不超过
+  - 最大周期数
+  - start_event
+  - end_event
 description: |
-  约束起始事件发生后结束事件必须在指定最大延迟周期内发生，用于验证时序SLA。
+  约束任意起始信号（如 req、start、cmd）拉高后，结束信号（如 ack、done、resp）必须在指定最大延迟周期内响应，用于验证时序 SLA。
+  典型场景：req 拉高到 ack 拉高不超过 N 周期、start 到 done 的流水线延迟约束、command 到 response 的响应时间上限。
+  本模板适用于通用两事件时序约束；若验证的是 AXI4/AXI4-Stream 的 valid/ready 协议握手超时（valid 持续拉高等待 ready），请使用 sva_handshake_timeout_v1。
 parameters:
   - name: module_name
     type: string

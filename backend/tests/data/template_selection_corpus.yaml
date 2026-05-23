@@ -143,6 +143,22 @@ correct_mapping:
     code_type: assertion
     expected_template: sva_timing_max_delay_v1
 
+  - id: timing_req_ack_max_delay_8
+    added: "2026-05-23"
+    source: "FIX-4 bug report"
+    note: "曾被误判为 sva_handshake_timeout_v1；req→ack 是通用时序约束，不是 AXI valid/ready 协议"
+    intent: "从 req 拉高到 ack 拉高的最大延迟不超过 8 个时钟周期"
+    code_type: assertion
+    expected_template: sva_timing_max_delay_v1
+
+  - id: timing_start_to_done_pipeline
+    added: "2026-05-23"
+    source: "FIX-4 seed"
+    note: "流水线 start→done 时序，与握手协议无关"
+    intent: "start 信号置高后 done 必须在 16 个时钟内拉高，验证流水线最大延迟"
+    code_type: assertion
+    expected_template: sva_timing_max_delay_v1
+
   - id: timing_din_to_dout
     added: "2026-05-23"
     source: "initial seed"
