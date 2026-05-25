@@ -13,6 +13,13 @@
 - [3. 缓存层验证](#3-缓存层验证)
 - [4. 意图构建器（IntentBuilder）](#4-意图构建器intentbuilder)
 - [5. 模板贡献机制](#5-模板贡献机制)
+  - [§5.0 两种贡献入口](#50-两种贡献入口)
+  - [§5.1 入口 A：GeneratePage 低置信度场景](#51-入口-a-generatepage-低置信度场景--贡献)
+  - [§5.2 入口 B：「我的贡献」直接提交](#52-入口-b我的贡献--新贡献直接提交)
+  - [§5.3 管理员审核流程](#53-管理员审核流程)
+  - [§5.4 关键拦截路径](#54-关键拦截路径)
+  - [§5.5 我的贡献页状态追踪](#55-我的贡献页状态追踪)
+  - [§5.6 管理员三层防冲突面板](#56-管理员三层防冲突分析面板feat-4)
 - [6. 批量生成](#6-批量生成)
 - [7. 模板库浏览与管理](#7-模板库浏览与管理)
 - [8. 用户与权限](#8-用户与权限)
@@ -372,49 +379,160 @@ curl -s -w "HTTP %{http_code}\n" \
 
 ## 5. 模板贡献机制
 
-### §5.1 完整流程（4 字段提交 → LLM 反推 → 审核 → 入库）
+### §5.0 两种贡献入口
 
-#### 步骤
+| 入口 | 触发时机 | 表单预填 |
+|---|---|---|
+| **A：GeneratePage → IntentBuilder → 建议贡献** | IntentBuilder 连续 5 轮 RAG top-1 < 0.5，平台判断库内无匹配 | `description` 由 accumulated_intent 预填；`code_type` 由会话携带 |
+| **B：「我的贡献」→「+ 新贡献」** | 用户主动发起 | 全部手填 |
 
-1. 普通用户在 GeneratePage 触发低置信度场景，或通过「我的贡献」页 +「+ 新贡献」入口
-2. 弹出提交 Modal（v3.0 简化为 4 字段）：
-   - 模板名称
-   - 代码类型（assertion / coverage）
-   - 验证场景描述（自然语言，用于 RAG 匹配）
-   - 代码示例（粘贴含真实信号名的可运行 SV 代码）
-3. 点「提交，由 AI 协助参数化」
-4. 后端同步跑（5-15s）：
-   - LLM 反推 parameter_defs / Jinja body / keywords / subcategory / protocol
-   - 3 道自动校验：参数名合法 / Jinja2 沙箱渲染通过 / keywords 格式
-   - 语义查重把 top-3 相似模板塞 `original_row_json.similar_templates`
-5. 期望成功响应：HTTP 201 + `status: "pending_review"` + 自动反推的 `parameter_defs / keywords / subcategory / protocol`
+两个入口最终进入相同的 4 字段提交表单：`template_name / code_type / description / demo_code`。提交后后端同步跑（5-15s）LLM 反推 + 3 道自动校验，成功返 HTTP 201，失败返 422。
 
-#### 进入审核
+---
 
-6. 切换到 lib_admin 账号（或 super_admin）
-7. 进 Admin → 贡献审核
-8. 看到刚提交的贡献，点击展开审核 Drawer（90% 宽三栏布局）：
-   - 左栏（只读）：用户提交 — 模板名、code_type、场景描述、原始代码示例
-   - 中栏（可编辑）：LLM 反推的 Jinja2 模板（Monaco 高亮）
-   - 右栏（可编辑）：parameter_defs JSON / keywords / subcategory / protocol
-9. 验证 `similar_templates`（如果有）：贡献提交时把库内相似 top-3 塞了 `original_row_json`，审核员可在这里看到
-10. 审核员可任意修改中/右栏；改完点「保存编辑」
-11. 改 demo_code / parameter_defs 后保存时**自动重跑** jinja 二次校验，失败拒提交
+### §5.1 入口 A：GeneratePage 低置信度场景 → 贡献
 
-#### 批准入库
+#### 用例：背压流控覆盖率（库内暂无匹配模板）
 
-12. 点「批准并入库」
-13. 期望：HTTP 200 + 自动分配 `promoted_template_id`（形如 `contrib_<8hex>`）
-14. 进「模板库」页，能看到新入库模板（maturity=draft）
-15. 此后用相关意图 preview，可命中该模板
+| 步骤 | 操作 | 期望 |
+|---|---|---|
+| 1 | GeneratePage 输入 `统计背压信号 bp_n 拉低时 tx_valid 是否真的暂停，覆盖四种组合场景`，code_type 选 UVM 覆盖率，点「分析意图」 | pipeline 返回 under_specified 或 empty_retrieval → 自动跳 IntentBuilder |
+| 2 | IntentBuilder 内连续对话，描述场景细节 | 右侧 RAG 候选 card 相似度持续 < 50%（橙/红色百分比标签） |
+| 3 | 连续 5 轮后底部出现橙色「贡献新模板」按钮 | `suggest_contribute: true` |
+| 4 | 点「贡献新模板」 | 跳转提交表单，`description` 预填 accumulated_intent，`code_type=coverage` |
+| 5 | 填写模板名称（如 `背压流控覆盖率`），粘贴下方 demo_code，点提交 | HTTP 201 + `status: pending_review` + LLM 反推的 `parameter_defs` 含 `clk / bp_n / tx_valid / group_name` |
 
-### §5.2 关键拦截路径
+#### 提交 demo_code 示例（入口 A）
 
-#### §5.2.1 重复模板名 → 422
+```systemverilog
+// 背压流控覆盖率：统计 bp_n 拉低（施压）时 tx_valid 的四种组合场景
+covergroup cg_backpressure @(posedge clk);
+  option.per_instance = 1;
+  option.comment = "背压流控场景覆盖";
+
+  cp_bp: coverpoint bp_n {
+    bins asserted   = {0};   // downstream 施压
+    bins deasserted = {1};   // 正常传输
+  }
+
+  cp_tx: coverpoint tx_valid {
+    bins sending = {1};
+    bins idle    = {0};
+  }
+
+  cx_bp_x_tx: cross cp_bp, cp_tx {
+    bins normal_tx   = binsof(cp_bp.deasserted) && binsof(cp_tx.sending);   // 正常发送
+    bins bp_paused   = binsof(cp_bp.asserted)   && binsof(cp_tx.idle);      // 背压暂停（期望行为）
+    bins bp_violated = binsof(cp_bp.asserted)   && binsof(cp_tx.sending);   // 背压违例（bug 场景）
+    bins both_idle   = binsof(cp_bp.deasserted) && binsof(cp_tx.idle);      // 双方空闲
+  }
+
+endgroup
+
+cg_backpressure cg_bp_inst = new();
+```
+
+---
+
+### §5.2 入口 B：「我的贡献」→「+ 新贡献」直接提交
+
+#### 用例：寄存器写后读一致性断言（用户主动贡献）
+
+| 步骤 | 操作 | 期望 |
+|---|---|---|
+| 1 | 左侧导航进「我的贡献」，点右上角「+ 新贡献」 | 弹出 4 字段提交 Modal |
+| 2 | **模板名称**：`寄存器写后读一致性断言`<br>**代码类型**：SVA 断言<br>**场景描述**：`写使能有效后，下一拍读同地址返回的数据必须与写入值相同，检测 RTL 写穿或旁路逻辑错误`<br>**代码示例**：粘贴下方 demo_code | — |
+| 3 | 点「提交，由 AI 协助参数化」（5-15s） | HTTP 201 + `parameter_defs` 含 `clk / rst_n / wr_en / wr_addr / rd_addr / wr_data / rd_data`；`keywords` 含"写后读"、"一致性"；`subcategory` ≈ `data_integrity` |
+
+#### 提交 demo_code 示例（入口 B）
+
+```systemverilog
+// 写后读一致性：wr_en 有效且地址相同时，下一拍 rd_data 必须等于写入值
+property p_reg_wr_rd_consistency;
+  @(posedge clk) disable iff (!rst_n)
+  (wr_en && (wr_addr == rd_addr)) |=> (rd_data == $past(wr_data));
+endproperty
+
+a_reg_wr_rd_consistency: assert property(p_reg_wr_rd_consistency)
+  else $error("[WR_RD] 一致性违例：rd_data=%0h expected=%0h addr=%0h",
+              rd_data, $past(wr_data), rd_addr);
+```
+
+**验证后端日志**：
+
+```bash
+docker compose logs backend | grep -E "\[contribution\]|\[param_extract\]" | tail -20
+```
+
+---
+
+### §5.3 管理员审核流程
+
+> 角色：`lib_admin` 或 `super_admin`，入口：Admin → 贡献审核 → 点击记录展开 Drawer（三列布局）。
+
+#### Drawer 三列说明
+
+| 列 | 内容 | 可编辑 |
+|---|---|---|
+| 左列 | 用户提交原文：模板名、code_type、场景描述、原始 demo_code | 只读 |
+| 中列 | LLM 反推的 Jinja2 模板体（Monaco 高亮） | ✅ 可直接编辑 |
+| 右列 | parameter_defs JSON / keywords / subcategory / protocol | ✅ 可直接编辑 |
+
+#### 审核决策树
+
+```
+打开 Drawer
+│
+├─ [左列] 用户意图是否属于 IC 验证范围？
+│    └─ 否（FPGA 烧写 / Python 脚本等） → 「拒绝」并填 reason，流程结束
+│
+├─ [中列] Jinja2 模板体检查
+│    ├─ {{ 变量 }} 占位符是否覆盖所有应参数化的信号名？
+│    ├─ SV 语法结构是否正确（covergroup/property/endgroup 匹配）？
+│    └─ 若有问题 → 在 Monaco 编辑器修改后点「保存编辑」（自动触发沙箱二次校验）
+│
+├─ [右列] parameter_defs / keywords 检查
+│    ├─ 参数名是否 snake_case，无 SV/Python 保留字（module/always/class…）？
+│    ├─ required/default/description/role_hint 是否准确？
+│    ├─ 中间列 {{ var }} 与右列 parameter_defs 的 name 是否一一对应？
+│    └─ 若有问题 → 在 JSON 编辑器内修改
+│
+├─ 点「批准并入库」→ 触发 pre-approve-analysis（详见 §5.6）
+│    ├─ 无冲突 → 绿色面板 → 1s 后自动入库
+│    └─ 有冲突 → 橙色面板 → 三选一：一键应用建议 / 忽略冲突 / 取消
+│
+└─ 整体质量差（demo 过于模糊，LLM 参数化错误率高）
+     └─ 「请求修改」→ 填具体反馈 → 状态改为 needs_revision
+          └─ 用户在「我的贡献」页修改 demo_code 后重提
+```
+
+#### 审核要点速查
+
+| 检查项 | 绿灯（可批准）| 红灯（需修改 / 拒绝）|
+|---|---|---|
+| Jinja2 渲染 | 沙箱渲染通过，无 StrictUndefined | 含未定义变量 / dunder 访问 / 语法错误 |
+| 参数名合法性 | 全 snake_case，无保留字 | 出现 `module` / `always` / `class` 等 |
+| 占位符完整性 | 模板中所有 `{{ var }}` 在 parameter_defs 中有对应 `name` | `{{ signal }}` 在右列叫 `sig`（名称不一致）|
+| 信号名参数化 | 原 demo 中的具体信号名（如 `bp_n`）已替换为 `{{ bp_signal }}` | 硬编码信号名残留模板体中 |
+| 语义重叠 | pre-approve-analysis 无冲突，或建议修改后降至可接受 | 与已有模板 embedding 相似度 > 0.85 且描述无差异化 |
+
+#### 请求修改时的反馈建议
+
+反馈应指向具体问题，例如：
+
+> "LLM 把 wr_addr 和 rd_addr 合并成一个 addr 参数，请在 demo_code 里用不同名称区分，并在描述中说明地址必须相等的条件。"
+
+> "模板体中 tx_valid 被硬编码，请在场景描述里明确写出该信号名，让 LLM 能识别为参数。"
+
+---
+
+### §5.4 关键拦截路径
+
+#### §5.4.1 重复模板名 → 422
 
 提交时 `template_name` 与已入库 Template 重名 → HTTP 422 `contribution_name_duplicate`。
 
-#### §5.2.2 demo_code 太烂 → LLM 反推失败 → 422
+#### §5.4.2 demo_code 太烂 → LLM 反推失败 → 422
 
 ```bash
 # 故意提交 garbage demo_code
@@ -426,29 +544,29 @@ curl -s -X POST http://localhost/api/v1/contributions \
 
 期望：HTTP 422 + `detail.type="contribution_parse_failed"` + `detail.stage="param_defs_empty"`（或类似）。
 
-#### §5.2.3 SSTI payload 提交时被拦
+#### §5.4.3 SSTI payload 提交时被拦
 
 提交 demo_code 含 `{{ self.__class__.__bases__ }}` 这类 dunder 访问 → Sandbox 渲染失败 → 422 stage=`jinja_sandbox`。
 
-#### §5.2.4 审核员 PATCH 后二次校验
+#### §5.4.4 审核员 PATCH 后二次校验
 
 审核员把 demo_code 改成含 SSTI 的 Jinja2 → PATCH 端点二次跑 sandbox 渲染 → 422 拒 commit，原数据不变。
 
-#### §5.2.5 demo_code / description 超长拒
+#### §5.4.5 demo_code / description 超长拒
 
 `demo_code > 32KB` 或 `description > 4KB` → Pydantic 拒 422 `string_too_long`。
 
-#### §5.2.6 SV / Python 关键字作参数名拒
+#### §5.4.6 SV / Python 关键字作参数名拒
 
 若 LLM 反推产出 `always` / `class` / `module` 等关键字作 parameter name → 拒，stage=`param_defs_name`。
 
-### §5.3 我的贡献页
+### §5.5 我的贡献页状态追踪
 
 1. 普通用户进「我的贡献」
 2. 看自己提交记录的状态列：`pending_review` / `under_review` / `needs_revision` / `approved` / `rejected`
 3. needs_revision 状态可点「编辑」修改后重提，状态归回 `pending_review`
 
-### §5.4 管理员审核——三层防冲突分析面板（FEAT-4）
+### §5.6 管理员三层防冲突分析面板（FEAT-4）
 
 > 本节覆盖 FEAT-4 新增的 pre-approve-analysis 流程。普通用户提交贡献的流程不变（§5.1）。
 
