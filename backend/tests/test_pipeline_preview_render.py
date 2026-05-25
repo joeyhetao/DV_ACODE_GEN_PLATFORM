@@ -656,13 +656,15 @@ async def test_pipeline_preview_marginal_intent_falls_back_with_llm_confidence()
 @pytest.mark.asyncio
 async def test_pipeline_preview_off_topic_gate_disabled_skips_check():
     """offtopic_gate_enabled=False → 即使 dense 分数低于阈值，也跳过闸继续走老路径。
-    紧急逃生通道：若阈值校准误调或语料缺失导致大面积误拒，可立即关闸。"""
+    紧急逃生通道：若阈值校准误调或语料缺失导致大面积误拒，可立即关闸。
+    RAG score 用 0.70（>= no_match_score_threshold=0.60），避免触发第五道闸（与本测试无关）。
+    """
     fake_db_template = MagicMock()
     fake_db_template.parameters = []
     fake_db_template.id = "sva_data_integrity_v1"
     fake_db_template.name = "Template sva_data_integrity_v1"
     fake_db_template.version = "1.0.0"
-    rag = [_make_rag_candidate("sva_data_integrity_v1", score=0.5)]
+    rag = [_make_rag_candidate("sva_data_integrity_v1", score=0.70)]
     llm_refused = TemplateSelectionOutput(template_id="", param_mapping={}, confidence=0.0)
 
     from app.core.config import get_settings
@@ -1681,3 +1683,79 @@ async def test_fix2_fsm_intent_ungrounded_module_name_falls_to_default():
         f"expected module_name=dut from template default, got {module_meta}"
     assert module_meta["source"] == "default", \
         f"expected source=default, got source={module_meta['source']}"
+
+
+# ── 第五道闸：no_matching_template gate ─────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_no_matching_template_gate_fires_when_rag_fallback_low_score():
+    """confidence_source=rag_fallback + RAG top-1 score < 0.60 → NoMatchingTemplateError。
+
+    场景：LLM step1 返回 "none"（db.get 找不到对应模板），rag_fallback 生效，
+    但 top-1 score=0.45 低于阈值 → 库内无此场景，直接引导贡献。
+    redirect_to 应以 /contribute/new? 开头，携带 description 和 code_type。
+    """
+    from app.services.core.pipeline import NoMatchingTemplateError
+
+    rag = [_make_rag_candidate("some_template", score=0.45)]
+    # LLM 选 "none" → db.get("none") 返 None → rag_fallback
+    llm_sel = TemplateSelectionOutput(template_id="none", param_mapping={}, confidence=0.3)
+
+    fake_rag_tmpl = MagicMock()
+    fake_rag_tmpl.parameters = []
+    fake_rag_tmpl.id = "some_template"
+    fake_rag_tmpl.name = "Some Template"
+    fake_rag_tmpl.version = "1.0.0"
+
+    # db.get("none") → None；db.get("some_template") → fake_rag_tmpl
+    def _db_get_side_effect(model, id_):
+        if id_ == "some_template":
+            return fake_rag_tmpl
+        return None
+
+    stack, fake_db = _patch_preview_deps(rag, llm_sel)
+    fake_db.get = AsyncMock(side_effect=_db_get_side_effect)
+
+    with stack, pytest.raises(NoMatchingTemplateError) as excinfo:
+        await pipeline_preview(_make_preview_inp("统计背压信号 bp_n 拉低时 tx_valid 是否暂停"), fake_db)
+
+    err = excinfo.value
+    assert err.detector == "no_matching_template"
+    assert err.top_score == pytest.approx(0.45)
+    assert err.redirect_to.startswith("/contribute/new?")
+    assert "description=" in err.redirect_to
+    assert "code_type=" in err.redirect_to
+
+
+@pytest.mark.asyncio
+async def test_no_matching_template_gate_skipped_when_rag_score_high():
+    """confidence_source=rag_fallback + RAG top-1 score >= 0.60 → 闸不触发，走正常流程。
+
+    场景：LLM 返 "none" 但 RAG top-1 score=0.72（较高）→ 说明库内可能有相关模板，
+    只是描述模糊 → 不应跳贡献页，应让 rag_fallback 流程继续（可能走 under_specified）。
+    """
+    from app.services.core.pipeline import NoMatchingTemplateError
+
+    rag = [_make_rag_candidate("cov_transition_coverage_v1", score=0.72)]
+    llm_sel = TemplateSelectionOutput(template_id="none", param_mapping={}, confidence=0.4)
+
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = []
+    fake_tmpl.id = "cov_transition_coverage_v1"
+    fake_tmpl.name = "状态转换覆盖率组"
+    fake_tmpl.version = "1.0.0"
+
+    def _db_get_side_effect(model, id_):
+        if id_ == "cov_transition_coverage_v1":
+            return fake_tmpl
+        return None
+
+    stack, fake_db = _patch_preview_deps(rag, llm_sel)
+    fake_db.get = AsyncMock(side_effect=_db_get_side_effect)
+
+    # 不应抛 NoMatchingTemplateError；正常返回（无必填参数，无 under_specified）
+    with stack:
+        result = await pipeline_preview(_make_preview_inp("生成一个 FSM 转换覆盖率"), fake_db)
+
+    assert result.template_id == "cov_transition_coverage_v1"
+    assert result.confidence_source == "rag_fallback"

@@ -424,12 +424,25 @@ type UnderSpecifiedDetail = {
   missing_params: MissingParam[]
   redirect_to?: string | null
 }
-type ApiErrorDetail = string | OffTopicDetail | CodeTypeMismatchDetail | UnderSpecifiedDetail | undefined
+type NoMatchingTemplateDetail = {
+  type: 'no_matching_template'
+  message: string
+  top_score: number
+  redirect_to: string
+}
+type ApiErrorDetail = string | OffTopicDetail | CodeTypeMismatchDetail | UnderSpecifiedDetail | NoMatchingTemplateDetail | undefined
 
 function handleApiError(e: unknown, fallbackMsg: string, navigate?: NavigateFunction): void {
   const err = e as { response?: { status?: number; data?: { detail?: ApiErrorDetail } } }
   const detail = err.response?.data?.detail
   const status = err.response?.status
+
+  // 第五道闸：库内无匹配模板，先提示再跳贡献页（在通用 redirect_to 检查之前处理，以便显示 toast）
+  if (detail && typeof detail === 'object' && detail.type === 'no_matching_template') {
+    message.info('库内暂无匹配模板，跳转至贡献页面帮助完善模板库')
+    if (navigate && 'redirect_to' in detail && detail.redirect_to) navigate(detail.redirect_to)
+    return
+  }
 
   // v3.0：detail.redirect_to 优先于一切——后端明示前端应跳转的路由，前端无脑 router.push
   // off_topic / code_type_mismatch / empty_retrieval 三种 detail.redirect_to=null 不触发本分支

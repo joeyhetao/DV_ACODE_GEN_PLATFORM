@@ -26,6 +26,7 @@ from app.services.core.pipeline import (
     EmptyRetrievalError,
     CodeTypeMismatchError,
     UnderSpecifiedIntentError,
+    NoMatchingTemplateError,
     PipelineInput,
     RenderInput,
     run_pipeline,
@@ -70,6 +71,21 @@ def _code_type_mismatch_detail(e: CodeTypeMismatchError) -> dict:
         "selected_score": round(e.selected_score, 4),
         "suggested_score": round(e.suggested_score, 4),
         "redirect_to": None,
+    }
+
+
+def _no_matching_template_detail(e: NoMatchingTemplateError) -> dict:
+    # 第五道闸：库内无此场景模板，redirect_to 直接跳贡献页（携带 description + code_type）
+    intent_preview = e.original_intent[:40] + ("…" if len(e.original_intent) > 40 else "")
+    return {
+        "type": "no_matching_template",
+        "message": (
+            f"库内暂无与「{intent_preview}」匹配的模板（最近候选相似度 {e.top_score:.2f}）。"
+            "欢迎贡献该验证场景，丰富模板库。"
+        ),
+        "detector": e.detector,
+        "top_score": round(e.top_score, 4),
+        "redirect_to": e.redirect_to,
     }
 
 
@@ -127,6 +143,8 @@ async def generate(
         raise HTTPException(status_code=422, detail=_code_type_mismatch_detail(e))
     except UnderSpecifiedIntentError as e:
         raise HTTPException(status_code=422, detail=_under_specified_detail(e))
+    except NoMatchingTemplateError as e:
+        raise HTTPException(status_code=422, detail=_no_matching_template_detail(e))
     except EmptyRetrievalError as e:
         raise HTTPException(status_code=503, detail=_empty_retrieval_detail(e))
     except ValueError as e:
@@ -230,6 +248,8 @@ async def preview(
         raise HTTPException(status_code=422, detail=_code_type_mismatch_detail(e))
     except UnderSpecifiedIntentError as e:
         raise HTTPException(status_code=422, detail=_under_specified_detail(e))
+    except NoMatchingTemplateError as e:
+        raise HTTPException(status_code=422, detail=_no_matching_template_detail(e))
     except EmptyRetrievalError as e:
         raise HTTPException(status_code=503, detail=_empty_retrieval_detail(e))
     except ValueError as e:
