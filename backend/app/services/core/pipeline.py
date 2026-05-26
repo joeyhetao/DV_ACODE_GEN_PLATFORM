@@ -88,11 +88,12 @@ class EmptyRetrievalError(RuntimeError):
 
 
 class NoMatchingTemplateError(ValueError):
-    """LLM step1 明确拒绝所有 RAG 候选（confidence_source=rag_fallback）且 top-1 分数低 ——
+    """LLM step1 明确拒绝所有 RAG 候选（confidence_source=rag_fallback）——
     库内暂无此验证场景的模板，引导用户贡献新模板而非让其在 IntentBuilder 里无意义对话 5 轮。
 
-    触发条件：confidence_source=="rag_fallback" AND rag_candidates[0]["score"] < threshold。
-    阈值由 NO_MATCH_SCORE_THRESHOLD 环境变量控制（默认 0.60）。
+    触发条件：LLM step1 明确拒绝所有 RAG 候选（confidence_source=="rag_fallback"）即触发。
+    top_score 仅供日志/监控参考，不再参与触发判断（cross-encoder 词汇重叠可对
+    语义不相关模板给高分，故只信 LLM 判断）。
     NO_MATCH_GATE_ENABLED=false 一键关闸，退回旧 rag_fallback → under_specified 流程。
     """
     def __init__(self, original_intent: str, code_type: str, top_score: float):
@@ -106,7 +107,7 @@ class NoMatchingTemplateError(ValueError):
         params.append(f"code_type={quote(code_type)}")
         self.redirect_to = "/contribute/new?" + "&".join(params)
         super().__init__(
-            f"库内无匹配模板（top_score={top_score:.2f} < threshold），建议贡献新模板"
+            f"库内无匹配模板（top_score={top_score:.2f}），建议贡献新模板"
         )
 
 
@@ -408,19 +409,19 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
             )
             confidence_source = "rag_fallback"
 
-    # 第五道闸：LLM 明确拒绝所有候选（rag_fallback）且 RAG top-1 分数也低 →
-    # 库内暂无此场景模板，直接引导贡献，省去无意义的 5 轮 IntentBuilder 对话。
+    # 第五道闸：LLM 明确拒绝所有候选（rag_fallback）→ 库内暂无此场景模板，
+    # 直接引导贡献，省去无意义的 5 轮 IntentBuilder 对话。
     # 与 under_specified 的区别：under_specified = 模板已识别但参数不全；
     # no_matching_template = 连模板本身都没有高置信命中。
+    # FIX-9：去掉 RAG score 阈值条件——cross-encoder 词汇重叠会给语义不相关模板
+    # 1.0 分（如 cpu_req/dma_req 互斥意图命中含 req 关键词的握手模板），
+    # score 阈值反而否决 LLM 正确的 none 判断。只信 LLM step1。
     if (
         confidence_source == "rag_fallback"
         and settings.no_match_gate_enabled
-        and rag_candidates
-        and rag_candidates[0]["score"] < settings.no_match_score_threshold
     ):
         print(
-            f"[Gate] no_matching_template: top_score={rag_candidates[0]['score']:.3f} "
-            f"< threshold={settings.no_match_score_threshold}",
+            f"[Gate] no_matching_template: top_score={rag_candidates[0]['score']:.4f}",
             flush=True,
         )
         raise NoMatchingTemplateError(

@@ -62,9 +62,12 @@ class Settings(BaseSettings):
     under_specified_gate_enabled: bool = True
 
     # No-matching-template 闸（第五道闸）：LLM step1 明确拒绝所有候选（rag_fallback）
-    # 且 RAG top-1 reranker 分数 < threshold → 库内无此场景，直接跳贡献页省去 5 轮无效对话。
-    # threshold 作用于 cross-encoder reranker 输出（非 dense embedding 分数）。
+    # 即触发，直接跳贡献页省去 5 轮无效对话。
+    # FIX-9：去掉 RAG top-1 分数阈值条件——cross-encoder 词汇重叠会给语义不相关模板
+    # 高分（如 cpu_req/dma_req 互斥意图命中含 req 关键词的握手模板得 1.0），
+    # score 阈值反而否决 LLM 正确的 none 判断。只信 LLM step1。
     # 关闸：NO_MATCH_GATE_ENABLED=false 退回旧 rag_fallback → under_specified 流程。
+    # no_match_score_threshold 保留供日志/监控参考及潜在未来用途，不再参与闸判断。
     no_match_gate_enabled: bool = True
     no_match_score_threshold: float = 0.60
 
