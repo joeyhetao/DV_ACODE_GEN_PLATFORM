@@ -209,6 +209,17 @@ echo $TOKEN
 | code_type | UVM 覆盖率 |
 | 期望模板 | `cov_value_coverage_v1` 信号值域覆盖率组 |
 
+### §1.11 背压流控交叉覆盖率组
+
+| | |
+|---|---|
+| 输入 | `统计背压信号 bp_n 拉低时 tx_valid 是否真的暂停，覆盖四种组合场景` |
+| code_type | UVM 覆盖率 |
+| 期望模板 | `cov_cross_coverage_v1` 交叉覆盖率组 |
+| 参数 | signal_a=`bp_n`（LLM）/ signal_b=`tx_valid`（LLM）/ group_name=`cross`（默认）/ bins_a=`{0, 1}`（LLM）/ bins_b=`{0, 1}`（LLM）|
+| confidence_source | `llm_step1`（LLM 主动选中，置信度 ≥ 85%）|
+| 备注 | 背压流控语义与交叉覆盖率模板高度匹配；**不触发**第五道闸，直接进 ConfirmationPanel |
+
 ---
 
 ## 2. 单条生成 — 5 道闸触发
@@ -421,42 +432,27 @@ curl -s -w "HTTP %{http_code}\n" \
 
 ### §5.1 入口 A：GeneratePage 低置信度场景 → 贡献
 
-#### 用例：背压流控覆盖率（库内暂无匹配模板）
+#### 用例：总线仲裁互斥约束断言（库内暂无匹配模板）
 
 | 步骤 | 操作 | 期望 |
 |---|---|---|
-| 1 | GeneratePage 输入 `统计背压信号 bp_n 拉低时 tx_valid 是否真的暂停，覆盖四种组合场景`，code_type 选 UVM 覆盖率，点「分析意图」 | 不弹 Modal，不跳 IntentBuilder；前端弹蓝色 toast「库内暂无匹配模板，跳转至贡献页面帮助完善模板库」，随即自动 navigate 到贡献提交页 |
-| 2 | 检查跳转后页面 URL，应含 `description=` 和 `code_type=coverage` | 表单 description 字段已预填背压意图原文，code_type 预选 UVM 覆盖率 |
-| 3 | 填写模板名称（如 `背压流控覆盖率`），粘贴下方 demo_code，点「提交，由 AI 协助参数化」 | HTTP 201 + `status: pending_review` + LLM 反推的 `parameter_defs` 含 `clk / bp_n / tx_valid / group_name` |
+| 1 | GeneratePage 输入 `断言 cpu_req 和 dma_req 不能在同一时钟周期同时有效，验证总线仲裁互斥约束`，code_type 选 **SVA 断言**，点「分析意图」 | 不弹 Modal，不跳 IntentBuilder；前端弹蓝色 toast「库内暂无匹配模板，跳转至贡献页面帮助完善模板库」，随即自动 navigate 到贡献提交页 |
+| 2 | 检查跳转后页面 URL 应含 `description=` 和 `code_type=assertion` | 表单 description 字段已预填互斥约束意图原文，code_type 预选 SVA 断言 |
+| 3 | 填写模板名称（如 `总线仲裁互斥约束断言`），粘贴下方 demo_code，点「提交，由 AI 协助参数化」 | HTTP 201 + `status: pending_review` + LLM 反推的 `parameter_defs` 含 `clk / rst_n / signal_a / signal_b` |
+
+**为什么这个场景能触发第五道闸**：库内 6 个 assertion 模板分别覆盖数据稳定、最大延迟、握手超时、复位值、FSM 转换、握手数据稳定，均不涉及"两信号互斥"语义。LLM step1 会明确拒绝所有候选（`rag_fallback`），且 RAG top-1 分数低于 0.60 阈值。
 
 #### 提交 demo_code 示例（入口 A）
 
 ```systemverilog
-// 背压流控覆盖率：统计 bp_n 拉低（施压）时 tx_valid 的四种组合场景
-covergroup cg_backpressure @(posedge clk);
-  option.per_instance = 1;
-  option.comment = "背压流控场景覆盖";
+// 总线仲裁互斥断言：cpu_req 和 dma_req 不能在同一周期同时有效
+property p_bus_mutex;
+  @(posedge clk) disable iff (!rst_n)
+  !(cpu_req && dma_req);
+endproperty
 
-  cp_bp: coverpoint bp_n {
-    bins asserted   = {0};   // downstream 施压
-    bins deasserted = {1};   // 正常传输
-  }
-
-  cp_tx: coverpoint tx_valid {
-    bins sending = {1};
-    bins idle    = {0};
-  }
-
-  cx_bp_x_tx: cross cp_bp, cp_tx {
-    bins normal_tx   = binsof(cp_bp.deasserted) && binsof(cp_tx.sending);   // 正常发送
-    bins bp_paused   = binsof(cp_bp.asserted)   && binsof(cp_tx.idle);      // 背压暂停（期望行为）
-    bins bp_violated = binsof(cp_bp.asserted)   && binsof(cp_tx.sending);   // 背压违例（bug 场景）
-    bins both_idle   = binsof(cp_bp.deasserted) && binsof(cp_tx.idle);      // 双方空闲
-  }
-
-endgroup
-
-cg_backpressure cg_bp_inst = new();
+a_bus_mutex: assert property(p_bus_mutex)
+  else $error("[ARB] 互斥违例：cpu_req=%b dma_req=%b 同时有效", cpu_req, dma_req);
 ```
 
 ---
