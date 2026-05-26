@@ -239,3 +239,88 @@ Frontend pages mirror the backend domains (Generate, Batch, Library, IntentBuild
 > 是否现在运行 `/plan-ticket`？
 
 **例外（不触发，可直接实现）**：纯 bug fix（不改闸逻辑）、前端 UI 样式/文案调整、补单测（不新增被测逻辑）、文档专项任务（已在 docs/ 分支）。
+
+## worktree-init.sh 完成后必须输出操作手册
+
+`scripts/worktree-init.sh <TICKET>` 成功后，**立即**（不等用户提问）输出以下四段内容，让用户只需机械操作，无需再追问任何路径或指令。
+
+### 1. Worktree 路径（WSL UNC）
+
+Linux 路径转 WSL UNC 规则：`/home/Administrator/X` → `\\wsl.localhost\Ubuntu-22.04\home\Administrator\X`
+
+| | WSL UNC 路径 |
+|---|---|
+| feature | `\\wsl.localhost\Ubuntu-22.04\home\Administrator\<repo>-feat-<TICKET>` |
+| docs | `\\wsl.localhost\Ubuntu-22.04\home\Administrator\<repo>-docs-<TICKET>` |
+
+### 2. Feature session 粘贴内容
+
+基于 spec §3 Scope / §4 Implementation Sketch 生成，包含：
+- 明确的文件路径 + 函数名 + 改动要点（直接从 spec §4 提取，不泛泛而谈）
+- 测试命令（从 spec §2 Acceptance Criteria 提取）
+- 结尾固定为完整四步序列（不可省略任何一步）
+
+格式模板：
+```
+我在 feature/<TICKET> worktree 里，spec 在 .claude/plans/<TICKET>.spec.md。
+
+请按 spec §4 实现以下改动：
+
+[从 spec §4 逐条提取的具体文件路径 + 函数名 + 改动说明]
+
+完成后按顺序执行：
+  1. pytest [spec §2 中的测试文件] -v   ← 所有测试必须通过
+  2. /review-pre-pr                      ← 代码审查，修复所有 blocker
+  3. /commit                             ← 生成 commit + Handoff JSON
+  4. /open-pr feat                       ← 开 PR，等待 merge
+```
+
+### 3. Feature PR merge 确认命令
+
+```bash
+wsl -d Ubuntu-22.04 -- bash -c "cd /home/Administrator/<repo> && git fetch origin && git log origin/develop --oneline -5 && git branch -r | grep <TICKET> || echo 'no remote branch'"
+```
+期望：develop 日志中出现 feat PR commit，即可进 docs session。
+
+### 4. Docs session 粘贴内容
+
+基于 spec §6 Docs Impact 生成，包含：
+- `git fetch origin && git rebase origin/develop` 前置步骤
+- 每个 docs_targets 文件的具体改动要点（从 spec §6 提取）
+- 结尾固定为完整四步序列（不可省略任何一步）
+
+格式模板：
+```
+我在 docs/<TICKET> worktree 里，spec 在 .claude/plans/<TICKET>.spec.md。
+feature/<TICKET> 已经 merge 到 develop。
+
+请先执行：
+  git fetch origin && git rebase origin/develop
+
+然后按 spec §6 更新：
+
+[从 spec §6 docs_targets 逐条提取的文件 + 改动要点]
+
+完成后按顺序执行：
+  1. /review-pre-pr   ← 文档审查，修复所有 blocker
+  2. /commit          ← 生成 commit
+  3. /open-pr docs    ← 开 PR，等待 merge
+```
+
+### 5. 主 session 验收检查
+
+每个 session 完成后，主 session **必须**运行以下命令验证，不能仅凭 session 自述判断完成：
+
+**feat 完成验收**（feat PR merge 后）：
+```bash
+wsl -d Ubuntu-22.04 -- bash -c "cd /home/Administrator/<repo> && git log origin/develop --oneline -3"
+```
+期望：看到 `fix(...):` 或 `feat(...)` commit，且 commit message 与 spec §7 PR Body 一致。
+
+**docs 完成验收**（docs PR merge 后）：
+```bash
+wsl -d Ubuntu-22.04 -- bash -c "cd /home/Administrator/<repo> && git log origin/develop --oneline -3"
+```
+期望：看到 `docs(...)` commit，且 spec §6 docs_targets 中每个文件均有实质变更（用 `git show <hash> --stat` 确认）。
+
+**此节适用于所有走 4-agent 流程的票，无例外。** 若 `docs_targets=[]`（仅 feature），跳过第 3/4/5-docs 段，但第 1/2/5-feat 段仍须输出。
