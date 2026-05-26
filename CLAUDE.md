@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 IC verification assistant code generation platform: structured Excel input → deterministic SVA assertion / UVM functional coverage code. Authoritative spec is `PRD.md` (**v3.0**) and `ARCHITECTURE.md` (v2.19). README and CONTRIBUTING are in Chinese; design docs are the source of truth.
 
-**v3.0 user journey reversal (most important reading before changing pipeline / IntentBuilder / contribution code)**: open-ended NL is no longer salvaged by the pipeline. The 4 gates (off-topic / code_type_mismatch / under_specified / empty_retrieval) all return 422/503 with a structured `detail`. `detail.redirect_to` is the v3.0 mechanism by which the backend tells the frontend where to route the user — only `under_specified` populates it (`/intent-builder?prefill=...&template_id=...&missing=...`); the other three are `null`. Frontend `handleApiError` checks `redirect_to` **first**, before any Modal — read [GeneratePage.tsx handleApiError](frontend/src/pages/Generate/GeneratePage.tsx) for the exact branching. IntentBuilder ([api/v1/intent_builder.py](backend/app/api/v1/intent_builder.py) + [services/intent/conversation.py](backend/app/services/intent/conversation.py)) is a RAG-grounded multi-turn chat with Redis 24h session ([services/intent/session.py](backend/app/services/intent/session.py))—LLM is forced to align user intent to existing templates and is not allowed to invent scenarios. Contribution wizard ([api/v1/contributions.py](backend/app/api/v1/contributions.py)) now takes 4 user fields; backend LLM reverse-derives parameter_defs / Jinja body / keywords via [services/platform/parameter_extractor.py](backend/app/services/platform/parameter_extractor.py) and validates through 3 gates (param_defs naming, Jinja2 renderability, keywords shape) before queuing for admin review.
+**v3.0 user journey reversal (most important reading before changing pipeline / IntentBuilder / contribution code)**: open-ended NL is no longer salvaged by the pipeline. The 5 gates (off-topic / code_type_mismatch / no_matching_template / under_specified / empty_retrieval) all return 422/503 with a structured `detail`. `detail.redirect_to` is the v3.0 mechanism by which the backend tells the frontend where to route the user — `under_specified` routes to `/intent-builder?prefill=...&template_id=...&missing=...`; `no_matching_template` routes to `/contribute/new?description=...&code_type=...` (skipping IntentBuilder entirely); the other three are `null`. Frontend `handleApiError` checks `redirect_to` **first**, before any Modal — read [GeneratePage.tsx handleApiError](frontend/src/pages/Generate/GeneratePage.tsx) for the exact branching. IntentBuilder ([api/v1/intent_builder.py](backend/app/api/v1/intent_builder.py) + [services/intent/conversation.py](backend/app/services/intent/conversation.py)) is a RAG-grounded multi-turn chat with Redis 24h session ([services/intent/session.py](backend/app/services/intent/session.py))—LLM is forced to align user intent to existing templates and is not allowed to invent scenarios. Contribution wizard ([api/v1/contributions.py](backend/app/api/v1/contributions.py)) now takes 4 user fields; backend LLM reverse-derives parameter_defs / Jinja body / keywords via [services/platform/parameter_extractor.py](backend/app/services/platform/parameter_extractor.py) and validates through 3 gates (param_defs naming, Jinja2 renderability, keywords shape) before queuing for admin review.
 
 ## Common commands
 
@@ -83,16 +83,17 @@ npm run lint     # ESLint with --max-warnings 0
 
 **The single most important constraint**: the platform must produce identical output for identical input **for in-domain inputs that contain sufficient information**. The LLM is *only* allowed to choose a template ID and map signal names to template parameters — it never generates code. Code comes from Jinja2 rendering. **Contract v2.11 reversal**: when the input is in-domain but missing required parameters (no signal names, no state list, etc.), the platform now **rejects with HTTP 422** rather than fabricating placeholder code. Read `ARCHITECTURE.md` §1.1 before changing anything in `services/core/` or `services/llm/`.
 
-**Four hard gates before code is rendered**, in order at the top of `pipeline_preview`:
+**Five hard gates before code is rendered**, in order at the top of `pipeline_preview`:
 
 1. **Off-topic gate**: `dense_top1_score(original_intent, code_type) < OFFTOPIC_DENSE_THRESHOLD` → `OffTopicIntentError` → HTTP 422. Threshold calibrated empirically against `backend/tests/data/offtopic_corpus.yaml`; rerun `backend/scripts/calibrate_offtopic_threshold.py` after major template-library changes.
 2. **Code-type mismatch gate**: For each non-selected code_type, run a dense_top1_score; if `max(other) - selected ≥ CODE_TYPE_MISMATCH_MARGIN` (default 0.10) → `CodeTypeMismatchError` → 422 with `detail.suggested_code_type`. Typical case: user picks "assertion" but writes "统计 ... 覆盖率".
-3. **Empty retrieval gate** (post-RAG): three-stage retrieval returned no candidates AND keyword supplement also empty → `EmptyRetrievalError` → **HTTP 503** (infrastructure issue — Qdrant / embedding service / empty template library). Distinct from off-topic; SRE looks at this, not the user.
-4. **Under-specified intent gate** ([`_detect_under_specified`](backend/app/services/core/pipeline.py), after `_map_params_with_source`): any required parameter resolved to a low-confidence source → `UnderSpecifiedIntentError` → HTTP 422 with `detail.missing_params=[{name, description, expr_type, role_hint}, ...]`. Low-confidence = `source ∈ {placeholder, semantic_fallback}` OR `source==llm AND value ∈ {"", 0, "0", "null", literal param name}`. The LLM is **not allowed** to fake-fill parameters with stubs.
+3. **No-matching-template gate** (post-LLM-step1, pre-step2): `confidence_source == "rag_fallback"` (LLM step1 explicitly rejected all candidates) AND `rag_candidates[0]["score"] < NO_MATCH_SCORE_THRESHOLD` (default 0.60) → `NoMatchingTemplateError` → HTTP 422 with `detail.redirect_to="/contribute/new?description=...&code_type=..."`. This gate fires **before** under_specified — a clearly unknown scenario goes directly to the contribution page, skipping the 5-round IntentBuilder loop. Toggle: `NO_MATCH_GATE_ENABLED`.
+4. **Empty retrieval gate** (post-RAG): three-stage retrieval returned no candidates AND keyword supplement also empty → `EmptyRetrievalError` → **HTTP 503** (infrastructure issue — Qdrant / embedding service / empty template library). Distinct from off-topic; SRE looks at this, not the user.
+5. **Under-specified intent gate** ([`_detect_under_specified`](backend/app/services/core/pipeline.py), after `_map_params_with_source`): any required parameter resolved to a low-confidence source → `UnderSpecifiedIntentError` → HTTP 422 with `detail.missing_params=[{name, description, expr_type, role_hint}, ...]`. Low-confidence = `source ∈ {placeholder, semantic_fallback}` OR `source==llm AND value ∈ {"", 0, "0", "null", literal param name}`. The LLM is **not allowed** to fake-fill parameters with stubs.
 
-Each gate has an env switch (`OFFTOPIC_GATE_ENABLED` / `CODE_TYPE_MISMATCH_GATE_ENABLED` / `UNDER_SPECIFIED_GATE_ENABLED`) for emergency rollback to the old "always produce code" behavior. All exception classes are caught in [api/v1/generate.py](backend/app/api/v1/generate.py)'s except chain in this exact order — **don't reorder**, don't generalize to `except ValueError` (it'll mask the structured detail).
+Each gate has an env switch (`OFFTOPIC_GATE_ENABLED` / `CODE_TYPE_MISMATCH_GATE_ENABLED` / `NO_MATCH_GATE_ENABLED` / `UNDER_SPECIFIED_GATE_ENABLED`) for emergency rollback. All exception classes are caught in [api/v1/generate.py](backend/app/api/v1/generate.py)'s except chain in this exact order — **don't reorder**, don't generalize to `except ValueError` (it'll mask the structured detail).
 
-**v3.0 redirect_to field on error detail**: every gate's `detail` now carries `redirect_to: str | None`. Only `under_specified` populates a path (`/intent-builder?...`); off_topic / code_type_mismatch / empty_retrieval all return `null`. Frontend `handleApiError` reads `redirect_to` first via `'redirect_to' in detail` type guard — if present, `navigate(detail.redirect_to)` without any Modal. Backend constructs the URL inside `UnderSpecifiedIntentError.__init__` using `urllib.parse.quote` (Chinese-safe). Don't move the redirect URL construction to the endpoint layer; the exception class owns it.
+**v3.0 redirect_to field on error detail**: every gate's `detail` carries `redirect_to: str | None`. `under_specified` routes to `/intent-builder?prefill=...&template_id=...&missing=...`; `no_matching_template` routes to `/contribute/new?description=...&code_type=...`; off_topic / code_type_mismatch / empty_retrieval return `null`. Frontend `handleApiError` reads `redirect_to` first via `'redirect_to' in detail` type guard — if present, `navigate(detail.redirect_to)` without any Modal. Backend constructs the URL inside the exception class `__init__` using `urllib.parse.quote` (Chinese-safe). Don't move the redirect URL construction to the endpoint layer; the exception class owns it.
 
 **v3.0 IntentBuilder (RAG-grounded multi-turn chat)**: `POST /intent-builder/chat` accepts `{session_id, user_message, code_type}`. session_id is mintable (empty → server mints UUID4). Each turn: load Redis session (`intent_builder_session:{user_id}:{session_id}`, TTL 24h) → run RAG retrieval on `accumulated_intent or user_message` → inject top-3 candidates into LLM system prompt → call `llm.chat(messages)` → extract `<<intent>>...<<end>>` segment via regex → save session → respond. The LLM is constrained to ONLY align to existing templates (no inventing scenarios) via [`_build_system_prompt`](backend/app/services/intent/conversation.py). After 5 turns with all top-1 RAG scores < 0.5, response sets `suggest_contribute=true` so frontend shows "Contribute new template" button. Session has no explicit close endpoint — 24h TTL handles cleanup.
 
@@ -214,3 +215,27 @@ Frontend pages mirror the backend domains (Generate, Batch, Library, IntentBuild
 - **Template changes** must update both YAML in `backend/template_library/` and DB (run `lib_manager.py import`); the YAML is the version-controlled source.
 - Don't put backend secrets in `.env` commits. `JWT_SECRET_KEY` and `LLM_KEY_ENCRYPTION_SECRET` are validated; weak values prevent boot.
 - After editing the migration tree: `alembic upgrade head`. Initial schema is consolidated in `migrations/versions/001_initial_schema.py`.
+
+## 4-agent 工作流触发规则
+
+**在动手实现之前**，先判断此次改动是否满足以下任一条件。如果满足，立刻停下并提醒用户先运行 `/plan-ticket`，不要直接在 `develop` 上写代码。
+
+| 改动类型 | 判断依据 |
+|---|---|
+| 新增或修改 pipeline 闸（gate）逻辑 | 涉及 `services/core/pipeline.py` 的异常类或闸判断块 |
+| 新增 API 端点或修改现有端点的错误响应结构 | `api/v1/` 下新增路由，或改 `detail.type` / `redirect_to` 字段 |
+| 改变用户跳转路径 | `GeneratePage.tsx` / `IntentBuilderPage.tsx` 等前端路由逻辑 |
+| 涉及核心契约（ARCHITECTURE.md §1.1） | 确定性引擎、闸顺序、参数源优先级、缓存 key 结构等 |
+| 改动预期影响 test-manual §2/§4/§5 至少一个小节 | 新测试场景、新错误类型、新跳转路径 |
+
+**触发后的标准话术**（在回复里明确说，不要直接开始写代码）：
+
+> 这个改动涉及 [具体触发条件]，属于需要走 4-agent 完整流程的规模：
+> 1. `/plan-ticket <ID> <意图>` — 生成 spec，明确 `docs_targets`
+> 2. `scripts/worktree-init.sh <ID>` — 创建 feature + docs 双 worktree
+> 3. feature session 实现 → `/commit`（自动派生 Handoff JSON）
+> 4. docs session `/update-docs` — 同步 PRD / ARCHITECTURE / test-manual
+>
+> 是否现在运行 `/plan-ticket`？
+
+**例外（不触发，可直接实现）**：纯 bug fix（不改闸逻辑）、前端 UI 样式/文案调整、补单测（不新增被测逻辑）、文档专项任务（已在 docs/ 分支）。
