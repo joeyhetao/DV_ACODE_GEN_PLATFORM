@@ -432,27 +432,36 @@ curl -s -w "HTTP %{http_code}\n" \
 
 ### §5.1 入口 A：GeneratePage 低置信度场景 → 贡献
 
-#### 用例：总线仲裁互斥约束断言（库内暂无匹配模板）
+#### 前置：必须清 intent_cache
+
+```bash
+docker compose exec redis redis-cli --scan --pattern 'intent_cache:*' \
+  | xargs -r docker compose exec -T redis redis-cli DEL
+```
+
+intent_cache 命中时流水线直接短路返回缓存结果，第五道闸永远不会触发。**每次测试本节前必须先清缓存。**
+
+#### 用例：DMA 地址越界检测断言（库内暂无匹配模板）
 
 | 步骤 | 操作 | 期望 |
 |---|---|---|
-| 1 | GeneratePage 输入 `断言 cpu_req 和 dma_req 不能在同一时钟周期同时有效，验证总线仲裁互斥约束`，code_type 选 **SVA 断言**，点「分析意图」 | 不弹 Modal，不跳 IntentBuilder；前端弹蓝色 toast「库内暂无匹配模板，跳转至贡献页面帮助完善模板库」，随即自动 navigate 到贡献提交页 |
-| 2 | 检查跳转后页面 URL 应含 `description=` 和 `code_type=assertion` | 表单 description 字段已预填互斥约束意图原文，code_type 预选 SVA 断言 |
-| 3 | 填写模板名称（如 `总线仲裁互斥约束断言`），粘贴下方 demo_code，点「提交，由 AI 协助参数化」 | HTTP 201 + `status: pending_review` + LLM 反推的 `parameter_defs` 含 `clk / rst_n / signal_a / signal_b` |
+| 1 | GeneratePage 输入 `断言 DMA 传输起始地址 dma_addr 不超过系统内存上限 MEM_SIZE，防止越界访问`，code_type 选 **SVA 断言**，点「分析意图」 | 不弹 Modal，不跳 IntentBuilder；前端弹蓝色 toast「库内暂无匹配模板，跳转至贡献页面帮助完善模板库」，随即自动 navigate 到贡献提交页 |
+| 2 | 检查跳转后页面 URL 应含 `description=` 和 `code_type=assertion` | 表单 description 字段已预填地址越界意图原文，code_type 预选 SVA 断言 |
+| 3 | 填写模板名称（如 `DMA 地址越界检测断言`），粘贴下方 demo_code，点「提交，由 AI 协助参数化」 | HTTP 201 + `status: pending_review` + LLM 反推的 `parameter_defs` 含 `clk / rst_n / dma_addr / mem_size` |
 
-**为什么这个场景能触发第五道闸**：库内 6 个 assertion 模板分别覆盖数据稳定、最大延迟、握手超时、复位值、FSM 转换、握手数据稳定，均不涉及"两信号互斥"语义。LLM step1 会明确拒绝所有候选（`rag_fallback`），且 RAG top-1 分数低于 0.60 阈值。
+**为什么这个场景能触发第五道闸**：库内 6 个 assertion 模板分别覆盖数据稳定 / 最大延迟 / 握手超时 / 复位值 / FSM 转换 / 握手数据稳定，没有任何一个涉及"地址范围越界"语义。LLM step1 明确拒绝所有候选（`rag_fallback`），且 RAG top-1 分数低于 0.60 阈值。
 
 #### 提交 demo_code 示例（入口 A）
 
 ```systemverilog
-// 总线仲裁互斥断言：cpu_req 和 dma_req 不能在同一周期同时有效
-property p_bus_mutex;
+// DMA 地址越界检测：dma_addr 不能超过 MEM_SIZE-1
+property p_dma_addr_in_range;
   @(posedge clk) disable iff (!rst_n)
-  !(cpu_req && dma_req);
+  dma_valid |-> (dma_addr < MEM_SIZE);
 endproperty
 
-a_bus_mutex: assert property(p_bus_mutex)
-  else $error("[ARB] 互斥违例：cpu_req=%b dma_req=%b 同时有效", cpu_req, dma_req);
+a_dma_addr_in_range: assert property(p_dma_addr_in_range)
+  else $error("[DMA] 地址越界：dma_addr=%0h >= MEM_SIZE=%0h", dma_addr, MEM_SIZE);
 ```
 
 ---
