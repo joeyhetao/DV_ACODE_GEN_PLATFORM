@@ -1423,8 +1423,8 @@ Step 5a: TemplateSelect（LLM Step1）
   禁止通过将用户信号名重命名为模板参数名（如 cpu_req/dma_req → valid/ready）
   来强行匹配；此类场景必须返回字符串 "none"（Anthropic 路径在 tool_choice 强制调用下
   于 template_id 字段填 "none"），交由本层 rag_fallback 路径继续走第五道闸
-  （pipeline.py NoMatchingTemplateError，post-Step 5a 闸：rag_fallback +
-  rag_candidates[0]["score"] < NO_MATCH_SCORE_THRESHOLD 默认 0.60 → HTTP 422
+  （pipeline.py NoMatchingTemplateError，post-Step 5a 闸：LLM step1 返回 none
+  即触发，score 值记入日志供监控 → HTTP 422
   no_matching_template + detail.redirect_to=/contribute/new?...）。
   即：模板覆盖空白由"贡献页"修复，不由 LLM 在 step1 强行掩盖。
 

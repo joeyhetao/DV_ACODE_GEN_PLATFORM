@@ -87,7 +87,7 @@ docker compose logs -f backend | grep -E "\[Pipeline\]|\[Gate\]|\[Timing\]|\[GLM
 | `[Gate] off_topic: dense_top1=... threshold=...` | §2.1 闸命中 |
 | `[Pipeline] code_type mismatch: selected=... vs suggested=...` | §2.2 闸命中 |
 | `[Gate] empty_retrieval: code_type=...` | §2.4 闸命中（基础设施异常） |
-| `[Gate] no_matching_template: top_score=... < threshold=0.60` | §2.5 第五道闸命中，库内无此场景模板，直跳贡献页 |
+| `[Gate] no_matching_template: top_score=...` | §2.5 第五道闸命中（LLM step1 返回 none 即触发），库内无此场景模板，直跳贡献页；top_score 仅作监控参考 |
 | `[Timing] llm=... ms=... reasoning_tokens=...` | LLM 单次调用耗时 + 是否真关 thinking |
 | `[Timing] stage=... ms=...` | preview 各阶段耗时（normalize / rag / llm_select / preview_total） |
 | `ERROR ... pipeline_preview unexpected failure: user=... code_type=...` | 后端崩了，附 full traceback；前端会收 500 |
@@ -266,12 +266,12 @@ echo $TOKEN
 |---|---|
 | 输入 | `统计背压信号 bp_n 拉低时 tx_valid 是否暂停，覆盖四种组合场景` |
 | code_type | UVM 覆盖率 |
-| 触发条件 | LLM step1 明确拒绝所有 RAG 候选（rag_fallback）+ cross-encoder top-1 分数 < 0.60 |
+| 触发条件 | LLM step1 返回 none 即触发（`confidence_source=rag_fallback`）；top-1 score 不再参与触发判定，仅记入日志供监控 |
 | 期望 | 前端 toast「库内暂无匹配模板，跳转至贡献页面帮助完善模板库」→ 自动 navigate，**不弹 Modal，不进 IntentBuilder** |
 | detail.type | `no_matching_template` |
 | detail.redirect_to | `/contribute/new?description=<url-encoded-intent>&code_type=coverage`（非 null） |
-| detail.top_score | 数值 < 0.60 |
-| 后端日志 | `[Gate] no_matching_template: top_score=<n> < threshold=0.60` |
+| detail.top_score | 数值（可为 ≥ 0.60，cross-encoder 词汇重叠可给满分；不再作为触发依据） |
+| 后端日志 | `[Gate] no_matching_template: top_score=<n>` |
 
 **对比验证（确保正常场景不受影响）**：输入 §1.9 意图 `对状态信号 cur_state 做 FSM 转换覆盖率`（库内有 `cov_transition_coverage_v1`）→ 应进 under_specified → IntentBuilder，**不触发**此闸。
 
@@ -422,8 +422,8 @@ curl -s -w "HTTP %{http_code}\n" \
 
 | 入口 | 触发时机 | 表单预填 |
 |---|---|---|
-| **A：GeneratePage → 第五道闸直跳（首选路径）** | LLM step1 拒绝所有 RAG 候选（rag_fallback）+ RAG top-1 分数 < 0.60；preview 阶段即判定库内无此场景 | `description` 由 original_intent URL 编码预填；`code_type` 由 URL 参数携带 |
-| **A（边界降级）：GeneratePage → IntentBuilder → 建议贡献** | rag_fallback 但 RAG top-1 ≥ 0.60（描述模糊但库内有近似模板），走 IntentBuilder 5 轮后 `suggest_contribute=true` | `description` 由 accumulated_intent 预填；`code_type` 由会话携带 |
+| **A：GeneratePage → 第五道闸直跳（首选路径）** | LLM step1 返回 none 即触发（`confidence_source=rag_fallback`）；preview 阶段即判定库内无此场景，top-1 score 不参与触发判定（仅记入日志供监控） | `description` 由 original_intent URL 编码预填；`code_type` 由 URL 参数携带 |
+| **A（边界降级）：GeneratePage → IntentBuilder → 建议贡献** | LLM step1 选中了某个 RAG 候选但下游 `under_specified` 闸命中（描述模糊参数缺失），走 IntentBuilder 5 轮后 `suggest_contribute=true` | `description` 由 accumulated_intent 预填；`code_type` 由会话携带 |
 | **B：「我的贡献」→「+ 新贡献」** | 用户主动发起 | 全部手填 |
 
 三个路径最终进入相同的 4 字段提交表单：`template_name / code_type / description / demo_code`。提交后后端同步跑（5-15s）LLM 反推 + 3 道自动校验，成功返 HTTP 201，失败返 422。
@@ -449,7 +449,7 @@ intent_cache 命中时流水线直接短路返回缓存结果，第五道闸永�
 | 2 | 检查跳转后页面 URL 应含 `description=` 和 `code_type=assertion` | 表单 description 字段已预填总线仲裁互斥意图原文，code_type 预选 SVA 断言 |
 | 3 | 填写模板名称（如 `总线仲裁互斥约束断言`），粘贴下方 demo_code，点「提交，由 AI 协助参数化」 | HTTP 201 + `status: pending_review` + LLM 反推的 `parameter_defs` 含 `clk / rst_n / req_a / req_b`（或等价的两路请求信号名） |
 
-**为什么这个场景能触发第五道闸**：库内 6 个 assertion 模板分别覆盖数据稳定 / 最大延迟 / 握手超时 / 复位值 / FSM 转换 / 握手数据稳定，没有任何一个涉及"两信号互斥 / one-hot / 竞争检测"语义。FIX-8 后，LLM step1 在系统提示中被明确禁止"通过信号名重命名（如把 `cpu_req` / `dma_req` 重映射为握手模板的 `valid` / `ready`）强行适配语义不符的模板"，因此对互斥场景必返 `"none"`，`pipeline.py` 取 RAG 顶点候选并写入 `confidence_source="rag_fallback"`；RAG top-1 分数（互斥意图 vs 握手/稳定性模板）低于 0.60 阈值，触发 `NoMatchingTemplateError`。
+**为什么这个场景能触发第五道闸**：库内 6 个 assertion 模板分别覆盖数据稳定 / 最大延迟 / 握手超时 / 复位值 / FSM 转换 / 握手数据稳定，没有任何一个涉及"两信号互斥 / one-hot / 竞争检测"语义。FIX-8 后，LLM step1 在系统提示中被明确禁止"通过信号名重命名（如把 `cpu_req` / `dma_req` 重映射为握手模板的 `valid` / `ready`）强行适配语义不符的模板"，因此对互斥场景必返 `"none"`，`pipeline.py` 取 RAG 顶点候选并写入 `confidence_source="rag_fallback"`；FIX-9 后闸只依赖 `confidence_source=rag_fallback`（LLM step1 返 none）即触发 `NoMatchingTemplateError`——即使 cross-encoder reranker 因 `req` 词汇重叠对 `sva_timing_max_delay_v1` 给 1.0 满分，也不再阻拦闸生效。
 
 > **回归对照（应继续命中正常路径，不被新规则误拒）**：意图 `awvalid 拉高后 awready 未到来期间 awaddr 必须保持稳定` 选 SVA 断言 → LLM step1 仍应选中 `sva_handshake_stable_v1`，走 ConfirmationPanel；意图 `检测 cur_state 从 IDLE 到 ACTIVE 的转换` 选 UVM 覆盖率 → 仍应选中 `cov_transition_coverage_v1`。
 
