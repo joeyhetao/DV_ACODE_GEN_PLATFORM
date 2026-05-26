@@ -1092,7 +1092,7 @@ services/llm/
 | 调用 | `extra_body` | `max_tokens` | 说明 |
 |------|--------------|--------------|------|
 | `normalize_intent` | `{"thinking":{"type":"disabled"}}`（硬编码） | 512 | 句式改写，无需 chain-of-thought |
-| `_step1_select_id` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 仅返回候选列表中的 template_id；选错由 pipeline.py 的 RAG fallback 兜底 |
+| `_step1_select_id` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 仅返回候选列表中的 template_id 或字符串 `"none"`；系统提示含负向选择准则（FIX-8）——核心验证语义不匹配时禁止信号名重映射强行适配，必须返 `"none"` 让 pipeline 走 rag_fallback → 第五道闸（详见 §3.15.3 Step 5a） |
 | `_step2_fill_params` | 由 `llm_configs.step2_disable_thinking` 运行时切换 | 2048（off）/ 1024（on） | 仅针对所选模板的 required 参数生成 JSON；prompt 注入示例输出，正则提取响应中第一个 JSON 对象（兼容 ` ```json``` ` 围栏） |
 | `test_basic` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 连通性自检 |
 
@@ -1415,7 +1415,18 @@ Step 5a: TemplateSelect（LLM Step1）
   → 内部依次调用 _step1_select_id（选模板 ID）+ _step2_fill_params（填参数）
   返回 TemplateSelectionOutput(template_id, param_mapping, confidence)
   若 template_id 为空 / "none" / 不在候选 → 退化为 rag_candidates[0]
-    （此时 confidence 重写为该候选的 RAG 分数）
+    （此时 confidence 重写为该候选的 RAG 分数，confidence_source = "rag_fallback"）
+
+  【负向选择准则（FIX-8）】_step1_select_id 与 anthropic_client.select_template 的系统提示
+  显式约束：当候选模板的**核心验证语义**与用户意图不匹配（例如意图是"两信号互斥 /
+  one-hot / 竞争检测"，但候选均为握手 / 稳定性 / 延迟 / FSM / 值域），
+  禁止通过将用户信号名重命名为模板参数名（如 cpu_req/dma_req → valid/ready）
+  来强行匹配；此类场景必须返回字符串 "none"（Anthropic 路径在 tool_choice 强制调用下
+  于 template_id 字段填 "none"），交由本层 rag_fallback 路径继续走第五道闸
+  （pipeline.py NoMatchingTemplateError，post-Step 5a 闸：rag_fallback +
+  rag_candidates[0]["score"] < NO_MATCH_SCORE_THRESHOLD 默认 0.60 → HTTP 422
+  no_matching_template + detail.redirect_to=/contribute/new?...）。
+  即：模板覆盖空白由"贡献页"修复，不由 LLM 在 step1 强行掩盖。
 
 Step 5b: GenerationCacheLookup
   从意图正则提取 + LLM param_mapping 合并后查 get_generation_cache
