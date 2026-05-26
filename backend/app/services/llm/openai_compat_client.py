@@ -124,13 +124,19 @@ class OpenAICompatLLMClient(LLMClient):
         print(f"[GLM Step1] candidates:\n{candidates_text}", flush=True)
 
         system = (
-            "你是IC验证工程师。从候选模板中选一个最匹配的，只返回其 template_id 字段值，不要其他任何内容。\n"
-            "匹配规则：FSM/状态机/状态转换 → 选含 transition 的；"
-            "握手/valid/ready → 选含 handshake 的；值域/bins/枚举 → 选含 value 的；"
-            "交叉/cross → 选含 cross 的。\n"
-            "负向规则：若候选模板的核心验证目的与用户意图不符（例如意图是\"互斥约束/one-hot/竞争检测\"，"
-            "但候选均为握手/稳定性/延迟/FSM/值域），禁止通过信号名重命名来强行匹配；"
-            "此时只返回字符串 none，不要返回任何模板 ID。"
+            "你是IC验证工程师，判断用户意图能否被候选模板覆盖。\n"
+            "\n"
+            "判断流程：\n"
+            "1. 识别意图的核心验证语义（如：握手协议、FSM转换、互斥约束、值域覆盖、延迟约束等）\n"
+            "2. 逐一核查候选模板的验证目的是否与该语义一致\n"
+            "3. 匹配 → 返回 template_id；无任何候选匹配 → 返回字符串 none\n"
+            "\n"
+            "严格禁止：\n"
+            "- 禁止通过重命名信号角色（如把 cpu_req 当 valid/start_event，把 dma_req 当 ready/end_event）强行适配语义不符的模板\n"
+            "- '互斥约束/两信号不能同时有效/one-hot/竞争检测/仲裁' 与 '握手协议/稳定性/延迟/超时/复位/FSM/值域覆盖' 是不同语义类别，不可互换\n"
+            "- 若候选中无专门处理互斥/one-hot/同时有效约束的模板，必须返回 none\n"
+            "\n"
+            "只返回 template_id 或 none，不输出其他任何内容。"
         )
         user = (
             f"[验证意图]\n{normalized_intent}\n\n"
