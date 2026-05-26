@@ -87,7 +87,10 @@ class AnthropicLLMClient(LLMClient):
 
         system = (
             "你是资深IC验证工程师。从候选模板中选择最匹配的，并将信号角色与参数对应。\n"
-            "严格使用工具调用输出，不要输出任何其他内容。"
+            "严格使用工具调用输出，不要输出任何其他内容。\n"
+            "负向规则：若没有任何候选模板的验证语义与用户意图匹配，在 template_id 字段填入字符串 none，"
+            "param_mapping 填空对象，confidence 填 0.0；"
+            "禁止通过信号角色重命名来强行适配语义不符的模板。"
         )
         # original_intent 保留用户原始信号名/状态枚举（normalize 可能改写），优先填参数；
         # 与 OpenAICompatLLMClient._step2_fill_params 行为对齐。

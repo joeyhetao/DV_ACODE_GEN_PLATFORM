@@ -1728,6 +1728,48 @@ async def test_no_matching_template_gate_fires_when_rag_fallback_low_score():
 
 
 @pytest.mark.asyncio
+async def test_no_matching_template_mutex_scenario():
+    """FIX-8：互斥约束场景下 LLM step1 应返回空字符串 → rag_fallback → 第五道闸触发。
+
+    场景：用户提交"断言 cpu_req 和 dma_req 不能在同一时钟周期同时有效，验证总线仲裁互斥约束"，
+    库内只有握手类候选（sva_handshake_stable_v1，score=0.50）。新增的负向选择规则迫使
+    LLM step1 返回空字符串而非把 cpu_req/dma_req 重映射为 valid/ready。
+    rag_fallback 接管后，top-1 score=0.50 < threshold=0.60 → NoMatchingTemplateError。
+    """
+    from app.services.core.pipeline import NoMatchingTemplateError
+
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.50)]
+    # 新负向规则下，LLM 对互斥场景应返回空字符串（而非强行映射到握手模板）
+    llm_sel = TemplateSelectionOutput(template_id="", param_mapping={}, confidence=0.0)
+
+    fake_rag_tmpl = MagicMock()
+    fake_rag_tmpl.parameters = []
+    fake_rag_tmpl.id = "sva_handshake_stable_v1"
+    fake_rag_tmpl.name = "握手稳定性"
+    fake_rag_tmpl.version = "1.0.0"
+
+    def _db_get_side_effect(model, id_):
+        if id_ == "sva_handshake_stable_v1":
+            return fake_rag_tmpl
+        return None
+
+    stack, fake_db = _patch_preview_deps(rag, llm_sel)
+    fake_db.get = AsyncMock(side_effect=_db_get_side_effect)
+
+    mutex_intent = "断言 cpu_req 和 dma_req 不能在同一时钟周期同时有效，验证总线仲裁互斥约束"
+    with stack, pytest.raises(NoMatchingTemplateError) as excinfo:
+        await pipeline_preview(_make_preview_inp(mutex_intent), fake_db)
+
+    err = excinfo.value
+    assert err.detector == "no_matching_template"
+    assert err.top_score == pytest.approx(0.50)
+    assert err.code_type == "assertion"
+    assert err.redirect_to.startswith("/contribute/new?")
+    assert "description=" in err.redirect_to
+    assert "code_type=" in err.redirect_to
+
+
+@pytest.mark.asyncio
 async def test_no_matching_template_gate_skipped_when_rag_score_high():
     """confidence_source=rag_fallback + RAG top-1 score >= 0.60 → 闸不触发，走正常流程。
 
