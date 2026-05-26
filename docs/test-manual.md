@@ -1,7 +1,7 @@
 # 平台功能测试手册
 
 > 面向：QA、产品验证、上线前回归。每个用例 = 操作步骤 + 期望效果。
-> 平台版本：PRD v3.0。后端基于 4 道闸契约（off-topic / code_type_mismatch / under_specified / empty_retrieval）。
+> 平台版本：PRD v3.0。后端基于 5 道闸契约（off-topic / code_type_mismatch / no_matching_template / under_specified / empty_retrieval）。
 
 ---
 
@@ -9,7 +9,7 @@
 
 - [0. 测试前置](#0-测试前置)
 - [1. 单条生成 — 高置信路径](#1-单条生成--高置信路径)
-- [2. 单条生成 — 4 道闸触发](#2-单条生成--4-道闸触发)
+- [2. 单条生成 — 5 道闸触发](#2-单条生成--5-道闸触发)
 - [3. 缓存层验证](#3-缓存层验证)
 - [4. 意图构建器（IntentBuilder）](#4-意图构建器intentbuilder)
 - [5. 模板贡献机制](#5-模板贡献机制)
@@ -26,7 +26,7 @@
 - [9. LLM 配置管理](#9-llm-配置管理)
 - [10. 通知机制](#10-通知机制)
 - [附录 A：日志/缓存排查速查](#附录-a日志缓存排查速查)
-- [附录 B：4 道闸错误响应结构对照](#附录-b4-道闸错误响应结构对照)
+- [附录 B：5 道闸错误响应结构对照](#附录-b5-道闸错误响应结构对照)
 
 ---
 
@@ -87,6 +87,7 @@ docker compose logs -f backend | grep -E "\[Pipeline\]|\[Gate\]|\[Timing\]|\[GLM
 | `[Gate] off_topic: dense_top1=... threshold=...` | §2.1 闸命中 |
 | `[Pipeline] code_type mismatch: selected=... vs suggested=...` | §2.2 闸命中 |
 | `[Gate] empty_retrieval: code_type=...` | §2.4 闸命中（基础设施异常） |
+| `[Gate] no_matching_template: top_score=... < threshold=0.60` | §2.5 第五道闸命中，库内无此场景模板，直跳贡献页 |
 | `[Timing] llm=... ms=... reasoning_tokens=...` | LLM 单次调用耗时 + 是否真关 thinking |
 | `[Timing] stage=... ms=...` | preview 各阶段耗时（normalize / rag / llm_select / preview_total） |
 | `ERROR ... pipeline_preview unexpected failure: user=... code_type=...` | 后端崩了，附 full traceback；前端会收 500 |
@@ -210,9 +211,9 @@ echo $TOKEN
 
 ---
 
-## 2. 单条生成 — 4 道闸触发
+## 2. 单条生成 — 5 道闸触发
 
-按 pipeline 顺序触发：off-topic → code_type_mismatch → empty_retrieval → under_specified。
+按 pipeline 顺序触发：off-topic → code_type_mismatch → no_matching_template → under_specified → empty_retrieval。
 
 ### §2.1 off-topic（HTTP 422，弹"非验证请求"Modal）
 
@@ -248,7 +249,34 @@ echo $TOKEN
 
 需故意制造基础设施异常才能复现（停掉 Qdrant 或清空 templates 表）。日常回归靠单测 `test_pipeline_preview_rag_empty_and_no_supplement_raises_empty_retrieval`，**不要**在生产复测此场景。
 
-### §2.5 4 道闸响应结构验证（API 层）
+### §2.5 no_matching_template（HTTP 422，toast + 直跳贡献页）
+
+| | |
+|---|---|
+| 输入 | `统计背压信号 bp_n 拉低时 tx_valid 是否暂停，覆盖四种组合场景` |
+| code_type | UVM 覆盖率 |
+| 触发条件 | LLM step1 明确拒绝所有 RAG 候选（rag_fallback）+ cross-encoder top-1 分数 < 0.60 |
+| 期望 | 前端 toast「库内暂无匹配模板，跳转至贡献页面帮助完善模板库」→ 自动 navigate，**不弹 Modal，不进 IntentBuilder** |
+| detail.type | `no_matching_template` |
+| detail.redirect_to | `/contribute/new?description=<url-encoded-intent>&code_type=coverage`（非 null） |
+| detail.top_score | 数值 < 0.60 |
+| 后端日志 | `[Gate] no_matching_template: top_score=<n> < threshold=0.60` |
+
+**对比验证（确保正常场景不受影响）**：输入 §1.9 意图 `对状态信号 cur_state 做 FSM 转换覆盖率`（库内有 `cov_transition_coverage_v1`）→ 应进 under_specified → IntentBuilder，**不触发**此闸。
+
+**API 层验证**：
+
+```bash
+TOKEN=<jwt>
+curl -s -X POST http://localhost/api/v1/generate/preview \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"text":"统计背压信号 bp_n 拉低时 tx_valid 是否暂停，覆盖四种组合场景","code_type":"coverage","clk":"clk","rst":"rst_n","rst_polarity":"低有效","signals":[]}' \
+  | python3 -m json.tool
+```
+
+期望：`detail.type="no_matching_template"` + `detail.redirect_to` 以 `/contribute/new?` 开头。
+
+### §2.6 5 道闸响应结构验证（API 层）
 
 ```bash
 # under_specified detail 必含 redirect_to 字符串
@@ -332,7 +360,7 @@ curl -s -X POST http://localhost/api/v1/generate/preview \
 1. 点底部「用这条意图回去生成」
 2. 期望：跳 `/generate?prefill=<accumulated_intent>&code_type=<...>&source=intent_builder`
 3. GeneratePage 自动填入意图
-4. 点「分析意图」→ 期望本次 4 道闸全过，到 ConfirmationPanel
+4. 点「分析意图」→ 期望本次 5 道闸全过，到 ConfirmationPanel
 
 ### §4.4 用户输入超长拒（DoS 防护）
 
@@ -383,10 +411,11 @@ curl -s -w "HTTP %{http_code}\n" \
 
 | 入口 | 触发时机 | 表单预填 |
 |---|---|---|
-| **A：GeneratePage → IntentBuilder → 建议贡献** | IntentBuilder 连续 5 轮 RAG top-1 < 0.5，平台判断库内无匹配 | `description` 由 accumulated_intent 预填；`code_type` 由会话携带 |
+| **A：GeneratePage → 第五道闸直跳（首选路径）** | LLM step1 拒绝所有 RAG 候选（rag_fallback）+ RAG top-1 分数 < 0.60；preview 阶段即判定库内无此场景 | `description` 由 original_intent URL 编码预填；`code_type` 由 URL 参数携带 |
+| **A（边界降级）：GeneratePage → IntentBuilder → 建议贡献** | rag_fallback 但 RAG top-1 ≥ 0.60（描述模糊但库内有近似模板），走 IntentBuilder 5 轮后 `suggest_contribute=true` | `description` 由 accumulated_intent 预填；`code_type` 由会话携带 |
 | **B：「我的贡献」→「+ 新贡献」** | 用户主动发起 | 全部手填 |
 
-两个入口最终进入相同的 4 字段提交表单：`template_name / code_type / description / demo_code`。提交后后端同步跑（5-15s）LLM 反推 + 3 道自动校验，成功返 HTTP 201，失败返 422。
+三个路径最终进入相同的 4 字段提交表单：`template_name / code_type / description / demo_code`。提交后后端同步跑（5-15s）LLM 反推 + 3 道自动校验，成功返 HTTP 201，失败返 422。
 
 ---
 
@@ -396,11 +425,9 @@ curl -s -w "HTTP %{http_code}\n" \
 
 | 步骤 | 操作 | 期望 |
 |---|---|---|
-| 1 | GeneratePage 输入 `统计背压信号 bp_n 拉低时 tx_valid 是否真的暂停，覆盖四种组合场景`，code_type 选 UVM 覆盖率，点「分析意图」 | pipeline 返回 under_specified 或 empty_retrieval → 自动跳 IntentBuilder |
-| 2 | IntentBuilder 内连续对话，描述场景细节 | 右侧 RAG 候选 card 相似度持续 < 50%（橙/红色百分比标签） |
-| 3 | 连续 5 轮后底部出现橙色「贡献新模板」按钮 | `suggest_contribute: true` |
-| 4 | 点「贡献新模板」 | 跳转提交表单，`description` 预填 accumulated_intent，`code_type=coverage` |
-| 5 | 填写模板名称（如 `背压流控覆盖率`），粘贴下方 demo_code，点提交 | HTTP 201 + `status: pending_review` + LLM 反推的 `parameter_defs` 含 `clk / bp_n / tx_valid / group_name` |
+| 1 | GeneratePage 输入 `统计背压信号 bp_n 拉低时 tx_valid 是否真的暂停，覆盖四种组合场景`，code_type 选 UVM 覆盖率，点「分析意图」 | 不弹 Modal，不跳 IntentBuilder；前端弹蓝色 toast「库内暂无匹配模板，跳转至贡献页面帮助完善模板库」，随即自动 navigate 到贡献提交页 |
+| 2 | 检查跳转后页面 URL，应含 `description=` 和 `code_type=coverage` | 表单 description 字段已预填背压意图原文，code_type 预选 UVM 覆盖率 |
+| 3 | 填写模板名称（如 `背压流控覆盖率`），粘贴下方 demo_code，点「提交，由 AI 协助参数化」 | HTTP 201 + `status: pending_review` + LLM 反推的 `parameter_defs` 含 `clk / bp_n / tx_valid / group_name` |
 
 #### 提交 demo_code 示例（入口 A）
 
@@ -666,7 +693,7 @@ curl -s -X PUT http://localhost/api/v1/admin/contributions/$CID/approve \
 3. 上传 Excel
 4. 看解析预览：行数、列识别
 5. 点「开始批量生成」
-6. 期望：实时进度条（已完成/总数）；每行调 `run_pipeline`，遇 4 道闸结构化记录该行状态
+6. 期望：实时进度条（已完成/总数）；每行调 `run_pipeline`，遇 5 道闸结构化记录该行状态
 7. 完成后展示结果列表：每行 `status` ∈ `success` / `under_specified` / `off_topic` / `code_type_mismatch` / `failed`
 8. 下载结果 ZIP
 
@@ -674,7 +701,7 @@ curl -s -X PUT http://localhost/api/v1/admin/contributions/$CID/approve \
 
 | 行状态 | 含义 | 用户行动 |
 |---|---|---|
-| `success` | 4 道闸全过 + 模板渲染成功 | 直接用代码 |
+| `success` | 5 道闸全过 + 模板渲染成功 | 直接用代码 |
 | `under_specified` | 该行描述里缺必填参数（响应含 `missing_params`） | 修改该行意图后单独重跑 |
 | `off_topic` | 描述非 IC 验证 | 重写该行 |
 | `code_type_mismatch` | 该行 code_type 与意图不符（响应含 `suggested_code_type`） | 切换该行 code_type |
@@ -832,15 +859,16 @@ docker compose exec backend pytest tests/ --ignore=tests/test_offtopic_corpus_re
 
 ---
 
-## 附录 B：4 道闸错误响应结构对照
+## 附录 B：5 道闸错误响应结构对照
 
-所有 4 道闸响应共享 `detail.redirect_to` 字段；前端 `handleApiError` 优先读这一字段决定是否跳路由。
+所有 5 道闸响应共享 `detail.redirect_to` 字段；前端 `handleApiError` 优先读这一字段决定是否跳路由。
 
 | 闸 | HTTP | `detail.type` | `detail.redirect_to` | 前端行为 |
 |---|---|---|---|---|
 | off-topic | 422 | `off_topic` | `null` | 弹"检测到非验证请求"Modal，停留生成页 |
 | code_type_mismatch | 422 | `code_type_mismatch` | `null` | 弹"代码类型选错了"Modal，含 `suggested_code_type` |
 | under_specified | 422 | `under_specified` | `/intent-builder?prefill=...&template_id=...&code_type=...&missing=...` | 自动 `router.push` 进 IntentBuilder |
+| no_matching_template | 422 | `no_matching_template` | `/contribute/new?description=...&code_type=...` | toast + 自动 navigate，跳过 IntentBuilder |
 | empty_retrieval | 503 | `empty_retrieval` | `null` | 弹"系统暂不可用"Modal（基础设施异常） |
 | contribution_parse_failed | 422 | `contribution_parse_failed` | — | 提交贡献 Modal 内 Alert 显示 `stage` + `reason` |
 
@@ -848,7 +876,7 @@ docker compose exec backend pytest tests/ --ignore=tests/test_offtopic_corpus_re
 
 ### 兜底 fallback 错误（非闸异常）
 
-当后端抛非结构化异常（如 LLM vendor 错、Pydantic 校验失败、httpx 超时）时，4 道闸都不命中，FastAPI 端点统一返回 `HTTP 500 detail="<ExceptionName>: <msg>"`（preview / render / 旧 `/generate` 都做了 `logger.exception` 记 traceback），前端 `handleApiError` 走 fallback 分支：
+当后端抛非结构化异常（如 LLM vendor 错、Pydantic 校验失败、httpx 超时）时，5 道闸都不命中，FastAPI 端点统一返回 `HTTP 500 detail="<ExceptionName>: <msg>"`（preview / render / 旧 `/generate` 都做了 `logger.exception` 记 traceback），前端 `handleApiError` 走 fallback 分支：
 
 ```
 message.error(`${fallbackMsg}（HTTP <status>: <detail 200 字符摘要>）`)
