@@ -127,7 +127,10 @@ class OpenAICompatLLMClient(LLMClient):
             "你是IC验证工程师。从候选模板中选一个最匹配的，只返回其 template_id 字段值，不要其他任何内容。\n"
             "匹配规则：FSM/状态机/状态转换 → 选含 transition 的；"
             "握手/valid/ready → 选含 handshake 的；值域/bins/枚举 → 选含 value 的；"
-            "交叉/cross → 选含 cross 的。"
+            "交叉/cross → 选含 cross 的。\n"
+            "负向规则：若候选模板的核心验证目的与用户意图不符（例如意图是\"互斥约束/one-hot/竞争检测\"，"
+            "但候选均为握手/稳定性/延迟/FSM/值域），禁止通过信号名重命名来强行匹配；"
+            "此时只返回字符串 none，不要返回任何模板 ID。"
         )
         user = (
             f"[验证意图]\n{normalized_intent}\n\n"
