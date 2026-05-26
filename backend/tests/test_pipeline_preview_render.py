@@ -630,7 +630,11 @@ async def test_pipeline_preview_marginal_intent_falls_back_with_llm_confidence()
 
     这是真 IC 请求但表述简略的常见路径。即便 RAG top1 分数较低（如 0.7），
     也不应当被拒——这是 normalize_intent 信任路径（sentinel 没触发）。
+    FIX-9 后第五道闸默认会拦截 rag_fallback；本测试关注 confidence 透传逻辑，
+    需临时关闸 no_match_gate_enabled 以隔离测试目标。
     """
+    from app.core.config import get_settings
+
     rag = [
         _make_rag_candidate("sva_handshake_timeout_v1", score=0.7),
         _make_rag_candidate("sva_data_integrity_v1", score=0.3),
@@ -644,20 +648,27 @@ async def test_pipeline_preview_marginal_intent_falls_back_with_llm_confidence()
     fake_db_template.version = "1.0.0"
 
     stack, fake_db = _patch_preview_deps(rag, llm_refused, db_get_return_value=fake_db_template)
-    with stack:
-        result = await pipeline_preview(_make_preview_inp(), fake_db)
+    settings = get_settings()
+    original = settings.no_match_gate_enabled
+    settings.no_match_gate_enabled = False
+    try:
+        with stack:
+            result = await pipeline_preview(_make_preview_inp(), fake_db)
 
-    assert result.template_id == "sva_handshake_timeout_v1"
-    assert result.confidence_source == "rag_fallback"
-    # 关键断言：confidence 是 LLM 上报的 0.0，不再被 RAG 0.95 覆盖
-    assert result.confidence == 0.0
+        assert result.template_id == "sva_handshake_timeout_v1"
+        assert result.confidence_source == "rag_fallback"
+        # 关键断言：confidence 是 LLM 上报的 0.0，不再被 RAG 0.95 覆盖
+        assert result.confidence == 0.0
+    finally:
+        settings.no_match_gate_enabled = original
 
 
 @pytest.mark.asyncio
 async def test_pipeline_preview_off_topic_gate_disabled_skips_check():
     """offtopic_gate_enabled=False → 即使 dense 分数低于阈值，也跳过闸继续走老路径。
     紧急逃生通道：若阈值校准误调或语料缺失导致大面积误拒，可立即关闸。
-    RAG score 用 0.70（>= no_match_score_threshold=0.60），避免触发第五道闸（与本测试无关）。
+    FIX-9 后第五道闸只看 confidence_source==rag_fallback，本测试构造的 llm_refused
+    会触发它；测试目标是 off-topic 闸开关，故同步临时关闭 no_match 闸隔离测试目标。
     """
     fake_db_template = MagicMock()
     fake_db_template.parameters = []
@@ -669,8 +680,10 @@ async def test_pipeline_preview_off_topic_gate_disabled_skips_check():
 
     from app.core.config import get_settings
     settings = get_settings()
-    original = settings.offtopic_gate_enabled
+    original_offtopic = settings.offtopic_gate_enabled
+    original_no_match = settings.no_match_gate_enabled
     settings.offtopic_gate_enabled = False
+    settings.no_match_gate_enabled = False
     try:
         # dense=0.10 远低于阈值，但闸关掉 → 不应抛异常
         from contextlib import ExitStack
@@ -708,7 +721,8 @@ async def test_pipeline_preview_off_topic_gate_disabled_skips_check():
         assert result.template_id == "sva_data_integrity_v1"
         assert result.confidence_source == "rag_fallback"
     finally:
-        settings.offtopic_gate_enabled = original
+        settings.offtopic_gate_enabled = original_offtopic
+        settings.no_match_gate_enabled = original_no_match
 
 
 @pytest.mark.asyncio
@@ -1688,11 +1702,11 @@ async def test_fix2_fsm_intent_ungrounded_module_name_falls_to_default():
 # ── 第五道闸：no_matching_template gate ─────────────────────────────────────
 
 @pytest.mark.asyncio
-async def test_no_matching_template_gate_fires_when_rag_fallback_low_score():
-    """confidence_source=rag_fallback + RAG top-1 score < 0.60 → NoMatchingTemplateError。
+async def test_no_matching_template_gate_fires_on_rag_fallback():
+    """confidence_source=rag_fallback → NoMatchingTemplateError（FIX-9：score 不再参与触发判断）。
 
-    场景：LLM step1 返回 "none"（db.get 找不到对应模板），rag_fallback 生效，
-    但 top-1 score=0.45 低于阈值 → 库内无此场景，直接引导贡献。
+    场景：LLM step1 返回 "none"（db.get 找不到对应模板），rag_fallback 生效 →
+    库内无此场景，直接引导贡献。score 仅供日志，不影响触发。
     redirect_to 应以 /contribute/new? 开头，携带 description 和 code_type。
     """
     from app.services.core.pipeline import NoMatchingTemplateError
@@ -1729,16 +1743,17 @@ async def test_no_matching_template_gate_fires_when_rag_fallback_low_score():
 
 @pytest.mark.asyncio
 async def test_no_matching_template_mutex_scenario():
-    """FIX-8：互斥约束场景下 LLM step1 应返回空字符串 → rag_fallback → 第五道闸触发。
+    """FIX-9：互斥约束场景下 LLM step1 应返回空字符串 → rag_fallback → 第五道闸触发。
 
     场景：用户提交"断言 cpu_req 和 dma_req 不能在同一时钟周期同时有效，验证总线仲裁互斥约束"，
-    库内只有握手类候选（sva_handshake_stable_v1，score=0.50）。新增的负向选择规则迫使
-    LLM step1 返回空字符串而非把 cpu_req/dma_req 重映射为 valid/ready。
-    rag_fallback 接管后，top-1 score=0.50 < threshold=0.60 → NoMatchingTemplateError。
+    库内只有握手类候选（sva_handshake_stable_v1）。真实生产现场 cross-encoder 因
+    req 词汇重叠给该模板 score=1.0；新增的负向选择规则迫使 LLM step1 返回空字符串
+    而非把 cpu_req/dma_req 重映射为 valid/ready。rag_fallback 接管后，FIX-9 闸条件
+    已不再依赖 score，故 score=1.0 也能触发 NoMatchingTemplateError。
     """
     from app.services.core.pipeline import NoMatchingTemplateError
 
-    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.50)]
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=1.0)]
     # 新负向规则下，LLM 对互斥场景应返回空字符串（而非强行映射到握手模板）
     llm_sel = TemplateSelectionOutput(template_id="", param_mapping={}, confidence=0.0)
 
@@ -1762,7 +1777,7 @@ async def test_no_matching_template_mutex_scenario():
 
     err = excinfo.value
     assert err.detector == "no_matching_template"
-    assert err.top_score == pytest.approx(0.50)
+    assert err.top_score == pytest.approx(1.0)
     assert err.code_type == "assertion"
     assert err.redirect_to.startswith("/contribute/new?")
     assert "description=" in err.redirect_to
@@ -1770,15 +1785,13 @@ async def test_no_matching_template_mutex_scenario():
 
 
 @pytest.mark.asyncio
-async def test_no_matching_template_gate_skipped_when_rag_score_high():
-    """confidence_source=rag_fallback + RAG top-1 score >= 0.60 → 闸不触发，走正常流程。
-
-    场景：LLM 返 "none" 但 RAG top-1 score=0.72（较高）→ 说明库内可能有相关模板，
-    只是描述模糊 → 不应跳贡献页，应让 rag_fallback 流程继续（可能走 under_specified）。
+async def test_no_matching_template_gate_disabled_skips():
+    """NO_MATCH_GATE_ENABLED=false → 即便 rag_fallback + score=1.0，闸不触发，
+    退回旧 rag_fallback → 正常流程。紧急关闸通道回归保护。
     """
-    from app.services.core.pipeline import NoMatchingTemplateError
+    from app.core.config import get_settings
 
-    rag = [_make_rag_candidate("cov_transition_coverage_v1", score=0.72)]
+    rag = [_make_rag_candidate("cov_transition_coverage_v1", score=1.0)]
     llm_sel = TemplateSelectionOutput(template_id="none", param_mapping={}, confidence=0.4)
 
     fake_tmpl = MagicMock()
@@ -1795,9 +1808,13 @@ async def test_no_matching_template_gate_skipped_when_rag_score_high():
     stack, fake_db = _patch_preview_deps(rag, llm_sel)
     fake_db.get = AsyncMock(side_effect=_db_get_side_effect)
 
-    # 不应抛 NoMatchingTemplateError；正常返回（无必填参数，无 under_specified）
-    with stack:
-        result = await pipeline_preview(_make_preview_inp("生成一个 FSM 转换覆盖率"), fake_db)
-
-    assert result.template_id == "cov_transition_coverage_v1"
-    assert result.confidence_source == "rag_fallback"
+    settings = get_settings()
+    original = settings.no_match_gate_enabled
+    settings.no_match_gate_enabled = False
+    try:
+        with stack:
+            result = await pipeline_preview(_make_preview_inp("生成一个 FSM 转换覆盖率"), fake_db)
+        assert result.template_id == "cov_transition_coverage_v1"
+        assert result.confidence_source == "rag_fallback"
+    finally:
+        settings.no_match_gate_enabled = original
