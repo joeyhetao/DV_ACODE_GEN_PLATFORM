@@ -16,6 +16,8 @@ from app.schemas.contribution import (
     ContributionOut,
     ContributionListOut,
     ContributionReviewAction,
+    ContributionPreviewRequest,
+    ContributionPreviewResponse,
     ConflictItem,
     PreApproveAnalysisResult,
 )
@@ -29,8 +31,10 @@ from app.services.core.dedup import check_name_duplicate, check_semantic_duplica
 from app.services.platform.parameter_extractor import (
     ContributionParseError,
     derive_parameters_from_demo,
+    generate_from_intent,
     _validate_jinja_rendering,
     _validate_parameter_defs,
+    _validate_template_name,
 )
 from app.services.platform.corpus_service import (
     generate_corpus_cases,
@@ -43,104 +47,170 @@ _PRE_ANALYSIS_TTL = 60 * 60  # 1h — admin must approve within an hour of runni
 router = APIRouter(prefix="/contributions", tags=["contributions"])
 
 
+def _parse_failed_422(e: ContributionParseError) -> HTTPException:
+    """统一 contribution_parse_failed 422 响应构造。"""
+    return HTTPException(
+        status_code=422,
+        detail={
+            "type": "contribution_parse_failed",
+            "stage": e.stage,
+            "reason": e.reason,
+            "message": (
+                f"AI 解析失败（阶段：{e.stage}），请完善场景描述 / 代码示例后重试。"
+            ),
+        },
+    )
+
+
+@router.post("/preview", response_model=ContributionPreviewResponse)
+async def preview_contribution(
+    payload: ContributionPreviewRequest,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    """FEAT-10：仅基于 original_intent + code_type 让 LLM 生成完整模板预览（不入库）。
+
+    成功 → 返回 LLM 生成的 5 字段 + name_conflict 标记；失败 → 422 contribution_parse_failed。
+    name_conflict 非阻塞——前端展示警告，让用户改名后再提交。
+    """
+    llm = await get_default_llm_client(db)
+    try:
+        extracted = await generate_from_intent(
+            original_intent=payload.original_intent,
+            code_type=payload.code_type,
+            llm=llm,
+        )
+    except ContributionParseError as e:
+        raise _parse_failed_422(e)
+
+    name_conflict = await check_name_duplicate(db, extracted.template_name)
+    # demo_code 回传 LLM 产出的**原始 SystemVerilog 代码**（含真实信号名 / 字面量），
+    # 前端用它作为"立即使用"的可复制代码块；jinja_body 不暴露给前端——它在用户编辑后
+    # 由 submit 端点（branch 3）通过 derive_parameters_from_demo 重新生成。
+    return ContributionPreviewResponse(
+        template_name=extracted.template_name,
+        description=extracted.description,
+        demo_code=extracted.demo_code,
+        parameter_defs=extracted.parameter_defs,
+        keywords=extracted.keywords,
+        name_conflict=name_conflict,
+    )
+
+
 @router.post("", response_model=ContributionOut, status_code=201)
 async def submit_contribution(
     payload: ContributionCreate,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    """v3.0：用户只填 4 必填字段（code_type / template_name / description / demo_code），
-    后端 LLM 反推 parameter_defs / jinja body / keywords / subcategory / protocol。
+    """FEAT-10：提交贡献，支持 3 条分支并存。
 
-    LLM 反推失败 → 422 `contribution_parse_failed`，前端弹"请简化代码示例"提示。
-    成功 → status=pending_review 入库，进入审核队列。
+    分支选择（按顺序判断）：
+    1. **intent-only 生成**：缺 template_name 或 demo_code → 调 generate_from_intent 让 LLM 同时
+       产出 template_name + description + demo_code + parameter_defs + keywords。
+    2. **显式 parameter_defs**：caller 显式传了 parameter_defs（如 v2 批量导入） → 直接入库，
+       不跑 LLM。
+    3. **v3.0 demo 反推**：4 字段齐全（template_name + description + demo_code）→ 跑
+       derive_parameters_from_demo 把 demo_code 反推为 Jinja2 模板。
 
-    P1-6 dedup：
-    - **提交时**：name 精确重名直接 422（用户必须先改名）；语义查重把 top-3 塞 original_row_json
-      让审核员看到，不拦提交（审核员有权拍板"是变体还是重复"）。
-    - approve 端点：信任审核员已经基于 dedup 信息做了决策，不再重复 dedup。
-
-    P2-14 db session 占用：LLM 反推耗时 5-15s，期间 db connection 被这个请求占。当前实现
-    在 LLM 调用之后才 db.add + commit，已经把 PG 持有时间压到最低。**若并发提交频繁**，可
-    在 docker-compose 里调大 PG `max_connections` 或 SQLAlchemy `pool_size`。
+    P1-6 dedup：name 精确重名 422；语义查重 top-3 塞 original_row_json 不阻塞。
     """
-    # P1-6：name 精确查重——同名 template 已存在则拒
-    if await check_name_duplicate(db, payload.template_name):
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "type": "contribution_name_duplicate",
-                "name": payload.template_name,
-                "message": f"模板名「{payload.template_name}」已存在，请换个名字。",
-            },
-        )
+    # 分支 1：缺关键字段则触发 intent-only 生成
+    need_llm_generate = not (payload.template_name and payload.demo_code)
 
-    # v2 兼容：若 caller 显式传了 parameter_defs（如批量导入），跳过 LLM 反推
-    if payload.parameter_defs:
-        derived_param_defs = payload.parameter_defs
-        derived_jinja_body = payload.demo_code
-        derived_keywords = payload.keywords or []
-        derived_subcategory = payload.subcategory
-        derived_protocol = payload.protocol
-    else:
-        # v3.0 主路径：LLM 反推
+    if need_llm_generate:
         llm = await get_default_llm_client(db)
         try:
-            extracted = await derive_parameters_from_demo(
-                demo_code=payload.demo_code,
-                description=payload.description,
+            generated = await generate_from_intent(
+                original_intent=payload.original_intent,
                 code_type=payload.code_type,
                 llm=llm,
             )
         except ContributionParseError as e:
-            raise HTTPException(
-                status_code=422,
-                detail={
-                    "type": "contribution_parse_failed",
-                    "stage": e.stage,
-                    "reason": e.reason,
-                    "message": (
-                        "AI 解析代码示例失败，请简化代码示例 / 完善场景描述后重新提交。"
-                        f"（失败阶段：{e.stage}）"
-                    ),
-                },
-            )
-        derived_param_defs = extracted.parameter_defs
-        derived_jinja_body = extracted.jinja_body
-        derived_keywords = extracted.keywords
-        derived_subcategory = extracted.subcategory or payload.subcategory
-        derived_protocol = extracted.protocol or payload.protocol
+            raise _parse_failed_422(e)
+        final_template_name = payload.template_name or generated.template_name
+        final_description = payload.description or generated.description
+        # user_demo（保留进 original_row_json["user_demo"]）始终是**原始 SV 代码**，
+        # 不是 Jinja2 模板体——审核员对比时看的是用户/LLM 视角的"能跑的代码"。
+        final_user_demo = payload.demo_code or generated.demo_code
+        derived_param_defs = generated.parameter_defs
+        derived_jinja_body = generated.jinja_body
+        derived_keywords = generated.keywords
+        derived_subcategory = generated.subcategory or payload.subcategory
+        derived_protocol = generated.protocol or payload.protocol
+    else:
+        final_template_name = payload.template_name
+        final_description = payload.description or ""
+        final_user_demo = payload.demo_code
+
+        # 分支 2：v2 兼容——显式传了 parameter_defs，跳过 LLM
+        if payload.parameter_defs:
+            derived_param_defs = payload.parameter_defs
+            derived_jinja_body = payload.demo_code
+            derived_keywords = payload.keywords or []
+            derived_subcategory = payload.subcategory
+            derived_protocol = payload.protocol
+        else:
+            # 分支 3：v3.0 4 字段路径——LLM 反推 demo_code → Jinja2
+            llm = await get_default_llm_client(db)
+            try:
+                extracted = await derive_parameters_from_demo(
+                    demo_code=payload.demo_code,
+                    description=final_description,
+                    code_type=payload.code_type,
+                    llm=llm,
+                )
+            except ContributionParseError as e:
+                raise _parse_failed_422(e)
+            derived_param_defs = extracted.parameter_defs
+            derived_jinja_body = extracted.jinja_body
+            derived_keywords = extracted.keywords
+            derived_subcategory = extracted.subcategory or payload.subcategory
+            derived_protocol = extracted.protocol or payload.protocol
+
+    # FEAT-10 C1：用户传入的 template_name 也必须过命名规范校验（LLM 路径下 generate_from_intent
+    # 内部已校验，但分支 2/3 + 分支 1 的 payload.template_name 覆盖路径不会自动跑校验）
+    try:
+        _validate_template_name(final_template_name)
+    except ContributionParseError as e:
+        raise _parse_failed_422(e)
+
+    # P1-6：name 精确查重——LLM 生成后再查（intent-only 路径下 template_name 可能由 LLM 产出）
+    if await check_name_duplicate(db, final_template_name):
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "type": "contribution_name_duplicate",
+                "name": final_template_name,
+                "message": f"模板名「{final_template_name}」已存在，请换个名字。",
+            },
+        )
 
     contribution = TemplateContribution(
         contributor_id=current_user.id,
         code_type=payload.code_type,
-        original_intent=payload.original_intent or payload.description,
+        original_intent=payload.original_intent,
         original_row_json=payload.original_row_json,
-        template_name=payload.template_name,
+        template_name=final_template_name,
         subcategory=derived_subcategory,
         protocol=derived_protocol,
-        # demo_code 字段存 LLM 反推后的 Jinja2 化模板（审核员可在三栏面板里改）
-        # 用户原始代码可以从 description 字段或单独字段保留——v3.0 暂存进 original_row_json["user_demo"]
+        # demo_code 字段存 Jinja2 化模板（审核员可在三栏面板里改）
         demo_code=derived_jinja_body,
-        description=payload.description,
+        description=final_description,
         keywords=derived_keywords,
         parameter_defs=derived_param_defs,
-        # Model Enum 是 (pending_review, under_review, needs_revision, approved, rejected)；
-        # **必须**写 "pending_review"，不能写 "pending"（PG 22023 invalid_input_value）。
         status="pending_review",
     )
     # 留个 user_demo 副本在 original_row_json 里——审核员对比用
     if not contribution.original_row_json:
         contribution.original_row_json = {}
-    contribution.original_row_json["user_demo"] = payload.demo_code
+    contribution.original_row_json["user_demo"] = final_user_demo
 
-    # P1-6：语义查重——把 top-3 相似已入库模板塞 original_row_json["similar_templates"]，
-    # 让审核员在三栏面板看到，不拦提交（审核员有最终判断权）。
-    # check_semantic_duplicate 失败（如 Qdrant 暂时不可达）时不阻塞提交，仅日志告警。
+    # P1-6：语义查重——top-3 塞 original_row_json["similar_templates"]，不阻塞提交
     try:
         similar = await check_semantic_duplicate(
-            description=payload.description,
-            name=payload.template_name,
+            description=final_description,
+            name=final_template_name,
             tags=None,
             keywords=derived_keywords,
             top_k=3,

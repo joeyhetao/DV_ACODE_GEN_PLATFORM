@@ -9,6 +9,17 @@ export interface Contribution {
   status: string; reviewer_comment?: string
   promoted_template_id?: string; created_at: string; updated_at: string
   original_row_json?: Record<string, unknown> | null  // v3.0: 保留用户原始 demo
+  use_immediately_available?: boolean  // FEAT-10: 前端用于判断是否展示"立即使用"按钮
+}
+
+// FEAT-10: 预览端点响应（LLM 基于 original_intent + code_type 一次性生成的 5 字段）
+export interface ContributionPreview {
+  template_name: string
+  description: string
+  demo_code: string
+  parameter_defs: Array<Record<string, unknown>>
+  keywords: string[]
+  name_conflict: boolean
 }
 export interface ContributionListItem {
   id: string; contributor_id: string; code_type: string; template_name: string; status: string; created_at: string
@@ -35,6 +46,11 @@ export interface PreApproveAnalysisResult {
 export const contributionsApi = {
   submit: async (data: Record<string, unknown>) => {
     const res = await apiClient.post<Contribution>('/contributions', data)
+    return res.data
+  },
+  // FEAT-10: 仅基于 original_intent + code_type 让 LLM 生成预览（不入库）
+  preview: async (data: { original_intent: string; code_type: string }) => {
+    const res = await apiClient.post<ContributionPreview>('/contributions/preview', data)
     return res.data
   },
   my: async (params?: { page?: number; page_size?: number }) => {

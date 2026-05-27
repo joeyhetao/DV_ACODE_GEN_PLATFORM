@@ -1,11 +1,13 @@
 import { useState, useEffect } from 'react'
 import {
   Card, Table, Tag, Button, Space, Modal, Form, Input, Select,
-  Drawer, Descriptions, Typography, message, Alert,
+  Drawer, Descriptions, Typography, message, Alert, Steps, Spin,
 } from 'antd'
-import { PlusOutlined, EyeOutlined } from '@ant-design/icons'
+import { PlusOutlined, EyeOutlined, CopyOutlined } from '@ant-design/icons'
 import { useLocation, useSearchParams } from 'react-router-dom'
-import { contributionsApi, ContributionListItem, Contribution } from '../../api/contributions'
+import {
+  contributionsApi, ContributionListItem, Contribution, ContributionPreview,
+} from '../../api/contributions'
 import { generateApi } from '../../api/generate'
 
 const { TextArea } = Input
@@ -26,6 +28,13 @@ interface PrefillState {
   prefillCodeType?: string
 }
 
+interface SubmitErrorDetail {
+  type?: string
+  stage?: string
+  reason?: string
+  message?: string
+}
+
 export default function MyContributionsPage() {
   const location = useLocation()
   const [searchParams] = useSearchParams()
@@ -42,10 +51,17 @@ export default function MyContributionsPage() {
   const [submitVisible, setSubmitVisible] = useState(false)
   const [detailVisible, setDetailVisible] = useState(false)
   const [detail, setDetail] = useState<Contribution | null>(null)
-  const [submitForm] = Form.useForm()
-  const [submitting, setSubmitting] = useState(false)
   const [codeTypes, setCodeTypes] = useState<{ id: string; display_name: string }[]>([])
+
+  // FEAT-10: 两步流状态
+  const [step, setStep] = useState<0 | 1>(0)
+  const [step0Form] = Form.useForm()
+  const [step1Form] = Form.useForm()
+  const [previewLoading, setPreviewLoading] = useState(false)
+  const [submitting, setSubmitting] = useState(false)
+  const [previewData, setPreviewData] = useState<ContributionPreview | null>(null)
   const [parseError, setParseError] = useState<{ stage: string; reason: string } | null>(null)
+  const [submittedDemoCode, setSubmittedDemoCode] = useState<string | null>(null)
 
   const load = async () => {
     setLoading(true)
@@ -57,16 +73,26 @@ export default function MyContributionsPage() {
     }
   }
 
+  const resetModal = () => {
+    setSubmitVisible(false)
+    setStep(0)
+    setPreviewData(null)
+    setParseError(null)
+    setSubmittedDemoCode(null)
+    step0Form.resetFields()
+    step1Form.resetFields()
+  }
+
   useEffect(() => {
     load()
     generateApi.codeTypes().then(setCodeTypes).catch(() => {})
   }, [])
 
-  // v3.0：从 IntentBuilder 跳过来时，自动打开提交 Modal 并预填 description / code_type
+  // v3.0：从 IntentBuilder 跳过来时，自动打开提交 Modal 并预填 description / code_type 到 Step 0
   useEffect(() => {
     if (prefill.prefillDescription || prefill.prefillCodeType) {
-      submitForm.setFieldsValue({
-        description: prefill.prefillDescription || '',
+      step0Form.setFieldsValue({
+        original_intent: prefill.prefillDescription || '',
         code_type: prefill.prefillCodeType || 'assertion',
       })
       setSubmitVisible(true)
@@ -80,33 +106,100 @@ export default function MyContributionsPage() {
     setDetailVisible(true)
   }
 
-  const handleSubmit = async () => {
-    const values = await submitForm.validateFields()
+  const extractParseError = (e: unknown): SubmitErrorDetail | null => {
+    const err = e as { response?: { data?: { detail?: SubmitErrorDetail | string } } }
+    const d = err.response?.data?.detail
+    if (d && typeof d === 'object') return d
+    return null
+  }
+
+  // FEAT-10 Step 0 → Step 1：调 /preview 让 LLM 生成完整模板
+  const handlePreview = async () => {
+    const values = await step0Form.validateFields()
+    setPreviewLoading(true)
+    setParseError(null)
+    try {
+      const preview = await contributionsApi.preview({
+        original_intent: values.original_intent,
+        code_type: values.code_type,
+      })
+      setPreviewData(preview)
+      step1Form.setFieldsValue({
+        template_name: preview.template_name,
+        description: preview.description,
+        demo_code: preview.demo_code,
+      })
+      setStep(1)
+    } catch (e: unknown) {
+      const d = extractParseError(e)
+      if (d?.type === 'contribution_parse_failed') {
+        setParseError({ stage: d.stage || 'unknown', reason: d.reason || '' })
+      } else {
+        message.error(d?.message || '预览生成失败')
+      }
+    } finally {
+      setPreviewLoading(false)
+    }
+  }
+
+  // 共用 submit：Step 1 内点"提交审核"或"立即使用"都走这个
+  const submitCurrent = async (): Promise<Contribution | null> => {
+    const intent = step0Form.getFieldValue('original_intent') as string
+    const codeType = step0Form.getFieldValue('code_type') as string
+    const values = await step1Form.validateFields()
     setSubmitting(true)
     setParseError(null)
     try {
-      // v3.0：只提交 4 必填——keywords / parameter_defs / subcategory / protocol 全部由后端 LLM 反推
-      await contributionsApi.submit({
+      const created = await contributionsApi.submit({
+        original_intent: intent,
+        code_type: codeType,
         template_name: values.template_name,
-        code_type: values.code_type,
         description: values.description,
         demo_code: values.demo_code,
       })
-      message.success('提交成功，AI 已协助参数化，等待管理员审核')
-      setSubmitVisible(false)
-      submitForm.resetFields()
-      load()
+      return created
     } catch (e: unknown) {
-      const err = e as { response?: { data?: { detail?: { type?: string; stage?: string; reason?: string; message?: string } | string } } }
-      const detail = err.response?.data?.detail
-      if (detail && typeof detail === 'object' && detail.type === 'contribution_parse_failed') {
-        setParseError({ stage: detail.stage || 'unknown', reason: detail.reason || '' })
-        // 不关 Modal，让用户在 Modal 里看到错误并修改代码示例
+      const d = extractParseError(e)
+      if (d?.type === 'contribution_parse_failed') {
+        setParseError({ stage: d.stage || 'unknown', reason: d.reason || '' })
+      } else if (d?.type === 'contribution_name_duplicate') {
+        message.error(d.message || '模板名重复，请修改后再提交')
       } else {
-        message.error(typeof detail === 'string' ? detail : '提交失败')
+        message.error(d?.message || '提交失败')
       }
+      return null
     } finally {
       setSubmitting(false)
+    }
+  }
+
+  const handleSubmitForReview = async () => {
+    const created = await submitCurrent()
+    if (created) {
+      message.success('提交成功，等待管理员审核')
+      resetModal()
+      load()
+    }
+  }
+
+  const handleUseImmediately = async () => {
+    const created = await submitCurrent()
+    if (created) {
+      // Step 1 页面内展示可复制代码框（用 Step 1 表单里用户最终确认的 demo_code）
+      const code = step1Form.getFieldValue('demo_code') as string
+      setSubmittedDemoCode(code)
+      message.success('提交成功，模板已进入审核队列')
+      load()
+    }
+  }
+
+  const handleCopy = async () => {
+    if (!submittedDemoCode) return
+    try {
+      await navigator.clipboard.writeText(submittedDemoCode)
+      message.success('已复制到剪贴板')
+    } catch {
+      message.error('复制失败，请手动选中代码块')
     }
   }
 
@@ -134,17 +227,25 @@ export default function MyContributionsPage() {
         <Table dataSource={list} rowKey="id" columns={columns} loading={loading} size="small" pagination={{ pageSize: 15 }} />
       </Card>
 
-      {/* v3.0 提交贡献——4 必填字段，AI 自动反推 parameters JSON */}
+      {/* FEAT-10 两步提交流 */}
       <Modal
-        title="提交模板贡献（AI 协助参数化）"
+        title="提交模板贡献"
         open={submitVisible}
-        onOk={handleSubmit}
-        onCancel={() => { setSubmitVisible(false); setParseError(null) }}
-        width={760}
-        confirmLoading={submitting}
-        okText="提交，由 AI 协助参数化"
+        onCancel={resetModal}
+        width={820}
         destroyOnClose
+        footer={renderFooter()}
       >
+        <Steps
+          current={step}
+          size="small"
+          style={{ marginBottom: 24 }}
+          items={[
+            { title: '描述意图' },
+            { title: '预览并提交' },
+          ]}
+        />
+
         {parseError && (
           <Alert
             type="error"
@@ -156,51 +257,116 @@ export default function MyContributionsPage() {
               <>
                 {parseError.reason}
                 <br />
-                <Text type="secondary">请简化「代码示例」或完善「场景描述」后重新提交。</Text>
+                <Text type="secondary">请完善意图描述或调整字段后重试。</Text>
               </>
             }
             style={{ marginBottom: 16 }}
           />
         )}
-        <Alert
-          type="info"
-          showIcon
-          message="只需填 4 个字段，剩下的 AI 会自动反推"
-          description="后端会从你的代码示例里识别可参数化位置（信号名、状态枚举、位宽常量等），自动改写为 Jinja2 占位符并生成 parameters JSON。审核员会再过一遍。"
-          style={{ marginBottom: 16 }}
-        />
-        <Form form={submitForm} layout="vertical">
-          <Form.Item name="template_name" label="模板名称" rules={[{ required: true, message: '必填' }]}>
-            <Input placeholder="如：AXI 写通道地址稳定断言" />
-          </Form.Item>
-          <Form.Item name="code_type" label="代码类型" rules={[{ required: true, message: '必填' }]}>
-            <Select placeholder="选择代码类型">
-              {codeTypes.map((ct) => (
-                <Select.Option key={ct.id} value={ct.id}>{ct.display_name}</Select.Option>
-              ))}
-            </Select>
-          </Form.Item>
-          <Form.Item
-            name="description"
-            label="验证场景描述"
-            rules={[{ required: true, message: '必填' }]}
-            extra="用自然语言描述这个模板要解决什么问题；写得越具体，RAG 匹配率越高。"
-          >
-            <TextArea rows={3} placeholder="如：检测 AXI valid-ready 握手期间数据信号必须保持稳定" />
-          </Form.Item>
-          <Form.Item
-            name="demo_code"
-            label="代码示例"
-            rules={[{ required: true, message: '必填' }]}
-            extra="直接粘贴你设计里能跑的 SystemVerilog 代码，含真实信号名 / 状态枚举值 / 数字字面量。AI 会自动识别哪些是参数。"
-          >
-            <TextArea
-              rows={12}
-              style={{ fontFamily: 'monospace', fontSize: 13 }}
-              placeholder={'module my_check (input logic clk, ...);\n  property p_handshake;\n    @(posedge clk) disable iff(!rst_n)\n    awvalid && !awready |-> $stable(awaddr);\n  endproperty\n  ...\nendmodule'}
+
+        {step === 0 && (
+          <>
+            <Alert
+              type="info"
+              showIcon
+              message="只需填两件事，剩下的 AI 会自动生成"
+              description="后端会基于你的意图描述与代码类型，让 LLM 生成模板名、场景描述、完整 SystemVerilog 示例代码，以及参数列表。下一步可编辑。"
+              style={{ marginBottom: 16 }}
             />
-          </Form.Item>
-        </Form>
+            <Spin spinning={previewLoading} tip="AI 生成中（约 5-15 秒）...">
+              <Form form={step0Form} layout="vertical">
+                <Form.Item
+                  name="original_intent"
+                  label="验证意图描述"
+                  rules={[{ required: true, message: '必填' }]}
+                  extra="用自然语言描述你想验证什么；越具体越好，AI 生成的模板会更贴合。"
+                >
+                  <TextArea
+                    rows={4}
+                    placeholder="如：检测 AXI valid-ready 握手期间，地址 awaddr 必须保持稳定，直到握手完成"
+                  />
+                </Form.Item>
+                <Form.Item name="code_type" label="代码类型" rules={[{ required: true, message: '必填' }]}>
+                  <Select placeholder="选择代码类型">
+                    {codeTypes.map((ct) => (
+                      <Select.Option key={ct.id} value={ct.id}>{ct.display_name}</Select.Option>
+                    ))}
+                  </Select>
+                </Form.Item>
+              </Form>
+            </Spin>
+          </>
+        )}
+
+        {step === 1 && (
+          <>
+            {previewData?.name_conflict && (
+              <Alert
+                type="warning"
+                showIcon
+                message="模板名重复"
+                description={`AI 生成的模板名「${previewData.template_name}」已存在，请手动修改后再提交。`}
+                style={{ marginBottom: 16 }}
+              />
+            )}
+            {submittedDemoCode ? (
+              <>
+                <Alert
+                  type="success"
+                  showIcon
+                  message="代码已就绪，可直接复制使用"
+                  description="模板已提交审核，审核通过后将加入模板库。"
+                  style={{ marginBottom: 16 }}
+                />
+                <div style={{ marginBottom: 8 }}>
+                  <Button icon={<CopyOutlined />} onClick={handleCopy}>复制代码</Button>
+                </div>
+                <pre
+                  style={{
+                    background: '#f5f5f5',
+                    padding: 12,
+                    borderRadius: 6,
+                    overflow: 'auto',
+                    fontSize: 13,
+                    fontFamily: 'monospace',
+                    maxHeight: 480,
+                  }}
+                >
+                  {submittedDemoCode}
+                </pre>
+              </>
+            ) : (
+              <Form form={step1Form} layout="vertical">
+                <Form.Item
+                  name="template_name"
+                  label="模板名称"
+                  rules={[{ required: true, message: '必填' }]}
+                  extra="命名规范：sva_<scenario>_v<N> 或 cov_<scenario>_v<N>"
+                >
+                  <Input />
+                </Form.Item>
+                <Form.Item
+                  name="description"
+                  label="场景描述"
+                  rules={[{ required: true, message: '必填' }]}
+                >
+                  <TextArea rows={3} />
+                </Form.Item>
+                <Form.Item
+                  name="demo_code"
+                  label="代码示例"
+                  rules={[{ required: true, message: '必填' }]}
+                  extra="可编辑——这是 AI 基于你的意图生成的 SystemVerilog 代码"
+                >
+                  <TextArea
+                    rows={12}
+                    style={{ fontFamily: 'monospace', fontSize: 13 }}
+                  />
+                </Form.Item>
+              </Form>
+            )}
+          </>
+        )}
       </Modal>
 
       {/* Detail Drawer */}
@@ -236,4 +402,27 @@ export default function MyContributionsPage() {
       </Drawer>
     </>
   )
+
+  function renderFooter() {
+    if (step === 0) {
+      return [
+        <Button key="cancel" onClick={resetModal}>取消</Button>,
+        <Button key="preview" type="primary" loading={previewLoading} onClick={handlePreview}>
+          生成预览
+        </Button>,
+      ]
+    }
+    // Step 1
+    if (submittedDemoCode) {
+      // 已"立即使用"提交完成——只展示关闭按钮
+      return [<Button key="close" type="primary" onClick={resetModal}>关闭</Button>]
+    }
+    return [
+      <Button key="back" onClick={() => setStep(0)} disabled={submitting}>上一步</Button>,
+      <Button key="submit" loading={submitting} onClick={handleSubmitForReview}>提交审核</Button>,
+      <Button key="immediate" type="primary" loading={submitting} onClick={handleUseImmediately}>
+        立即使用
+      </Button>,
+    ]
+  }
 }
