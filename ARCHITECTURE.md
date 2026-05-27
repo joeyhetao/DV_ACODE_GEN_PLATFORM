@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.19  
+**版本**：v2.20  
 **状态**：已确认  
-**日期**：2026-05-16  
+**日期**：2026-05-27  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -37,6 +37,15 @@
   - §3.10.1 贡献提交流补齐 v3.0 LLM 反推路径的三道**校验闸**（`_validate_parameter_defs` 参数命名合法 / `_validate_jinja_rendering` 占位值能渲染 / `_validate_keywords` 形态）与**dedup 预扫**（提交时调 `check_semantic_duplicate` 把 top-3 相似已入库模板塞 `original_row_json["similar_templates"]`，失败非阻塞仅 WARN），任一校验失败抛 `ContributionParseError → 422 contribution_parse_failed`；同步列出三个入口点（批量低置信行 / IntentBuilder 5 轮无候选 / 我的贡献页"+ 新贡献"）
   - §3.11.5 IntentBuilder 补齐**5 轮对话上限**与 `suggest_contribute` 信号：每轮把 top-1 RAG score 记入 session；5 轮全 < 0.5 → 响应携 `suggest_contribute=True`，前端展示"我们的库似乎不覆盖这个场景"+ §3.10 贡献入口；LLM system prompt 强制约束输出末尾用 `<<intent>>...<<end>>` 包裹累积标准化意图供前端 prefill；并强制 RAG-priority（每轮 LLM 调用前必先跑 RAG 注入 top-3 候选 description，不允许 LLM 凭空想象新场景）
   - §3.11.3 上传预检在 v3.0 **缩水**：仅展示低置信行的"最近似模板"，不再引导逐行修改；批量场景下"低质量行"由 v3.0 `under_specified` 闸在逐行 `run_pipeline` 时 422，前端标红展示
+- v2.19 → v2.20：**FEAT-10 贡献流程二次简化为 2 字段必填 + intent-only LLM 生成**——
+  - §3.10.1 新增 `generate_from_intent(original_intent, code_type, llm) → ExtractedFull` 函数（`services/platform/parameter_extractor.py`），LLM 一次性生成 `template_name + description + demo_code + parameter_defs + jinja_body + keywords + subcategory + protocol`；在原 3 道校验闸（参数命名 / Jinja2 沙箱 / keywords 形态）之外新增 `_validate_template_name` 第 4 道校验，强制 `^(sva|cov)_[a-z][a-z0-9_]*_v\d+$` 命名规范，违规抛 `ContributionParseError(stage="template_name")`
+  - §3.10.1 `POST /api/v1/contributions` 重构为 3 分支并存（按顺序判断）：(1) 缺关键字段（`template_name` 或 `demo_code`）→ 触发 `generate_from_intent`；(2) 显式传 `parameter_defs` → v2 批量路径不调 LLM；(3) 4 字段齐全 → 原 `derive_parameters_from_demo` demo 反推路径；分支 1 同样跑 dedup 预扫与 name 精确查重
+  - §5.1 端点表新增 `POST /api/v1/contributions/preview`（仅基于 `original_intent + code_type` 让 LLM 生成完整模板预览，**不入库**），返回 `{template_name, description, demo_code, parameter_defs, keywords, name_conflict}`；`name_conflict` 由 `check_name_duplicate` 计算，**非阻塞**——前端展示 Warning Alert 让用户改名后再调 submit；解析失败统一走 `422 contribution_parse_failed`（与现 submit 端点同结构 `detail.type / detail.stage / detail.reason`）
+  - §5.1 `POST /api/v1/contributions` 响应 schema `ContributionOut` 新增 `use_immediately_available: bool = True` 字段（前端用于条件渲染"立即使用"按钮）
+  - §3.10.1 「立即使用」路径定型为**在 Step 2 Modal 内展示可复制代码框**（`<pre>` monospace + 「复制代码」按钮 + 提示文案"代码已就绪，可直接复制使用。模板已提交审核，审核通过后将加入模板库。"），**不跳转 `/generate`**——`pending_review` 贡献不在 Qdrant 中，跳过去只会触发第五道闸 `no_matching_template` 进入循环；该贡献仍以 `status=pending_review` 进审核队列
+  - 双层审核机制成型：第一层是 Step 2 用户对 LLM 输出的语义级校对（编辑或接受 `template_name / description / demo_code`），第二层是管理员三栏审核（不变）
+  - schema 变更：`ContributionCreate.original_intent` 升必填（去掉 `Optional`），`template_name / description / demo_code` 改为 `Optional`；新增 `ContributionPreviewRequest / ContributionPreviewResponse`；`ContributionOut` 增 `use_immediately_available`
+  - 前端：`MyContributionsPage` 提交 Modal 改为 Ant Design 两步 Steps；`contributions.ts` 新增 `contributionsApi.preview()` 方法与 `ContributionPreview` 接口
 
 ---
 
@@ -770,49 +779,108 @@ Admin 提交编辑
 
 ### 3.10 模板贡献服务
 
-#### 3.10.1 贡献提交（v3.0 LLM 反推路径）
+#### 3.10.1 贡献提交（v3.1 双入口 + 3 分支并存）
 
-v3.0 把贡献向导简化为"用户只填 `name + code_type + description + 代码示例`"——v2 要求用户手填参数定义表 + Demo 编辑器里塞占位符（`{{ valid_sig }}` 等）的 Step 2/3 退役。后端由 `services/platform/parameter_extractor.py::derive_parameters_from_demo()` 调 `LLMClient.chat()` 反推 `parameter_defs` + Jinja2 化的 `template_body` + `keywords` + `subcategory` + `protocol`。
+v3.1 在 v3.0 LLM 反推路径基础上**进一步把必填字段从 4 件压到 2 件**（`original_intent + code_type`），新增预览端点供前端两步 Modal 使用；原 4 字段路径作为分支 3 完全向后兼容。
 
-**入口点**（v3.0）：(1) 批量生成结果列表低置信度（< 50%）行旁的「贡献新模板」按钮；(2) IntentBuilder 5 轮对话仍无候选高置信时自动展示的「贡献新模板」入口（详 §3.11.5）；(3) 顶部导航「我的贡献」页「+ 新贡献」直接入口。三条路径走同一 POST 端点。
+**入口点**（v3.1）：(1) 批量生成结果列表低置信度（< 50%）行旁的「贡献新模板」按钮；(2) GeneratePage 第五道闸 `no_matching_template` 直跳贡献页（`redirect_to=/contribute/new?description=...&code_type=...`）；(3) IntentBuilder 5 轮对话仍无候选高置信时自动展示的「贡献新模板」入口（详 §3.11.5）；(4) 顶部导航「我的贡献」页「+ 新贡献」直接入口。所有入口最终都进同一两步 Modal。
+
+**预览端点（FEAT-10 新增，不入库）**：
+
+```
+POST /api/v1/contributions/preview
+  ↓
+ContributionPreviewRequest Schema（Pydantic）
+  - 必填：original_intent (str, 1-4096), code_type (str)
+  ↓
+调 generate_from_intent(original_intent, code_type, llm)：
+  LLMClient.chat([{system: "你是 SV 模板生成专家 + 命名规范"},
+                  {user: <intent + code_type + contract>}])
+  → _extract_json_block：兼容 ```json``` 围栏抓首个 JSON 对象
+  → 4 道校验闸（任一失败抛 ContributionParseError → 422 contribution_parse_failed）：
+    ① _validate_template_name：匹配 ^(sva|cov)_[a-z][a-z0-9_]*_v\d+$
+      失败 → stage="template_name"
+    ② _validate_parameter_defs：name/type/required/description/expr_type 齐全；
+      name 是合法 SV 标识符；expr_type ∈ {sv_identifier, sv_identifier_list,
+      sv_boolean_expr, sv_bins_expr, integer, free_text}
+      失败 → stage ∈ {param_defs_shape, param_defs_empty, param_defs_name,
+      param_defs_expr_type}
+    ③ _validate_jinja_rendering：用占位值跑一次 SandboxedEnvironment +
+      StrictUndefined 渲染
+      失败 → stage ∈ {jinja_empty, jinja_syntax, jinja_sandbox (SSTI/不安全
+      操作), jinja_render (StrictUndefined / 参数引用失败)}
+    ④ _validate_keywords：必须是 list[str]，自动去重 / 过滤空串；非 list 即拒
+      失败 → stage="keywords_shape"
+  返回 ExtractedFull(template_name, description, demo_code, parameter_defs,
+                     jinja_body, keywords, subcategory, protocol)
+  ↓
+check_name_duplicate(extracted.template_name) → name_conflict: bool（非阻塞）
+  ↓
+返回 ContributionPreviewResponse(template_name, description, demo_code,
+                                  parameter_defs, keywords, name_conflict)
+```
+
+`demo_code` 回传 LLM 产出的**原始 SystemVerilog 代码**（含真实信号名 / 字面量），不暴露 `jinja_body`——`jinja_body` 在 submit 时由 `derive_parameters_from_demo` 用用户最终编辑过的 `demo_code` 重新生成，保证用户对代码的修改会被传递到模板体。
+
+**提交端点（3 分支并存，按顺序判断）**：
 
 ```
 POST /api/v1/contributions
   ↓
-ContributionCreate Schema 验证（Pydantic）
-  - 必填：name, code_type, description, demo_code
-  - 可选：parameter_defs（传则走旧路径，不调 LLM 反推；不传则走 v3.0 反推路径）
-  - description 非空校验（RAG 向量化依赖此字段）
+ContributionCreate Schema（Pydantic）
+  - 必填：original_intent (str, 1-4096), code_type
+  - 可选：template_name, description, demo_code, parameter_defs（v3.1 全部可选）
   ↓
-分支：
-  parameter_defs 已提供 → 沿用用户原 demo_code 作 template_body（旧路径，contributions.py 内部分支）
-  parameter_defs 未提供 → 调 derive_parameters_from_demo(demo_code, description, code_type)：
-      LLMClient.chat([{system: "你是 SV 模板反推专家"}, {user: <demo+description+contract>}])
-      → _extract_json_block：从 LLM 输出里抓第一个 JSON 对象（兼容 ```json``` 围栏）
-      → 三道校验闸（任一失败抛 ContributionParseError → 422 contribution_parse_failed，
-        前端弹"你的代码示例太复杂/有语法歧义/含太多边角逻辑"友好提示）：
-        ① _validate_parameter_defs：每项必须含 name/type/required/description/expr_type；
-          name 必须是合法 SV 标识符（无中文/无特殊字符）；expr_type 取值在
-          {sv_identifier, sv_identifier_list, sv_boolean_expr, sv_bins_expr, integer, free_text}；
-          required=True 项不能有 default 字段（语义冲突）
-        ② _validate_jinja_rendering：用所有参数的占位值（"<param>"）跑一次 Jinja2
-          StrictUndefined 渲染；语法错误 / 引用未声明变量 / 模板渲空 → 拒
-        ③ _validate_keywords：必须是 list[str]，每项非空、长度 ≤ 32、共 ≤ 10 个
-      返回 ExtractedTemplate(parameter_defs, jinja_body, keywords, subcategory, protocol)
+分支判定：need_llm_generate = not (template_name and demo_code)
+
+【分支 1 — intent-only 生成】（need_llm_generate=true）
+  调 generate_from_intent(original_intent, code_type, llm)，跑同样 4 道校验闸
+  final_template_name = payload.template_name or generated.template_name
+  final_description   = payload.description   or generated.description
+  final_user_demo     = payload.demo_code     or generated.demo_code
+  derived_param_defs  = generated.parameter_defs
+  derived_jinja_body  = generated.jinja_body  ← LLM 同时产出的 Jinja2 体
+  derived_keywords    = generated.keywords
+
+【分支 2 — v2 批量兼容】（need_llm_generate=false AND payload.parameter_defs 显式给出）
+  derived_param_defs = payload.parameter_defs（caller 已是结构化）
+  derived_jinja_body = payload.demo_code（caller 已是 Jinja2 体）
+  不调 LLM
+
+【分支 3 — v3.0 demo 反推】（need_llm_generate=false AND payload.parameter_defs 未给）
+  调 derive_parameters_from_demo(demo_code, description, code_type)
+  跑 3 道校验闸（参数命名 / Jinja2 沙箱 / keywords 形态）
   ↓
-dedup 预扫（v3.0）：调 check_semantic_duplicate(description, name, tags) 用 dense-only
-  余弦取 top-3 相似已入库模板，命中即写入 contribution.original_row_json["similar_templates"]
-  供审核员事后参考；check 失败（Qdrant 暂时不可达等）非阻塞，仅打 WARN 日志继续入队
+_validate_template_name(final_template_name)
+  分支 1 内 generate_from_intent 已校验，但分支 2/3 + 分支 1 中 payload.template_name 覆盖路径需补校验
+  失败 → 422 contribution_parse_failed(stage="template_name")
   ↓
-写入 template_contributions（status=pending_review，存反推/原始两份；
-  demo_code 字段填 LLM 反推 jinja_body，original_row_json 含用户原始 demo_code + similar_templates）
+check_name_duplicate(final_template_name) 命中 → 422 contribution_name_duplicate（阻塞）
   ↓
-返回 contribution_id + status
+dedup 预扫：check_semantic_duplicate(description, name) dense-only 取 top-3
+  命中即写入 contribution.original_row_json["similar_templates"]；
+  失败（Qdrant 暂时不可达等）非阻塞，仅打 WARN
+  ↓
+写入 template_contributions（status=pending_review）
+  - demo_code 字段填 derived_jinja_body（用户编辑过的 SV 代码经过 jinja 化）
+  - original_row_json["user_demo"] = final_user_demo（保留原始 SV 代码供审核员对比）
+  - original_row_json["similar_templates"] = dedup 预扫结果
+  ↓
+返回 ContributionOut（含 use_immediately_available: bool = True）
 ```
 
-整段同步耗时 5-15s（LLM 反推占主要）。审核员在 AdminContributionsPage 看到**三栏对照**：左栏用户原始 demo_code（只读）/ 中栏反推后的 jinja_body（Monaco 可改）/ 右栏反推后的 parameter_defs + keywords + subcategory + protocol（表单可改）+ 顶部横栏展示 dedup 预扫的 top-3 相似模板（≥ 0.90 黄色警告）；任意修改后批准走 §3.10.2 入库流水线（取审核员修改后的中右栏内容再跑一次 Jinja2 验证 + 向量化 + 写 Qdrant/PG）。
+整段同步耗时 5-15s（LLM 占主要）。审核员在 AdminContributionsPage 看到**三栏对照**：左栏用户原始 `original_row_json["user_demo"]`（只读）/ 中栏 `demo_code`（已 Jinja2 化，Monaco 可改）/ 右栏 `parameter_defs + keywords + subcategory + protocol`（表单可改）+ 顶部横栏展示 dedup 预扫的 top-3 相似模板（≥ 0.90 黄色警告）；任意修改后批准走 §3.10.2 入库流水线。
 
-重提流程：被请求修改的贡献，普通用户只能改 description + demo_code（左栏内容），重提会**重新跑一次 LLM 反推 + 三闸 + dedup 预扫**——审核员对中右栏的旧手改在重提后丢弃，避免新旧反推产物错配。
+**双层审核机制**：
+
+- **第一层（用户验证 LLM 输出）**：前端两步 Modal 的 Step 2 就是用户对 LLM 生成质量的把关——预览返回的 `template_name / description / demo_code` 三字段全部可在 Step 2 编辑后再提交；这是把"参数化脏活推给 LLM"后必须建立的反馈环
+- **第二层（管理员审批入库）**：与 §3.7.5 三栏审核完全一致，审核员独立判定质量并对中右栏改写后批准
+
+**「立即使用」路径（FEAT-10）**：Step 2 内点「立即使用」按钮 → 与「提交审核」走完全相同的 `POST /api/v1/contributions`（贡献仍以 `pending_review` 入审核队列），区别在前端**不关闭 Modal**，而是在 Step 2 页面内展示可复制代码框（`<pre>` monospace 块 + 「复制代码」按钮 + 提示文案"代码已就绪，可直接复制使用。模板已提交审核，审核通过后将加入模板库。"），用户可一键复制 LLM 生成的 SV 代码直接粘进设计。
+
+**不跳转 `/generate`**——刚提交的贡献处于 `pending_review` 不在 Qdrant 中，若跳过去走 pipeline 仍会触发第五道闸 `no_matching_template` 进入死循环；在 Step 2 内展示代码框是 FEAT-10 spec §5（"立即使用"方案 A）确定的方案，最简单且无副作用。
+
+重提流程：被请求修改的贡献，普通用户在两步 Modal 中改 `original_intent + code_type` 重新走预览/编辑流程，重提会**重新跑一次 LLM 生成 + 4 闸 + dedup 预扫**——审核员对中右栏的旧手改在重提后丢弃，避免新旧产物错配。
 
 #### 3.10.2 批准入库流水线
 
@@ -1867,7 +1935,8 @@ WHERE is_default = true;
 | DELETE | `/api/v1/admin/llm/configs/{id}` | 删除配置（默认模型不可删） | 超管 |
 | PUT | `/api/v1/admin/llm/configs/{id}/set-default` | 设为默认（自动清空相关 Redis 缓存） | 超管 |
 | POST | `/api/v1/admin/llm/configs/{id}/test` | 执行模型测试（basic/normalization/template_selection） | 超管 |
-| POST | `/api/v1/contributions` | 提交模板贡献 | 登录用户+ |
+| POST | `/api/v1/contributions/preview` | **FEAT-10**：仅基于 `original_intent + code_type` 让 LLM 生成完整模板预览（**不入库**）；返回 `{template_name, description, demo_code, parameter_defs, keywords, name_conflict}`；`name_conflict` 由 `check_name_duplicate` 计算非阻塞；解析失败统一 422 `contribution_parse_failed`（含 `detail.stage` / `detail.reason`） | 登录用户+ |
+| POST | `/api/v1/contributions` | 提交模板贡献；v3.1 必填降至 `original_intent + code_type`，`template_name / description / demo_code` 全部可选；按顺序 3 分支判定（intent-only LLM 生成 / 显式 parameter_defs 走 v2 批量路径 / 4 字段齐全走 demo 反推）；响应 `ContributionOut` 新增 `use_immediately_available: bool = True` | 登录用户+ |
 | GET | `/api/v1/contributions/mine` | 查看我的贡献列表 | 登录用户+ |
 | GET | `/api/v1/contributions/{id}` | 查看贡献详情 | 贡献者本人 |
 | PUT | `/api/v1/contributions/{id}` | 修改贡献（仅 needs_revision 状态） | 贡献者本人 |

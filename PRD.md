@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 产品需求文档（PRD）
 
-**版本**：v3.0  
+**版本**：v3.1  
 **状态**：起草中  
-**日期**：2026-05-14  
+**日期**：2026-05-27  
 **变更**：
 - v1.0 → v2.0：输入方式由"自然语言+Excel信号表"调整为"双表格结构化输入"（SVA需求表 + 功能覆盖率需求表）
 - v2.0 → v2.1：新增模板贡献与审核机制，处理 RAG 置信度 < 50% 时模板缺口的知识沉淀闭环
@@ -25,6 +25,7 @@
   - `normalize_intent` 角色降级为"**弃权信号载体**"：sentinel "无法判断类型，输出原文"保留，但下游不再用它做兜底——sentinel 之后参数仍是低置信源时 under_specified 闸照常拦。同义改写本身仍跑（保 cache key 稳定），但**不**承担"我替你猜你想说什么"的职责。
   - PipelineInput 新增可选字段 `source: "intent_builder" | "direct" = "direct"`，仅供日志/统计区分入口（不影响路由逻辑）。
   - **不**加新的低 confidence 硬闸——v2.13 的 4 道闸（off-topic / code_type_mismatch / under_specified / empty_retrieval）已覆盖所有"用户问题"场景，置信度保留为信息性元数据，由前端 ConfirmationPanel 软提示「贡献新模板」入口决定后续动作
+- v3.0 → v3.1：**§3.7 模板贡献向导从 4 字段再次简化为 2 字段**（FEAT-10）——用户只填 `original_intent + code_type` 两件，`template_name / description / demo_code` 由后端 LLM 一次性生成；前端提交 Modal 改为两步 Steps：Step 1 输入意图调 `POST /api/v1/contributions/preview` 取预览；Step 2 展示并允许编辑 `template_name / description / demo_code`，提供「提交审核」与「立即使用」两个按钮。新增**双层审核**机制：第一层是用户在 Step 2 对 LLM 输出做语义级验证（编辑或接受），第二层是管理员三栏审核（不变）。「立即使用」直接在 Step 2 页面内展示可复制代码框（`<pre>` 块 + 复制按钮），**不再跳转 `/generate`**——避免 `pending_review` 贡献因不在 Qdrant 中触发 `no_matching_template` 闸进入循环。LLM 生成的 `template_name` 走 `^(sva|cov)_[a-z][a-z0-9_]*_v\d+$` 命名规范校验 + `check_name_duplicate`，重名时预览响应携带 `name_conflict: true` 非阻塞提示（前端 Warning Alert 引导改名后重提）。`ContributionOut` 新增 `use_immediately_available: bool` 恒 true 字段供前端条件渲染。原 4 字段提交路径（`template_name + description + demo_code` 全传）作为分支 3 完全向后兼容；`parameter_defs` 显式传入仍走 v2 批量路径不调 LLM。
 
 ---
 
@@ -332,40 +333,67 @@ Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最
 
 ---
 
-#### 3.7.2 贡献向导（v3.0 大幅简化为单页表单）
+#### 3.7.2 贡献向导（v3.1 两步式 Modal，2 字段必填）
 
-点击「贡献新模板」打开单页（不再分多 Step Modal），用户只需填以下 4 个字段：
+点击「贡献新模板」打开两步 Modal（Ant Design Steps），用户**只需必填 2 个字段**：
+
+**Step 1 — 输入验证意图**
 
 | 字段 | 说明 | 必填 |
 |------|------|------|
-| 模板名称 | 简短描述性名称，如"AXI 写通道地址稳定断言" | ✓ |
-| 代码类型 | 单选：SVA 断言 / UVM 覆盖率 | ✓ |
-| 验证场景描述 | 自然语言描述这个模板要解决什么问题（用于 RAG 语义匹配，**写得越具体匹配率越高**） | ✓ |
-| 代码示例 | Monaco Editor SystemVerilog 高亮——**直接粘贴你设计里能跑的代码**，含真实信号名、状态枚举值、数字字面量；后端 LLM 会自动识别哪些是参数、哪些是固定结构 | ✓ |
+| `original_intent` | 自然语言描述你要验证的场景（4 行 TextArea），如"检测 AXI 写通道在 awvalid 拉高到 awready 到来期间地址保持稳定" | ✓ |
+| `code_type` | 单选：SVA 断言 / UVM 覆盖率 | ✓ |
 
-**不需要填**：~~参数定义表单~~ / ~~占位符映射~~ / ~~分类下拉~~ / ~~协议下拉~~ / ~~关键词~~——这些全部由后端 LLM 反推。
+点「生成预览」→ 前端调 `POST /api/v1/contributions/preview`（不入库，仅返回 LLM 生成结果），后端同步跑 LLM + 3 道校验（5-15s），成功进入 Step 2。
 
-提交按钮文案："**提交，由 AI 协助参数化**"。
+**Step 2 — 预览编辑与提交**
+
+LLM 生成的 5 字段在 Step 2 中展示为**可编辑表单**：
+
+| 字段 | 控件 | 来源 | 用户能改？ |
+|------|------|------|----------|
+| `template_name` | Input | LLM 按 `^(sva|cov)_[a-z][a-z0-9_]*_v\d+$` 规范生成 | ✅ |
+| `description` | TextArea（3 行） | LLM 按标准 IC 验证措辞生成 | ✅ |
+| `demo_code` | TextArea（12 行 monospace） | LLM 生成的完整 SVA/UVM 代码（含真实信号名） | ✅ |
+| `parameter_defs` | （隐藏） | LLM 反推参数定义；用户不直接看 | — |
+| `keywords` | （隐藏） | LLM 推测；用户不直接看 | — |
+
+若预览响应中 `name_conflict: true`，Step 2 顶部显示黄色 Warning Alert："此名称与现有模板重名，请修改 `template_name` 后再提交"。
+
+底部两个动作按钮：
+
+- **提交审核**：调 `POST /api/v1/contributions`（携带 Step 2 中用户最终确认/编辑后的 5 字段），状态入 `pending_review` 进审核队列；Modal 关闭，刷新列表
+- **立即使用**：同样调 `POST /api/v1/contributions` 入审核队列，但**不关闭 Modal**——Step 2 页面内展示可复制代码框（`<pre>` monospace 块 + 「复制代码」按钮 + 提示文案"代码已就绪，可直接复制使用。模板已提交审核，审核通过后将加入模板库。"）。**不跳转 `/generate`** —— 该贡献处于 `pending_review` 不在 Qdrant 中，跳过去只会触发第五道闸 `no_matching_template` 进入循环
+
+**不需要填**：~~参数定义表单~~ / ~~占位符映射~~ / ~~分类下拉~~ / ~~协议下拉~~ / ~~关键词~~ / ~~模板名称~~ / ~~场景描述~~ / ~~代码示例~~——全部由后端 LLM 一次性生成；用户负责语义级校对。
+
+**向后兼容**：原 4 字段提交路径（caller 同时显式传 `template_name + description + demo_code`）仍受支持——`POST /api/v1/contributions` 按 3 个分支选择路径：(1) 缺关键字段触发 intent-only 生成；(2) 显式传 `parameter_defs` 走 v2 批量路径不调 LLM；(3) 4 字段齐全走原 demo 反推路径。
 
 ---
 
-#### 3.7.3 后端 LLM 反推流程（提交时一次性跑）
+#### 3.7.3 后端 LLM 生成流程（preview / submit 两端共用）
 
-后端收到提交后**同步**完成（耗时预估 5-15s）：
+`generate_from_intent(original_intent, code_type, llm)` 同步完成（耗时预估 5-15s），preview 与 submit（分支 1）端点共用：
 
-1. **LLM 参数化 pass**（沿用 `llm_configs.is_default`）：
-   - System prompt 喂模板库已有 schema 风格作为示例
-   - User prompt = 用户填的 description + 代码示例
-   - 输出：(a) `parameters` JSON（含 name / type / required / description / expr_type / role_hint / default），(b) `template_body`（用 `{{ param }}` 占位真实信号的 Jinja2 模板），(c) 推测的 `keywords` / `subcategory` / `protocol`
-2. **自动校验**（三道，任一失败回 422 让用户重提）：
-   - Jinja2 用占位值能渲染通过（StrictUndefined 不报错）
-   - `parameters` JSON 字段命名合法（无中文 / 无特殊字符 / `expr_type` 都声明）
-   - 渲染后的 SV 代码经轻量词法扫描通过（括号/分号配平、关键字识别）
-3. **dedup 预扫**：用 description 跑一次语义查重（沿用 `check_semantic_duplicate`，阈值 0.90），若命中已有模板，提交记录里附"相似模板列表"供审核员对比
-4. 全部通过 → 状态 `pending_review`，进入审核队列
-5. **任一失败** → 返回 422 `contribution_parse_failed`，前端弹 Modal 显示具体失败原因，用户可改代码示例后重提
+1. **LLM 一次性生成 5 字段**（沿用 `llm_configs.is_default`）：
+   - System prompt 喂模板库已有 schema 风格 + 命名规范（`sva_<scenario>_v<N>` / `cov_<scenario>_v<N>`）作为约束
+   - User prompt = `original_intent + code_type`
+   - 输出：(a) `template_name`、(b) `description`、(c) `demo_code`（含真实信号名 / 字面量的完整 SV 代码），(d) `parameters` JSON（含 name / type / required / description / expr_type / role_hint / default），(e) `jinja_body`（用 `{{ param }}` 占位真实信号的 Jinja2 模板），(f) `keywords` / `subcategory` / `protocol`
+2. **自动校验**（4 道，任一失败回 422 `contribution_parse_failed`，`detail` 含 `stage` + `reason`）：
+   - `_validate_template_name`：必须匹配 `^(sva|cov)_[a-z][a-z0-9_]*_v\d+$`（`stage="template_name"`）
+   - `_validate_parameter_defs`：每项含 `name/type/required/description/expr_type`，name 是合法 SV 标识符，`expr_type ∈ {sv_identifier, sv_identifier_list, sv_boolean_expr, sv_bins_expr, integer, free_text}`（`stage ∈ {param_defs_shape, param_defs_empty, param_defs_name, param_defs_expr_type}`）
+   - `_validate_jinja_rendering`：Jinja2 用占位值跑 `SandboxedEnvironment` + `StrictUndefined` 渲染通过（`stage ∈ {jinja_empty, jinja_syntax, jinja_sandbox (SSTI/不安全操作), jinja_render (StrictUndefined / 参数引用失败)}`）
+   - `_validate_keywords`：必须是 `list[str]`，自动去重 / 过滤空串；非 list 即拒（`stage="keywords_shape"`）
+3. **`name_conflict` 检测**（preview 端点专属，非阻塞）：跑 `check_name_duplicate`，命中已入库模板时响应携带 `name_conflict: true`；submit 端点遇重名仍 422 `contribution_name_duplicate` 阻塞
+4. **dedup 预扫**（submit 端点）：用 description 跑一次语义查重（沿用 `check_semantic_duplicate`，阈值 0.90），命中已有模板时把"相似模板列表"塞 `original_row_json["similar_templates"]` 供审核员对比；查重失败（Qdrant 暂时不可达等）非阻塞
+5. submit 全部通过 → 状态 `pending_review`，进入审核队列
 
-错误情况下用户**不会**看到中间产物——只看到"你的代码示例太复杂/有语法歧义/含太多边角逻辑，请简化"的友好提示。
+错误情况下用户**不会**看到中间产物——只看到"你的描述太模糊 / LLM 生成的代码无法参数化"的友好提示，用户可改 Step 1 的 `original_intent` 重新生成预览。
+
+**双层审核机制**：
+
+- **第一层（用户验证 LLM 输出）**：Step 2 预览页就是用户对 LLM 生成质量的把关——任何不准确的命名、措辞或代码细节，用户可在 Step 2 直接改后再提交；这是 v3.1 把"参数化脏活推给 LLM"后增加的关键反馈环
+- **第二层（管理员审批入库）**：与 §3.7.5 既有三栏审核完全一致，审核员对左/中/右栏任意修改后批准触发 §3.10.2 入库流水线
 
 #### 3.7.4 我的贡献（普通用户）
 
@@ -408,7 +436,7 @@ Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最
 | 操作 | 说明 |
 |------|------|
 | 批准并入库 | 取中栏 + 右栏当前内容（含审核员的修改）触发模板创建流水线（再跑一次 Jinja2 验证→向量化→写 Qdrant + PostgreSQL），系统自动分配模板 ID |
-| 请求修改 | 必填审核意见，贡献者收到通知后可重新编辑提交（**只能改左栏：description + 代码示例**，重提会重新跑 LLM 反推） |
+| 请求修改 | 必填审核意见，贡献者收到通知后可重新编辑提交（v3.1：贡献者只能在两步 Modal 中改 `original_intent + code_type` 后重新走预览/编辑流程，重提会重新跑 LLM 生成；审核员对中右栏的旧手改在重提后丢弃，避免新旧产物错配） |
 | 退回 | 必填退回原因，记录归档，状态标为已退回 |
 
 **v3.0 不做**：审核员与 LLM 的多轮对话（"AI 这个 parameters 拆得不对，再来一遍"）—— v3.5 议题。当前若 LLM 反推质量不好，审核员直接手改中/右栏即可。
