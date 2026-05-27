@@ -426,7 +426,7 @@ curl -s -w "HTTP %{http_code}\n" \
 | **A（边界降级）：GeneratePage → IntentBuilder → 建议贡献** | LLM step1 选中了某个 RAG 候选但下游 `under_specified` 闸命中（描述模糊参数缺失），走 IntentBuilder 5 轮后 `suggest_contribute=true` | `description` 由 accumulated_intent 预填；`code_type` 由会话携带 |
 | **B：「我的贡献」→「+ 新贡献」** | 用户主动发起 | 全部手填 |
 
-三个路径最终进入相同的 4 字段提交表单：`template_name / code_type / description / demo_code`。提交后后端同步跑（5-15s）LLM 反推 + 3 道自动校验，成功返 HTTP 201，失败返 422。
+三个路径最终进入相同的 v3.1 两步 Modal：**Step 0 仅 2 字段必填** `original_intent + code_type`，点「生成预览」调 `POST /api/v1/contributions/preview` 不入库地让 LLM 同时产出 `template_name / description / demo_code / parameter_defs / keywords`；**Step 1** 用户对 LLM 输出做语义级校对（编辑或接受 3 字段）后点「提交审核」或「立即使用」，调 `POST /api/v1/contributions` 入审核队列。两端点都跑同样 4 道校验闸（`template_name` 命名规范 + parameter_defs 命名 + Jinja2 沙箱渲染 + keywords 形态），任一失败返 422 `contribution_parse_failed`（含 `detail.stage` / `detail.reason`）；submit 端点额外做 name 精确查重（422 `contribution_name_duplicate` 阻塞）+ 语义查重（top-3 写入 `original_row_json["similar_templates"]` 非阻塞）。原 4 字段提交路径（caller 显式传 `template_name + description + demo_code`）作为分支 3 完全向后兼容。详见 §5.7。
 
 ---
 
@@ -471,13 +471,13 @@ a_bus_grant_mutex: assert property(p_bus_grant_mutex)
 
 ### §5.2 入口 B：「我的贡献」→「+ 新贡献」直接提交
 
-#### 用例：寄存器写后读一致性断言（用户主动贡献）
+#### 用例：寄存器写后读一致性断言（用户主动贡献，v3.1 两步流）
 
 | 步骤 | 操作 | 期望 |
 |---|---|---|
-| 1 | 左侧导航进「我的贡献」，点右上角「+ 新贡献」 | 弹出 4 字段提交 Modal |
-| 2 | **模板名称**：`寄存器写后读一致性断言`<br>**代码类型**：SVA 断言<br>**场景描述**：`写使能有效后，下一拍读同地址返回的数据必须与写入值相同，检测 RTL 写穿或旁路逻辑错误`<br>**代码示例**：粘贴下方 demo_code | — |
-| 3 | 点「提交，由 AI 协助参数化」（5-15s） | HTTP 201 + `parameter_defs` 含 `clk / rst_n / wr_en / wr_addr / rd_addr / wr_data / rd_data`；`keywords` 含"写后读"、"一致性"；`subcategory` ≈ `data_integrity` |
+| 1 | 左侧导航进「我的贡献」，点右上角「+ 新贡献」 | 弹出两步 Modal，停在 Step 0 |
+| 2 | **Step 0** — **`original_intent`**：`写使能有效后，下一拍读同地址返回的数据必须与写入值相同，检测 RTL 写穿或旁路逻辑错误`；**`code_type`**：SVA 断言 → 点「生成预览」（5-15s） | LLM 同时产出 `template_name`（按 `sva_*_v1` 规范）、`description`、`demo_code` 三字段，进入 Step 1 |
+| 3 | **Step 1** — 检查/微调三字段（如把 LLM 起的名换成 `sva_reg_wr_rd_consistency_v1`），点「提交审核」 | HTTP 201 + `status: pending_review` + `use_immediately_available: true`；后端 `parameter_defs` 含 `clk / rst_n / wr_en / wr_addr / rd_addr / wr_data / rd_data`；`keywords` 含"写后读"、"一致性"；`subcategory` ≈ `data_integrity` |
 
 #### 提交 demo_code 示例（入口 B）
 
@@ -689,6 +689,153 @@ curl -s -X PUT http://localhost/api/v1/admin/contributions/$CID/approve \
   -H 'Content-Type: application/json' \
   -d "{\"analysis_id\": \"<analysis_id>\"}" | jq .
 ```
+
+### §5.7 贡献预览端点 smoke test（FEAT-10）
+
+> 本节覆盖 FEAT-10 新增的 `POST /api/v1/contributions/preview`——前端两步 Modal Step 0 → Step 1 跳转的后端入口。**不入库**，仅返回 LLM 生成预览供用户在 Step 1 编辑/确认；解析失败统一 422 `contribution_parse_failed`，name 命中已有模板时携 `name_conflict: true` 非阻塞标记。
+
+#### §5.7.1 正常生成
+
+**前置**：`llm_configs` 默认行可用、`embedding_service` 在线。
+
+```bash
+TOKEN=<jwt>
+curl -s -X POST http://localhost/api/v1/contributions/preview \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"original_intent":"检测AXI写通道在awvalid拉高到awready到来期间地址保持稳定","code_type":"assertion"}' | jq .
+```
+
+**期望**：HTTP 200，响应体形如：
+
+```json
+{
+  "template_name": "sva_axi_aw_addr_stable_v1",
+  "description": "在 AXI 写通道 awvalid 拉高到 awready 之间，awaddr 必须保持稳定",
+  "demo_code": "property p_axi_aw_addr_stable;\n  @(posedge clk) ...",
+  "parameter_defs": [
+    {"name": "clk", "type": "string", "required": true, "description": "时钟信号", "expr_type": "sv_identifier"},
+    {"name": "awvalid", "type": "string", "required": true, "description": "...", "expr_type": "sv_identifier"},
+    ...
+  ],
+  "keywords": ["AXI", "写通道", "地址稳定", ...],
+  "name_conflict": false
+}
+```
+
+**验证要点**：
+
+- `template_name` 匹配 `^(sva|cov)_[a-z][a-z0-9_]*_v\d+$`（assertion 应以 `sva_` 开头，coverage 应以 `cov_` 开头）
+- `parameter_defs` 每项含 `name / type / required / description / expr_type` 五字段
+- `demo_code` 是**原始 SV 代码**（含真实信号名 / 字面量），**不是** Jinja2 模板体——这一点用于前端"立即使用"路径直接展示给用户复制
+- `name_conflict` 为 `false`（库内无重名模板）
+
+#### §5.7.2 LLM 解析失败 → 422
+
+**触发条件**：`original_intent` 描述模糊到 LLM 无法生成合规 JSON / 命名 / Jinja2 / keywords 任一字段。
+
+```bash
+TOKEN=<jwt>
+curl -i -X POST http://localhost/api/v1/contributions/preview \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"original_intent":"做点验证的东西","code_type":"assertion"}'
+```
+
+**期望**：HTTP 422，响应体：
+
+```json
+{
+  "detail": {
+    "type": "contribution_parse_failed",
+    "stage": "<见下方速查表>",
+    "reason": "<具体失败描述>"
+  }
+}
+```
+
+**stage 取值速查**（与 `backend/app/services/platform/parameter_extractor.py` 实际 `ContributionParseError(stage=...)` 字符串一一对应）：
+
+| stage | 触发位 | 说明 |
+|---|---|---|
+| `llm_response` | `generate_from_intent` | LLM 返空响应 |
+| `json_locate` / `json_parse` | `_extract_json_block` | LLM 输出未含 JSON 对象 / JSON 解析失败 |
+| `template_name` | `_validate_template_name` | LLM 产出的名称不匹配 `^(sva|cov)_[a-z][a-z0-9_]*_v\d+$` |
+| `param_defs_shape` / `param_defs_empty` / `param_defs_name` / `param_defs_expr_type` | `_validate_parameter_defs` | LLM 产出的参数定义不是 list、为空、name 非法 SV 标识符、`expr_type` 不在白名单等 |
+| `jinja_empty` | `_validate_jinja_rendering` | LLM 产出的 `jinja_body` 为空字符串 |
+| `jinja_syntax` | `_validate_jinja_rendering` | Jinja2 模板体语法错误（`TemplateSyntaxError`） |
+| `jinja_sandbox` | `_validate_jinja_rendering` | 模板体含 SSTI / `__class__` 等不安全访问被 `SandboxedEnvironment` 拦截（`SecurityError`） |
+| `jinja_render` | `_validate_jinja_rendering` | 用占位值跑 `StrictUndefined` 渲染失败（引用未声明变量 / 其他运行时错误） |
+| `keywords_shape` | `_validate_keywords` | keywords 不是 list（None 容忍为空 list；非 str 元素与空串静默过滤；当前**无**长度/数量上限） |
+| `description` / `demo_code` | `generate_from_intent` | LLM 未返回 `description` 或 `demo_code` 字段或为空 |
+| `input` | `generate_from_intent` | `original_intent` 入参为空 |
+
+**前端预期行为**：Step 0 表单底部展示红色错误条「LLM 生成失败：<stage> - <reason>」，用户改 `original_intent` 后再点「生成预览」重试。
+
+#### §5.7.3 `name_conflict` 非阻塞提示
+
+**前置**：库中已存在 `sva_handshake_stable_v1` 模板。
+
+**触发**：意图描述与已有模板高度相似，LLM 倾向生成同名 `template_name`。
+
+```bash
+TOKEN=<jwt>
+curl -s -X POST http://localhost/api/v1/contributions/preview \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"original_intent":"valid 拉高到 ready 到来之间 data 必须稳定","code_type":"assertion"}' | jq '.template_name, .name_conflict'
+```
+
+**期望**：HTTP 200，响应体含：
+
+```json
+{
+  "template_name": "sva_handshake_stable_v1",
+  "name_conflict": true,
+  ...
+}
+```
+
+**前端预期行为**：Step 1 顶部展示黄色 Warning Alert「此名称与现有模板重名，请修改 `template_name` 后再提交」；submit 端点若用户不改名直接提交，会返 422 `contribution_name_duplicate` 阻塞（与 §5.4.1 既有行为一致）。
+
+#### §5.7.4 `original_intent` 为空 → 422
+
+**前置**：Pydantic schema `ContributionPreviewRequest.original_intent` 声明 `min_length=1`。
+
+```bash
+TOKEN=<jwt>
+curl -i -X POST http://localhost/api/v1/contributions/preview \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"original_intent":"","code_type":"assertion"}'
+```
+
+**期望**：HTTP 422，Pydantic 标准 validation error（`detail[0].loc=["body","original_intent"]` + `msg` 含 `min_length`）。
+
+#### §5.7.5 「立即使用」端到端验证
+
+**前置**：跑通 §5.7.1 拿到一个合法 preview 响应。
+
+```bash
+TOKEN=<jwt>
+PREVIEW=$(curl -s -X POST http://localhost/api/v1/contributions/preview \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"original_intent":"<新场景>","code_type":"assertion"}')
+
+# 模拟前端 Step 1「立即使用」：携带 preview 5 字段调 submit
+curl -s -X POST http://localhost/api/v1/contributions \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d "$(echo $PREVIEW | jq -c '{original_intent:"<新场景>",code_type:"assertion",template_name,description,demo_code}')" | jq .
+```
+
+**期望**：HTTP 201，响应体含：
+
+```json
+{
+  "id": "<uuid>",
+  "status": "pending_review",
+  "use_immediately_available": true,
+  ...
+}
+```
+
+**前端预期行为**：Step 1 内不关闭 Modal，渲染 `<pre>` monospace 代码块（内容 = Step 1 表单里用户最终确认的 `demo_code`）+ 「复制代码」按钮 + 提示文案"代码已就绪，可直接复制使用。模板已提交审核，审核通过后将加入模板库。"——**不**跳转 `/generate`，因为 `pending_review` 贡献不在 Qdrant 中，跳过去只会触发第五道闸 `no_matching_template` 进入死循环。
 
 ---
 
