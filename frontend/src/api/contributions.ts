@@ -20,6 +20,7 @@ export interface ContributionPreview {
   parameter_defs: Array<Record<string, unknown>>
   keywords: string[]
   name_conflict: boolean
+  existing_template_id?: string | null
 }
 export interface ContributionListItem {
   id: string; contributor_id: string; code_type: string; template_name: string; status: string; created_at: string

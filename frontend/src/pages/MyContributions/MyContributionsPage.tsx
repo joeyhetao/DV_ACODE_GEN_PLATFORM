@@ -4,7 +4,7 @@ import {
   Drawer, Descriptions, Typography, message, Alert, Steps, Spin,
 } from 'antd'
 import { PlusOutlined, EyeOutlined, CopyOutlined } from '@ant-design/icons'
-import { useLocation, useSearchParams } from 'react-router-dom'
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import {
   contributionsApi, ContributionListItem, Contribution, ContributionPreview,
 } from '../../api/contributions'
@@ -37,6 +37,7 @@ interface SubmitErrorDetail {
 
 export default function MyContributionsPage() {
   const location = useLocation()
+  const navigate = useNavigate()
   const [searchParams] = useSearchParams()
   // P2-17：URL query 优先（刷新恢复），location.state 作为 fallback
   const prefillFromState = (location.state || {}) as PrefillState
@@ -58,7 +59,8 @@ export default function MyContributionsPage() {
   const [step0Form] = Form.useForm()
   const [step1Form] = Form.useForm()
   const [previewLoading, setPreviewLoading] = useState(false)
-  const [submitting, setSubmitting] = useState(false)
+  const [submittingReview, setSubmittingReview] = useState(false)
+  const [submittingImmediate, setSubmittingImmediate] = useState(false)
   const [previewData, setPreviewData] = useState<ContributionPreview | null>(null)
   const [parseError, setParseError] = useState<{ stage: string; reason: string } | null>(null)
   const [submittedDemoCode, setSubmittedDemoCode] = useState<string | null>(null)
@@ -143,11 +145,13 @@ export default function MyContributionsPage() {
   }
 
   // 共用 submit：Step 1 内点"提交审核"或"立即使用"都走这个
-  const submitCurrent = async (): Promise<Contribution | null> => {
+  const submitCurrent = async (
+    setLoading: (v: boolean) => void,
+  ): Promise<Contribution | null> => {
     const intent = step0Form.getFieldValue('original_intent') as string
     const codeType = step0Form.getFieldValue('code_type') as string
     const values = await step1Form.validateFields()
-    setSubmitting(true)
+    setLoading(true)
     setParseError(null)
     try {
       const created = await contributionsApi.submit({
@@ -169,12 +173,12 @@ export default function MyContributionsPage() {
       }
       return null
     } finally {
-      setSubmitting(false)
+      setLoading(false)
     }
   }
 
   const handleSubmitForReview = async () => {
-    const created = await submitCurrent()
+    const created = await submitCurrent(setSubmittingReview)
     if (created) {
       message.success('提交成功，等待管理员审核')
       resetModal()
@@ -183,7 +187,7 @@ export default function MyContributionsPage() {
   }
 
   const handleUseImmediately = async () => {
-    const created = await submitCurrent()
+    const created = await submitCurrent(setSubmittingImmediate)
     if (created) {
       // Step 1 页面内展示可复制代码框（用 Step 1 表单里用户最终确认的 demo_code）
       const code = step1Form.getFieldValue('demo_code') as string
@@ -304,8 +308,25 @@ export default function MyContributionsPage() {
               <Alert
                 type="warning"
                 showIcon
-                message="模板名重复"
-                description={`AI 生成的模板名「${previewData.template_name}」已存在，请手动修改后再提交。`}
+                message={previewData.existing_template_id ? '库中已有相同模板' : '模板名重复'}
+                description={
+                  previewData.existing_template_id ? (
+                    <>
+                      库中已存在名为「{previewData.template_name}」的模板，无需重复提交。
+                      <br />
+                      <Button
+                        type="link"
+                        size="small"
+                        style={{ padding: 0, marginTop: 4 }}
+                        onClick={() => { resetModal(); navigate('/generate') }}
+                      >
+                        前往代码生成页直接使用 →
+                      </Button>
+                    </>
+                  ) : (
+                    `AI 生成的模板名「${previewData.template_name}」已存在，请手动修改后再提交。`
+                  )
+                }
                 style={{ marginBottom: 16 }}
               />
             )}
@@ -418,9 +439,9 @@ export default function MyContributionsPage() {
       return [<Button key="close" type="primary" onClick={resetModal}>关闭</Button>]
     }
     return [
-      <Button key="back" onClick={() => setStep(0)} disabled={submitting}>上一步</Button>,
-      <Button key="submit" loading={submitting} onClick={handleSubmitForReview}>提交审核</Button>,
-      <Button key="immediate" type="primary" loading={submitting} onClick={handleUseImmediately}>
+      <Button key="back" onClick={() => setStep(0)} disabled={submittingReview || submittingImmediate}>上一步</Button>,
+      <Button key="submit" loading={submittingReview} disabled={submittingImmediate} onClick={handleSubmitForReview}>提交审核</Button>,
+      <Button key="immediate" type="primary" loading={submittingImmediate} disabled={submittingReview} onClick={handleUseImmediately}>
         立即使用
       </Button>,
     ]

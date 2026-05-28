@@ -28,7 +28,7 @@ from app.services.platform.contribution_service import (
     reject_contribution,
     request_revision,
 )
-from app.services.core.dedup import check_name_duplicate, check_semantic_duplicate
+from app.services.core.dedup import check_name_duplicate, check_semantic_duplicate, get_existing_template_id_by_name
 from app.services.platform.parameter_extractor import (
     ContributionParseError,
     derive_parameters_from_demo,
@@ -84,7 +84,8 @@ async def preview_contribution(
     except ContributionParseError as e:
         raise _parse_failed_422(e)
 
-    name_conflict = await check_name_duplicate(db, extracted.template_name)
+    existing_template_id = await get_existing_template_id_by_name(db, extracted.template_name)
+    name_conflict = existing_template_id is not None
     # demo_code 回传 LLM 产出的**原始 SystemVerilog 代码**（含真实信号名 / 字面量），
     # 前端用它作为"立即使用"的可复制代码块；jinja_body 不暴露给前端——它在用户编辑后
     # 由 submit 端点（branch 3）通过 derive_parameters_from_demo 重新生成。
@@ -95,6 +96,7 @@ async def preview_contribution(
         parameter_defs=extracted.parameter_defs,
         keywords=extracted.keywords,
         name_conflict=name_conflict,
+        existing_template_id=existing_template_id,
     )
 
 

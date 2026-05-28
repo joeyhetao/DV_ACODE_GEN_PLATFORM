@@ -42,6 +42,7 @@ class ContributionPreviewResponse(BaseModel):
     parameter_defs: list[dict]
     keywords: list[str]
     name_conflict: bool = False
+    existing_template_id: str | None = None  # 冲突模板在库中的 ID，供前端"直接使用"跳转
 
 
 class ContributionUpdate(BaseModel):

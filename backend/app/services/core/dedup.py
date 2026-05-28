@@ -8,13 +8,20 @@ from app.services.embedding_client import get_embedding_client
 
 
 async def check_name_duplicate(db: AsyncSession, name: str, exclude_id: str | None = None) -> bool:
+    return await get_existing_template_id_by_name(db, name, exclude_id) is not None
+
+
+async def get_existing_template_id_by_name(
+    db: AsyncSession, name: str, exclude_id: str | None = None
+) -> str | None:
+    """Return the template.id of the active library template with this name, or None."""
     from app.models.template import Template
 
-    stmt = select(Template).where(Template.name == name)
+    stmt = select(Template.id).where(Template.name == name, Template.is_active == True)
     if exclude_id:
         stmt = stmt.where(Template.id != exclude_id)
     result = await db.execute(stmt)
-    return result.scalar_one_or_none() is not None
+    return result.scalar_one_or_none()
 
 
 async def check_semantic_duplicate(
