@@ -306,13 +306,13 @@ export default function MyContributionsPage() {
           <>
             {previewData?.name_conflict && (
               <Alert
-                type="warning"
+                type={previewData.is_semantic_duplicate ? 'info' : 'warning'}
                 showIcon
-                message={previewData.existing_template_id ? '库中已有相同模板' : '模板名重复'}
+                message={previewData.is_semantic_duplicate ? '库中已有相同场景模板' : '模板名称已被占用'}
                 description={
-                  previewData.existing_template_id ? (
+                  previewData.is_semantic_duplicate ? (
                     <>
-                      库中已存在名为「{previewData.template_name}」的模板，无需重复提交。
+                      库中已存在名为「{previewData.template_name}」且场景相同的模板，无需重复提交。
                       <br />
                       <Button
                         type="link"
@@ -324,7 +324,10 @@ export default function MyContributionsPage() {
                       </Button>
                     </>
                   ) : (
-                    `AI 生成的模板名「${previewData.template_name}」已存在，请手动修改后再提交。`
+                    <>
+                      AI 生成的名称「{previewData.template_name}」已被库中另一个不同场景的模板占用，
+                      请在下方手动修改模板名称后再提交。
+                    </>
                   )
                 }
                 style={{ marginBottom: 16 }}

@@ -86,6 +86,25 @@ async def preview_contribution(
 
     existing_template_id = await get_existing_template_id_by_name(db, extracted.template_name)
     name_conflict = existing_template_id is not None
+
+    # 仅名称冲突还不够——还需判断语义是否真正相同。
+    # 若语义相似度也超过 dedup_threshold，才算真正重复（可"直接使用"）。
+    # 若仅名称碰撞而 SVA 场景不同，前端应引导用户改名而非跳转。
+    is_semantic_duplicate = False
+    if name_conflict:
+        try:
+            similar = await check_semantic_duplicate(
+                description=extracted.description,
+                name=extracted.template_name,
+                keywords=extracted.keywords,
+            )
+            is_semantic_duplicate = any(
+                m["template_id"] == existing_template_id for m in similar
+            )
+        except Exception:
+            # Qdrant 不可用时降级：视为仅名称冲突，不展示"直接使用"，保守处理
+            is_semantic_duplicate = False
+
     # demo_code 回传 LLM 产出的**原始 SystemVerilog 代码**（含真实信号名 / 字面量），
     # 前端用它作为"立即使用"的可复制代码块；jinja_body 不暴露给前端——它在用户编辑后
     # 由 submit 端点（branch 3）通过 derive_parameters_from_demo 重新生成。
@@ -97,6 +116,7 @@ async def preview_contribution(
         keywords=extracted.keywords,
         name_conflict=name_conflict,
         existing_template_id=existing_template_id,
+        is_semantic_duplicate=is_semantic_duplicate,
     )
 
 
