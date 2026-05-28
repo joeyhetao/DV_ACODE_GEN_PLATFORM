@@ -363,7 +363,16 @@ export default function MyContributionsPage() {
                 </pre>
               </>
             ) : (
-              <Form form={step1Form} layout="vertical">
+              <Form
+                form={step1Form}
+                layout="vertical"
+                onValuesChange={(changed) => {
+                  // 用户手动改了模板名称 → 清除名称冲突状态，恢复正常提交按钮
+                  if ('template_name' in changed && previewData?.name_conflict) {
+                    setPreviewData(prev => prev ? { ...prev, name_conflict: false, existing_template_id: null, existing_template_description: null } : null)
+                  }
+                }}
+              >
                 <Form.Item
                   name="template_name"
                   label="模板名称"
@@ -444,12 +453,30 @@ export default function MyContributionsPage() {
       // 已"立即使用"提交完成——只展示关闭按钮
       return [<Button key="close" type="primary" onClick={resetModal}>关闭</Button>]
     }
+    // 库中已有同名模板时：提交审核禁用；"立即使用"改为跳转到生成页
+    const nameConflict = previewData?.name_conflict && !!previewData.existing_template_id
     return [
       <Button key="back" onClick={() => setStep(0)} disabled={submittingReview || submittingImmediate}>上一步</Button>,
-      <Button key="submit" loading={submittingReview} disabled={submittingImmediate} onClick={handleSubmitForReview}>提交审核</Button>,
-      <Button key="immediate" type="primary" loading={submittingImmediate} disabled={submittingReview} onClick={handleUseImmediately}>
-        立即使用
+      <Button
+        key="submit"
+        loading={submittingReview}
+        disabled={submittingImmediate || nameConflict}
+        title={nameConflict ? '库中已有同名模板，请修改模板名称后再提交' : undefined}
+        onClick={handleSubmitForReview}
+      >
+        提交审核
       </Button>,
+      nameConflict
+        ? (
+          <Button key="immediate" type="primary" onClick={() => { resetModal(); navigate('/generate') }}>
+            使用已有模板
+          </Button>
+        )
+        : (
+          <Button key="immediate" type="primary" loading={submittingImmediate} disabled={submittingReview} onClick={handleUseImmediately}>
+            立即使用
+          </Button>
+        ),
     ]
   }
 }
