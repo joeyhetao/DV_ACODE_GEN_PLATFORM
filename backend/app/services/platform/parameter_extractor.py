@@ -338,7 +338,11 @@ def _build_generation_prompt(original_intent: str, code_type: str) -> str:
         "   - coverage 类：cov_<scenario>_v<N>（示例：cov_fsm_state_transition_v1）\n"
         "   - 仅小写蛇形 + 末尾 _v1（首版默认 v1）\n"
         "2. 用一句标准 IC 验证措辞重述场景（description，30-120 字）\n"
-        "3. 写一份**完整可读**的 SystemVerilog 示例代码（demo_code），含 module/property/covergroup 等\n"
+        "3. 写一份**完整可读**的 SystemVerilog 示例代码（demo_code）：\n"
+        "   - 代码类型为 assertion（SVA断言）：只包含 module + property + assert property，"
+        "禁止包含 covergroup / coverpoint / cross 等覆盖率构造\n"
+        "   - 代码类型为 coverage（功能覆盖率）：只包含 module + covergroup + coverpoint，"
+        "禁止包含 assert property 等断言构造\n"
         "4. 把 demo_code 里应该参数化的位置（信号名、状态枚举、位宽、超时周期数）"
         "改写成 {{ snake_case_name }}，生成 jinja_body\n"
         "5. 给每个参数填元数据：name / type / required / description / expr_type / default\n"
@@ -349,7 +353,16 @@ def _build_generation_prompt(original_intent: str, code_type: str) -> str:
         "- 参数名不能撞 SystemVerilog 或 Python 关键字（如 always / module / class / for）\n"
         "- expr_type 只能是：sv_identifier / sv_identifier_list / sv_boolean_expr / sv_bins_expr / integer / free_text\n"
         "- 时钟参数命名 clk，复位参数命名 rst_n，都设 default=参数名本身\n"
-        "- jinja_body 引用的每个 {{ var }} 都必须在 parameter_defs 里声明\n\n"
+        "- jinja_body 引用的每个 {{ var }} 都必须在 parameter_defs 里声明\n"
+        "- jinja_body 的 {{ ... }} 内部只能放参数名本身（如 {{ clk }}）；"
+        "禁止放 Python/Jinja2 表达式、字典 {key: val}、集合 {a, b}、逻辑运算符\n"
+        "- SystemVerilog 代码里的大括号（拼接运算符 {a, b}、packed literal 等）"
+        "在 jinja_body 中必须原样保留为字面量文本，不能包裹成 {{ }}\n"
+        "- 每个 {{ }} 替换位只含一个参数名：{{ signal_name }}；"
+        "不允许 {{ sig_a && sig_b }}、{{ {sig} }}、{{ sig | filter }} 等写法\n"
+        "- {{ }} 里的名字必须来自 parameter_defs[*].name；"
+        "禁止使用 JSON 顶层字段名（template_name / description / demo_code / keywords 等），"
+        "这些字段不是用户填写的参数，不能出现在 jinja_body 里\n\n"
         "### 输出格式（必须严格遵守）\n"
         "返回一段 JSON（**只返 JSON，不要任何解释文字**），结构如下：\n"
         "```json\n"
@@ -433,7 +446,29 @@ async def generate_from_intent(
     # 校验（顺序：template_name → param_defs → jinja → keywords）
     _validate_template_name(template_name)
     _validate_parameter_defs(parameter_defs)
-    _validate_jinja_rendering(jinja_body, parameter_defs)
+    # jinja_syntax 失败时 retry once：把错误原文反馈给 LLM 让其自修正
+    try:
+        _validate_jinja_rendering(jinja_body, parameter_defs)
+    except ContributionParseError as _jinja_err:
+        if _jinja_err.stage not in ("jinja_syntax", "jinja_render"):
+            raise
+        retry_messages = messages + [
+            {"role": "assistant", "content": raw},
+            {
+                "role": "user",
+                "content": (
+                    f"上面的 jinja_body 有 Jinja2 语法错误：{_jinja_err.reason}\n"
+                    "请修正 jinja_body，只修正语法错误，其他字段保持不变，仍返回完整 JSON。\n"
+                    "注意：{{ }} 内只放参数名（如 {{ clk }}），"
+                    "SystemVerilog 大括号 {a, b} 应原样保留在模板文本里，不要包进 {{ }}。"
+                ),
+            },
+        ]
+        raw = await llm.chat(retry_messages, max_tokens=2048)
+        parsed = _extract_json_block(raw)
+        jinja_body = parsed.get("jinja_body", jinja_body)
+        parameter_defs = parsed.get("parameter_defs", parameter_defs)
+        _validate_jinja_rendering(jinja_body, parameter_defs)
     cleaned_keywords = _validate_keywords(keywords)
 
     if not isinstance(description, str) or not description.strip():

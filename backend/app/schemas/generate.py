@@ -65,7 +65,7 @@ class RenderRequest(BaseModel):
     # 方案 3 透传字段（前端 preview 阶段拿到后传回，让 render 完成 GenerationRecord 写入）
     intent_hash: str | None = None
     confidence: float = 0.0
-    confidence_source: str = ""              # "llm_step1" | "rag_fallback" | "intent_cache"
+    confidence_source: str = ""              # "llm_step1" | "rag_fallback" | "intent_cache" | "keyword_supplement"
     normalized_intent: str = ""
     original_intent: str = ""
     rag_candidates: list[dict] = []
@@ -105,7 +105,7 @@ class PreviewResponse(BaseModel):
     template_name: str
     template_version: str
     confidence: float
-    confidence_source: Literal["llm_step1", "rag_fallback", "intent_cache"]
+    confidence_source: Literal["llm_step1", "rag_fallback", "intent_cache", "keyword_supplement"]
     rag_candidates: list[RAGCandidateWithParams]
     params: dict[str, ParamWithSource]
     intent_hash: str

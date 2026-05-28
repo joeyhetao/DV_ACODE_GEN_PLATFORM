@@ -42,8 +42,10 @@ export default function AdminContributionsPage() {
   const [editedSubcategory, setEditedSubcategory] = useState('')
   const [editedProtocol, setEditedProtocol] = useState('')
   const [savingEdit, setSavingEdit] = useState(false)
-  // FEAT-4: two-step approve analysis
-  const [analysisLoading, setAnalysisLoading] = useState(false)
+  // FEAT-4: two-step approve analysis — string | null stores the ID being analyzed (not boolean,
+  // to avoid all table-row buttons showing loading when any single row is being processed)
+  const [analysisLoading, setAnalysisLoading] = useState<string | null>(null)
+  const [pendingApproveId, setPendingApproveId] = useState<string | null>(null)
   const [analysisResult, setAnalysisResult] = useState<PreApproveAnalysisResult | null>(null)
   const [autoApproveCountdown, setAutoApproveCountdown] = useState<number | null>(null)
   const countdownTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -61,7 +63,11 @@ export default function AdminContributionsPage() {
     if (analysisResult && !analysisResult.has_conflicts && autoApproveCountdown !== null) {
       if (autoApproveCountdown <= 0) {
         // Countdown finished — auto approve
-        doApprove(detail!.id, analysisResult.analysis_id)
+        // Use pendingApproveId (set when table-row 批准 was clicked) or fall back to
+        // detail.id (when approve was triggered from the detail panel)
+        const approveId = pendingApproveId || detail?.id
+        if (!approveId) return
+        doApprove(approveId, analysisResult.analysis_id)
         setAutoApproveCountdown(null)
         return
       }
@@ -135,7 +141,8 @@ export default function AdminContributionsPage() {
 
   // FEAT-4: two-step approve — run pre-approve-analysis first
   const handleApprove = async (id: string) => {
-    setAnalysisLoading(true)
+    setAnalysisLoading(id)
+    setPendingApproveId(id)
     setAnalysisResult(null)
     try {
       const result = await contributionsApi.analyzeConflicts(id)
@@ -147,7 +154,7 @@ export default function AdminContributionsPage() {
       const err = e as { response?: { data?: { detail?: string } } }
       message.error(err.response?.data?.detail || '分析失败，请重试')
     } finally {
-      setAnalysisLoading(false)
+      setAnalysisLoading(null)
     }
   }
 
@@ -212,7 +219,7 @@ export default function AdminContributionsPage() {
           {r.status === 'pending_review' && (
             <>
               <Button size="small" icon={<CheckOutlined />} type="primary"
-                onClick={() => handleApprove(r.id)} loading={analysisLoading || actionLoading}>批准</Button>
+                onClick={() => handleApprove(r.id)} loading={analysisLoading === r.id || actionLoading}>批准</Button>
               <Button size="small" icon={<EditOutlined />}
                 onClick={() => { setActionId(r.id); setRevisionVisible(true) }}>修改</Button>
               <Button size="small" icon={<CloseOutlined />} danger
@@ -259,7 +266,7 @@ export default function AdminContributionsPage() {
                 保存编辑
               </Button>
               <Button icon={<CheckOutlined />} type="primary"
-                onClick={() => handleApprove(detail!.id)} loading={analysisLoading || actionLoading}>
+                onClick={() => handleApprove(detail!.id)} loading={analysisLoading !== null || actionLoading}>
                 批准并入库
               </Button>
               <Button icon={<EditOutlined />}
@@ -400,7 +407,7 @@ export default function AdminContributionsPage() {
                             description={
                               <Space direction="vertical" style={{ width: '100%' }}>
                                 <Text code>{analysisResult.recommendation_text}</Text>
-                                <Button type="primary" size="small" onClick={handleApplyRecommendation} loading={savingEdit || analysisLoading}>
+                                <Button type="primary" size="small" onClick={handleApplyRecommendation} loading={savingEdit || analysisLoading !== null}>
                                   一键应用建议修改（保存后重新分析）
                                 </Button>
                               </Space>

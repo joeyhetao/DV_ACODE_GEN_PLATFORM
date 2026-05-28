@@ -312,6 +312,12 @@ async def detect_conflicts(
     except Exception as e:
         # 不能静默 —— 表缺失 / 查询失败会让冲突检测只看到静态语料，
         # 管理员可能看到错误的"无冲突"结果。至少要让运维在日志里能看到。
+        # rollback 必须在 print 前：失败的 DB 查询会让 asyncpg 进入 InFailedSQLTransactionError
+        # 状态，不 rollback 会导致同一 session 的后续所有查询也失败。
+        try:
+            await db.rollback()
+        except Exception:
+            pass
         print(
             f"[WARN] detect_conflicts: failed to load dynamic corpus from DB: "
             f"{type(e).__name__}: {e}",

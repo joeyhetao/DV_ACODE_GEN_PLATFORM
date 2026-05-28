@@ -2,6 +2,7 @@ from __future__ import annotations
 import json
 import uuid
 from fastapi import APIRouter, Depends, HTTPException, Query
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -450,13 +451,22 @@ async def admin_approve(
 
     from app.api.v1.templates import _create_template_from_contribution
 
-    promoted_id = await approve_contribution(
-        contribution=contribution,
-        reviewer_id=current_user.id,
-        db=db,
-        template_create_fn=_create_template_from_contribution,
-    )
-    await db.commit()
+    try:
+        promoted_id = await approve_contribution(
+            contribution=contribution,
+            reviewer_id=current_user.id,
+            db=db,
+            template_create_fn=_create_template_from_contribution,
+        )
+        await db.commit()
+    except IntegrityError as exc:
+        await db.rollback()
+        if "templates_name_key" in str(exc.orig):
+            raise HTTPException(
+                status_code=409,
+                detail=f"模板名称「{contribution.template_name}」已存在，该贡献无法重复入库",
+            )
+        raise
 
     # FEAT-4：将预生成的语料写入 DB（analysis_id 有且 Redis 仍有效）
     # promoted_id 为 None 时（理论上 approve_contribution 已抛错，但兜底防御）

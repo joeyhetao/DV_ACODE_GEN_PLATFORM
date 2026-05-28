@@ -28,8 +28,7 @@ async def _create_template_from_contribution(
     created_by: str,
     db: AsyncSession,
 ) -> str:
-    import uuid
-    template_id = f"contrib_{uuid.uuid4().hex[:12]}"
+    template_id = name  # template_name already validated unique (^(sva|cov)_..._v\d+$)
     template = Template(
         id=template_id,
         version="1.0.0",
