@@ -17,6 +17,7 @@
 9. [版本发布流程](#9-版本发布流程)
 10. [常用命令速查](#10-常用命令速查)
 11. [无关意图回归语料维护](#11-无关意图回归语料维护)
+12. [近邻模板混淆对回归语料维护](#12-近邻模板混淆对回归语料维护)
 
 ---
 
@@ -536,6 +537,75 @@ docker compose exec backend pytest tests/test_offtopic_corpus_real_llm.py --real
 **不要在代码里硬编码这条流程的频率**。这是数据工程职责，进 ops runbook 即可——本节作为一份"未来想到再做"的备忘。
 
 详细 schema 字段约定见 `backend/tests/data/offtopic_corpus.yaml` 文件头注释。
+
+---
+
+## 12. 近邻模板混淆对回归语料维护
+
+第五道闸 `no_matching_template` 是"库内没有任何模板能覆盖意图"的兜底；但更隐蔽的失效是 **LLM step1 在两个语义接近的模板间选错**——意图属于 `handshake_stable` 却选了 `handshake_timeout`，或 `timing_max_delay` 被选成 `handshake_timeout`。这类错误不触发任何 gate，最终用户拿到的是"看起来合理但语义错位的代码"，回归隐患极高。
+
+`backend/tests/data/template_confusion_corpus.yaml` 是这条防线——一份 checked-in 的近邻混淆对样本集，每条 case 声明 `correct_template` + `confusion_template`，由两套 pytest 守护：
+
+- `tests/test_template_confusion_corpus_mocked.py`：mock RAG 把 `confusion_template` 注入为 top-1，断言 pipeline 最终选中 `correct_template`，CI 必跑，守 candidate 渲染（A4）+ differentiators 投喂（A10）+ A8 verify 联动逻辑
+- `tests/test_template_confusion_corpus_real_llm.py --real-llm`：手动跑，调真 LLM + 真 RAG，守 prompt + 模型在不利 RAG 排序下的鲁棒性
+
+### 12.1 新增样本的标准流程
+
+**触发点 A：发现新混淆对（最高频）**
+1. 用户报告"我说 X，系统给我 Y"（X / Y 在语义上接近但 X 才对），或 real-llm 套件 fail
+2. 复现并定位是不是模板 description / differentiators / non_use_cases 信息不足导致 LLM 误判
+3. 在 `template_confusion_corpus.yaml` 加一条样本，必填：
+   - `id`（蛇形命名，唯一）
+   - `input`（用户原始意图文本）
+   - `code_type`（"assertion" | "coverage"）
+   - `signals`（可选，避免触发 under_specified 闸）
+   - `correct_template`（应命中的 template_id）
+   - `confusion_template`（最容易混淆的竞争 id，也是 mock 测注入为 RAG top-1 的 id）
+   - `added`（"YYYY-MM-DD"）
+   - `source`（"initial seed" / "user report 2026-XX-XX" / "PR fix-X"）
+   - `reason`（6 个月后能看懂"这对为啥容易混"）
+   - `flaky`（可选，true 表示 real-llm 测可能不稳定）
+4. **先跑 mock 测——预期当前 fail**（红灯证明在干扰候选下确实会选错）
+5. 修：补 template YAML 的 `differentiators` / `non_use_cases`、A4 候选渲染逻辑、或 A8 `verify_step1_selection` prompt，让 mock 测变绿
+6. PR → CI 永守
+
+**触发点 B：新增模板上线（中频）**
+PR 前 checklist：
+- [ ] 新模板找出至少 1 个最近邻竞争者，写一条混淆对样本
+- [ ] 至少覆盖新模板的两个方向（A→B 和 B→A 各一条），避免单向偏置
+- [ ] 跑 `lib_manager.py validate` 确认新模板的 `differentiators` / `non_use_cases` 都是非空 list
+
+**触发点 C：A4 / A8 / A10 关键参数变化（低频但风险高）**
+1. `_render_step1_candidate` 的 description 截断阈值变化（如 1000 → 600）：跑 mock 套件
+2. A8 `verify_step1_selection` prompt 调整：跑 real-llm 套件 `--real-llm`
+3. A10 模板 description 或 `differentiators` / `non_use_cases` 改动：两个套件都跑
+4. 若回归率上升，先修 prompt / 描述字段而**不是降语料**——语料是契约，不该被绕过
+
+### 12.2 维护准则
+
+- **append-only 优先**：除非彻底改设计契约，不要删除已有样本——它们是历史回归的疫苗
+- **测试断言精确到 `template_id`**（与 `template_selection_corpus.yaml` 的松散匹配不同——混淆对必须看具体走向）
+- **pair-A / pair-B / FSM / coverage 四类至少各 1 条**：确保最容易混的对都有兜底
+- **`source` + `reason` 必填**：6 个月后能看懂"这条为什么在这里"
+- **`added` 日期**：便于定期 review 时识别老化样本
+
+### 12.3 跑法速查
+
+```bash
+# PR 必跑：mock 套件（快，纯本地，CI 默认）
+docker compose exec backend pytest tests/test_template_confusion_corpus_mocked.py -v
+
+# 手动跑：真 LLM + 真 RAG 套件（需 llm_configs 表已配 is_default=true 记录 + Qdrant 已 import 全模板）
+docker compose exec backend pytest tests/test_template_confusion_corpus_real_llm.py --real-llm -v
+```
+
+### 12.4 与 A9 reranker score gate 的关系
+
+`scripts/calibrate_reranker_threshold.py` 以 `template_selection_corpus + template_confusion_corpus` 为输入跑真 RAG（stage1 + stage2 + stage3），输出每条 intent 的 `correct_template` 和 `confusion_template` 的 reranker score 分布，建议 `reranker_min_score_threshold` 阈值（约 `correct_p10 与 wrong_p50 中点`）。本节语料同时是 A9 阈值标定的数据源；**新增样本时也会顺便扩大标定基础**。
+
+阈值取法：让大多数 `correct` 通过、大多数 `confusion` 拦下；两段分布重叠严重时（`correct_p10 < confusion_p50`）→ 标定无解，**优先扩 `differentiators` / `description`** 或重训 reranker，不要直接放宽阈值。
+
+详细字段约定见 `backend/tests/data/template_confusion_corpus.yaml` 文件头注释。
 
 ---
 

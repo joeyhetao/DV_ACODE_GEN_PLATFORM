@@ -25,6 +25,7 @@
 - [8. 用户与权限](#8-用户与权限)
 - [9. LLM 配置管理](#9-llm-配置管理)
 - [10. 通知机制](#10-通知机制)
+- [11. Step1 模板选择质量回归（混淆对语料 + reranker 阈值标定）](#11-step1-模板选择质量回归混淆对语料--reranker-阈值标定)
 - [附录 A：日志/缓存排查速查](#附录-a日志缓存排查速查)
 - [附录 B：5 道闸错误响应结构对照](#附录-b5-道闸错误响应结构对照)
 
@@ -299,6 +300,79 @@ curl -s -X POST http://localhost/api/v1/generate/preview \
 ```
 
 期望响应：`detail.type="under_specified"` + `detail.redirect_to` 是非空字符串以 `/intent-builder?` 开头。
+
+### §2.7 step1 二次验证开关（A8，pipeline 内置 LLM 自审）
+
+**背景**：当 LLM step1 选中模板且 `confidence_source == "llm_step1"` 时，pipeline 调用 `llm.verify_step1_selection(normalized_intent, selected_id, candidates)` 发一条 yes/no 二次问询确认核心验证语义是否一致；LLM 答 `no` → `confidence_source` 降级为 `rag_fallback`，让第五道闸 `NoMatchingTemplateError`（若开启）接管引导贡献。**默认 `STEP1_VERIFY_ENABLED=false`**（开启前需先用 §11 confusion corpus 的 real-llm 套件评估误拒率）。fail-open：LLM 调用失败/解析失败一律视为 yes。
+
+**关掉时（默认行为）验证**：
+
+```bash
+# 在 backend 容器内（确保 settings 未设环境变量）
+docker compose exec backend python -c "from app.core.config import get_settings; print(f'STEP1_VERIFY_ENABLED={get_settings().step1_verify_enabled}')"
+```
+
+期望输出：`STEP1_VERIFY_ENABLED=False`。任何 §1.x 用例通过后，后端日志**不应**出现 `[Timing] stage=step1_verify` 行。
+
+**开启后（实验性）验证**：
+
+1. 修改 `.env` 或导出 `STEP1_VERIFY_ENABLED=true`，重启 backend：
+   ```bash
+   docker compose restart backend
+   ```
+2. 跑一条已知能命中模板的高置信意图（例如 §1.3 握手数据稳定断言）
+3. 后端日志期望：
+   ```
+   [Timing] stage=step1_verify ms=<n> ok=True
+   ```
+   `ok=True` 表示 LLM 答 yes，确认与 step1 选择一致，`confidence_source` 保持 `llm_step1`
+4. 跑一条易混淆意图（从 `backend/tests/data/template_confusion_corpus.yaml` 取一条，注入 RAG 把 `confusion_template` 顶到 top-1）
+5. 后端日志期望两段连续输出（仅当 LLM 决策反转时才出现）：
+   ```
+   [GLM Step1Verify] id=<confusion_id> raw='no'
+   [Pipeline] step1 verify=no: id=<confusion_id> → confidence_source 降级为 rag_fallback
+   ```
+   后续走 RAG fallback / 第五道闸路径
+
+**关闸单测**：`backend/tests/test_pipeline_preview_render.py` 中以 `step1_verify_enabled=False`、`return_value=True`、`return_value=False` 三组用例覆盖三档行为。
+
+### §2.8 reranker score gate（A9，pipeline 层独立 gate）
+
+**背景**：A8 验证通过后，pipeline 查 LLM 选中的 `template_id` 在 `rag_candidates` 中的 `score` 字段（即 stage3 reranker score，由 `services/rag/engine.py` enriched 写入）。若 `score < RERANKER_MIN_SCORE_THRESHOLD`（默认 0.30 经验占位）且 `STEP1_RERANKER_GATE_ENABLED=true` → 抛 `NoMatchingTemplateError(top_score=selected_score)` 直跳贡献页。**默认 `STEP1_RERANKER_GATE_ENABLED=false`**（开启前必须先跑标定脚本，未标定就上生产会误拒 marginal 真请求）。
+
+**与 FIX-9 移除的 `no_match_score_threshold` 的区分**：FIX-9 拦 RAG **top-1** score（已移除）；A9 拦 **LLM 选中** 的那个 id 的 reranker score。`no_match_score_threshold` 字段保留供日志/监控参考，**不**参与触发判定。
+
+**量化验证流程（A9 阈值标定）**：
+
+1. **前置**：确认 `llm_configs` 表已配 `is_default=true` 记录；Qdrant 已 import 全部模板（`docker compose exec backend python lib_manager.py import`）；embedding_service 健康
+2. 运行标定脚本：
+   ```bash
+   docker compose exec backend python scripts/calibrate_reranker_threshold.py
+   ```
+3. **阶段 1（selection corpus）期望输出**：每条 intent 列 `normalized` + top-N 模板列表 + `correct` 模板分数（若 correct 不在 top-N 则记 `MISS`）
+4. **阶段 2（confusion corpus）期望输出**：每条 case 列 `correct_template` 与 `confusion_template` 的 reranker score 对照
+5. **阶段 3（汇总）期望输出**：
+   ```
+   [correct]   N=<n> p10=<x> p50=<y> p90=<z>
+   [confusion] N=<n> p10=<x> p50=<y> p90=<z>
+   [suggest]   reranker_min_score_threshold = max(correct_p10 - ε, confusion_p50 + ε)
+   ```
+6. **解读规则**：
+   - `correct_p10 > confusion_p50` 且分隔明显 → 取中点写入 `backend/app/core/config.py::reranker_min_score_threshold` 默认值，然后 `STEP1_RERANKER_GATE_ENABLED=true` 可开启
+   - `correct_p10 < confusion_p50` 两段分布重叠 → **标定无解**，不要直接放宽阈值；优先在 §11 confusion corpus 加样本 / 模板 `differentiators` 补强 / 重训 reranker / 换 embedding model 后再标定
+7. 标定结果是给人工拍板用的，**脚本本身不进 CI**（依赖 live embedding service 与 Qdrant）
+
+**开启后（实验性）验证**：
+
+1. `.env` 设 `STEP1_RERANKER_GATE_ENABLED=true` 与标定建议的 `RERANKER_MIN_SCORE_THRESHOLD=<x>`，重启 backend
+2. 跑一条已知 reranker score 偏低（< 阈值）但 LLM 选中的意图
+3. 后端日志期望：
+   ```
+   [Gate] step1_reranker_gate: id=<tid> selected_score=<x.xxxx> < threshold=<y> → NoMatchingTemplate
+   ```
+4. 前端期望：toast「库内暂无匹配模板，跳转至贡献页面帮助完善模板库」→ 自动 navigate `/contribute/new?...`
+
+**关闸单测**：`backend/tests/test_pipeline_preview_render.py` 中以 `step1_reranker_gate_enabled` 开关 + `selected_score < threshold` / `selected_score > threshold` 三组用例覆盖三档行为。
 
 ---
 
@@ -1011,6 +1085,80 @@ docker compose exec backend alembic current
 # 跑全部单测
 docker compose exec backend pytest tests/ --ignore=tests/test_offtopic_corpus_real_llm.py -q
 ```
+
+---
+
+## 11. Step1 模板选择质量回归（混淆对语料 + reranker 阈值标定）
+
+LLM step1 在两个语义接近的模板间选错（如 `handshake_stable` ↔ `handshake_timeout`）是隐蔽失效——不触发任何 gate，用户拿到"看起来合理但语义错位的代码"。`backend/tests/data/template_confusion_corpus.yaml` 是这条防线的回归语料；与 A8 二次验证（§2.7）和 A9 reranker score gate（§2.8）三者联动构成"近邻混淆对路由契约"。
+
+### §11.1 confusion corpus 字段与添加流程
+
+字段约定（与 `template_selection_corpus.yaml` 类似，新增 `confusion_template`）：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `id` | ✓ | 蛇形命名，唯一 |
+| `input` | ✓ | 用户原始意图文本 |
+| `code_type` | ✓ | `"assertion"` \| `"coverage"` |
+| `signals` | ✗ | 信号列表 `[{name, width, role}]`，用于避免触发 under_specified 闸 |
+| `correct_template` | ✓ | 应命中的 `template_id` |
+| `confusion_template` | ✓ | 最容易混淆的竞争 `template_id`（mock 测注入为 RAG top-1） |
+| `added` | ✓ | `"YYYY-MM-DD"` |
+| `source` | ✓ | `"initial seed"` / `"user report 2026-XX-XX"` / `"PR fix-X"` |
+| `reason` | ✓ | 6 个月后能看懂"这对为啥容易混" |
+| `flaky` | ✗ | `true` 时 real-llm 套件 warn 但不 fail |
+
+**添加流程**：
+1. 收到用户报错或 real-llm 套件 fail 的混淆对
+2. 加一条 case 到 yaml，**先跑 mock 测预期 fail**（红灯证明问题真实存在）：
+   ```bash
+   docker compose exec backend pytest tests/test_template_confusion_corpus_mocked.py -v
+   ```
+3. 修：补对应模板 YAML 的 `differentiators` / `non_use_cases`（让 LLM step1 看到时能区分）、或调 `_render_step1_candidate` 截断阈值、或调 A8 `verify_step1_selection` prompt
+4. `lib_manager.py import --force`（导入更新过的模板）→ 重跑 mock 测变绿
+5. 真 LLM 套件复测（手动跑，看 prompt 改动是否在真模型上仍有效）：
+   ```bash
+   docker compose exec backend pytest tests/test_template_confusion_corpus_real_llm.py --real-llm -v
+   ```
+6. PR → CI 永守
+
+完整字段约定与触发点 A/B/C 详见 `backend/tests/data/template_confusion_corpus.yaml` 文件头注释（与 `CONTRIBUTING.md §12` 同源，避免双份维护）。
+
+### §11.2 跑套件速查
+
+**mock 套件**（CI 默认必跑，纯本地，~3s）：
+```bash
+docker compose exec backend pytest tests/test_template_confusion_corpus_mocked.py -v
+```
+内部逻辑：每条 case 把 `confusion_template` mock 成 RAG top-1，LLM step1 选 `correct`，断言 pipeline 最终落地 `correct_template`（不被 rag_fallback 拖走）；临时关 `under_specified` 闸隔离测试目标。
+
+**real-llm 套件**（手动，需 default LLM + Qdrant + bge-m3 在线，~分钟级）：
+```bash
+docker compose exec backend pytest tests/test_template_confusion_corpus_real_llm.py --real-llm -v
+```
+每条 case 调真 pipeline，断言 `template_id == correct`；`under_specified` 算路由对了（参数 corpus 未给全）、`NoMatchingTemplate` 算 step1 误拒、其他异常或选错均 fail（`flaky: true` 的 case 容差）。
+
+### §11.3 解读结果
+
+| 现象 | 解读 | 下一步 |
+|---|---|---|
+| mock 测全绿 | pipeline 路由逻辑健康（A4 渲染 + A8 verify + A10 描述字段联动正常） | — |
+| mock 测某条 fail | 该混淆对在 mock 路径下 pipeline 仍选错，多半是 `differentiators` 信息不够 | 补 template YAML 的 `differentiators` / `non_use_cases`，重导库，重跑 |
+| real-llm 测某条 fail | 真模型在新 RAG 排序下仍选错，prompt 或描述字段在真分布下不够 | 调 A8 verify prompt / 扩 description 三要素，重导库，重跑 real-llm |
+| real-llm 测 flaky 频繁告警 | 模型温度抖动 / 边界 case | 加 `flaky: true` 接受，或加更明确的样本提高 prompt 强度 |
+| A9 阈值标定脚本两段分布重叠 | `correct_p10 < confusion_p50`，无法画分界线 | **不要直接放宽阈值**——先扩 confusion corpus / 优化 differentiators / 重训 reranker，再标定 |
+
+### §11.4 与 A8 / A9 开关的联动测试矩阵
+
+| `STEP1_VERIFY_ENABLED` | `STEP1_RERANKER_GATE_ENABLED` | 适用场景 |
+|---|---|---|
+| `false`（默认） | `false`（默认） | 当前生产配置；A4 + A10 已起作用，A8/A9 暂未启用 |
+| `true` | `false` | 实验阶段：用 confusion corpus real-llm 套件评估 A8 verify 的 false-negative 率 |
+| `false` | `true` | 阈值已标定但 verify 尚未上线：纯量化拦截 |
+| `true` | `true` | 双重保险，两层均经过对应验证后开启 |
+
+任意配置变化都应：(1) 重启 backend；(2) 跑 §11.2 mock 套件确保 pipeline 仍正确；(3) `docker compose exec backend python -c "from app.core.config import get_settings; s=get_settings(); print(s.step1_verify_enabled, s.step1_reranker_gate_enabled, s.reranker_min_score_threshold)"` 确认 settings 落对。
 
 ---
 
