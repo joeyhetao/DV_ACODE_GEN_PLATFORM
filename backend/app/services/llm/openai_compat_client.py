@@ -25,6 +25,21 @@ def _extract_json(text: str) -> dict:
     return json.loads(match.group())
 
 
+def _render_step1_candidate(i: int, c: dict) -> str:
+    """Step1 候选 Markdown 多行块渲染。
+
+    description 截断 1000（原 60 → A4 扩到 300 → C1 修复后改 1000）：旧值 60 严重
+    不足以表达"做什么/典型场景/边界"三要素；lib_manager.py import 时还把
+    differentiators / non_use_cases 拼到 description 末尾（"区别要点：..."、
+    "不适用场景：..."），合计实测可达 812 char（protocol_handshake_coverage），
+    所以截断设到 1000 留余量，避免 non_use_cases 末项被切掉（review NEW-1）。
+    顶端用 `###` 标题让 LLM 容易解析"块边界"——若回归发现 LLM 在长候选列表里
+    选错块号，可考虑改成 `<candidate id="...">` XML 风格再观察。
+    """
+    desc = (c.get("description") or "")[:1000]
+    return f"### {i + 1}. {c['template_id']}  {c['name']}\n描述：{desc}"
+
+
 def _reasoning_tokens(resp) -> int | str:
     """从 OpenAI 兼容响应里取 reasoning_tokens；非 thinking 模型或 SDK 旧版返 'n/a'。"""
     try:
@@ -116,10 +131,16 @@ class OpenAICompatLLMClient(LLMClient):
         )
 
     async def _step1_select_id(self, normalized_intent: str, candidates: list[dict]) -> str:
-        """Step 1：纯文本返回一个 template_id，max_tokens=64。"""
+        """Step 1：纯文本返回一个 template_id，max_tokens=64（输出仅 ~10 tokens）。
+
+        候选文本以 Markdown 多行块渲染：description 截断 60→300 char；
+        若候选携带 differentiators / non_use_cases（template YAML 新字段）则一并展示，
+        让 LLM 在近邻混淆对（handshake_stable ↔ handshake_timeout 等）上有足够信息区分。
+        max_tokens 保持 64：候选文本扩容仅影响 input tokens（5×300 ≈ 1500），output
+        不变；GLM-4.7 在更长 prompt 下 step1 延迟增幅实测 < 1s。
+        """
         candidates_text = "\n".join(
-            f"{i + 1}. {c['template_id']}  {c['name']}  {c['description'][:60]}"
-            for i, c in enumerate(candidates)
+            _render_step1_candidate(i, c) for i, c in enumerate(candidates)
         )
         print(f"[GLM Step1] candidates:\n{candidates_text}", flush=True)
 
@@ -130,6 +151,9 @@ class OpenAICompatLLMClient(LLMClient):
             "1. 识别意图的核心验证语义（如：握手协议、FSM转换、互斥约束、值域覆盖、延迟约束等）\n"
             "2. 逐一核查候选模板的验证目的是否与该语义一致\n"
             "3. 匹配 → 返回 template_id；无任何候选匹配 → 返回字符串 none\n"
+            "\n"
+            "候选描述末尾可能附『区别要点』段（列出与最近邻模板的区别要点）和『不适用场景』段"
+            "（列出不适用场景），请优先用这两段做区分判断。\n"
             "\n"
             "严格禁止：\n"
             "- 禁止通过重命名信号角色（如把 cpu_req 当 valid/start_event，把 dma_req 当 ready/end_event）强行适配语义不符的模板\n"
@@ -233,6 +257,85 @@ class OpenAICompatLLMClient(LLMClient):
             return _extract_json(content)
         except Exception:
             return {}
+
+    async def verify_step1_selection(
+        self,
+        normalized_intent: str,
+        selected_template_id: str,
+        candidates: list[dict],
+    ) -> bool:
+        """A8 二次验证：发一条 yes/no 问题，确认 selected_template 的核心验证语义与意图一致。
+
+        触发位置：pipeline.py step1 之后、A9 reranker gate 之前（confidence_source ==
+        "llm_step1" 时）。
+        失败开放原则（fail-open）：解析失败 / 异常 / 模型超时一律返 True，避免新加这条
+        验证反而成为误拒来源；仅在 LLM 明确回 "no" 时把 confidence_source 降级。
+
+        max_tokens=16：足够 'yes'/'no' + 偶尔的小标点/换行，又不至于让模型展开论证。
+        thinking 显式 disabled（与 _step1_select_id 同理：分类任务不需要 CoT）。
+        """
+        selected = next((c for c in candidates if c["template_id"] == selected_template_id), None)
+        if selected is None:
+            # 选中的 id 不在候选列表里 —— 不太可能（pipeline 已经做过精确匹配），
+            # 但若发生只能 fail-open，让 step1 选择继续走。
+            return True
+
+        # description 字段在 lib_manager.import 时已经把 differentiators / non_use_cases
+        # 拼到末尾（"区别要点：..."、"不适用场景：..." 段），截断 1000 让所有段都看得到
+        # （实测合成最长 812 char，与 _render_step1_candidate 对齐；review NEW-1）。
+        desc = (selected.get("description") or "")[:1000]
+
+        system = (
+            "你是IC验证工程师。给定用户验证意图和一个已选定的模板，判断该模板的核心验证语义"
+            "是否真的与用户意图一致。\n"
+            "只回答一个单词：yes 或 no。\n"
+            "判断标准：\n"
+            "- yes：模板做的事情就是用户要做的事情（不只是关键词重合，而是验证语义一致）\n"
+            "- no：模板做的事情与用户意图核心不同（如 timeout 模板被选到 stable 场景，"
+            "或 transition 覆盖率被选到 value 覆盖率场景）\n"
+            "模板描述末尾可能附『区别要点』和『不适用场景』段，请优先用它们做判断。\n"
+            "不要给出解释、不要给出推理过程，只输出 yes 或 no。"
+        )
+        user = (
+            f"[用户意图]\n{normalized_intent}\n"
+            f"\n[已选模板]\nid: {selected['template_id']}\n"
+            f"名称: {selected.get('name', '')}\n"
+            f"描述：{desc}\n"
+            f"\n回答（yes 或 no）："
+        )
+
+        _t = time.perf_counter()
+        try:
+            resp = await self._client.chat.completions.create(
+                model=self._model,
+                max_tokens=16,
+                temperature=0.0,
+                extra_body={"thinking": {"type": "disabled"}},
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user},
+                ],
+            )
+        except Exception as e:
+            print(f"[GLM Step1Verify] LLM call failed → fail-open: {e}", flush=True)
+            return True
+
+        print(
+            f"[Timing] llm=verify_step1_selection ms={int((time.perf_counter() - _t) * 1000)} "
+            f"reasoning_tokens={_reasoning_tokens(resp)} thinking=off",
+            flush=True,
+        )
+        content = (resp.choices[0].message.content or "").strip().lower()
+        print(f"[GLM Step1Verify] id={selected_template_id!r} raw={content!r}", flush=True)
+        # 解析：以"第一个 token 精确等于 no"为否定信号——单纯 startswith("no") 会把
+        # "not sure" / "not applicable" 这类犹豫回答也判成否定，违反 fail-open 原则
+        # （review M2）。剥两端常见标点，让 "no." / "no," / "no!" 也算 no。
+        tokens = content.split()
+        first_clean = (tokens[0].rstrip(",.!?;:") if tokens else "")
+        if first_clean == "no":
+            return False
+        # 其他（'yes' / 'maybe' / 'not sure' / 任何无法解析的回复）一律 fail-open 放过。
+        return True
 
     async def chat(
         self,

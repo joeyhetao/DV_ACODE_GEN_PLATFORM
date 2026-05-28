@@ -1,0 +1,189 @@
+# ============================================================================
+# 模板混淆对回归语料库（A12）
+# ----------------------------------------------------------------------------
+# 本文件是系统对"近邻混淆对路由契约"的声明。每条 case 表达"在 RAG 把
+# confusion_template 当作 top-1 的不利环境下，pipeline 仍必须最终选中 correct_template"。
+#
+# 由 test_template_confusion_corpus_mocked.py（mock 模式，CI 必跑）和
+# test_template_confusion_corpus_real_llm.py（--real-llm 手动模式）共同消费。
+#
+# ── 增长流程（必读）─────────────────────────────────────────────────────────
+#
+# 触发点 A：发现新混淆对（最高频）
+#   1. 用户报告"我说 X，系统给我 Y"（X / Y 在语义上接近但 X 才对）
+#   2. 把原文加进本文件，写明：
+#      - correct_template = 应选中的 id
+#      - confusion_template = RAG 误判 top-1 的 id（也是 LLM 在没有 differentiators 时
+#        会被错引到的目标）
+#   3. 先跑 mock 测——预期是 fail（红灯证明 pipeline 在干扰候选下确实会选错）
+#   4. 修：补 template YAML 的 differentiators / non_use_cases、A4 候选渲染逻辑、
+#      或 A8 verify_step1_selection prompt，让它变绿
+#   5. PR → CI 永守
+#
+# 触发点 B：新增模板上线（中频）
+#   PR 前 checklist：
+#     □ 新模板找出至少 1 个最近邻竞争者，写一条混淆对样本
+#     □ 至少覆盖新模板的两个方向（A→B 和 B→A 各一条）
+#
+# 触发点 C：A4 / A8 / A10 关键参数变化（低频但风险高）
+#   1. description 截断阈值变（如 300 → 200）：跑 mock 套件
+#   2. A8 verify prompt 调整：跑 real-llm 套件 `--real-llm`
+#   3. 若回归率上升，先修 prompt 而不是降语料
+#
+# ── 字段约定 ────────────────────────────────────────────────────────────────
+#   id                   必填，蛇形命名，唯一
+#   input                必填，用户原始意图文本
+#   code_type            必填，"assertion" | "coverage"
+#   signals              可选，信号列表 [{name, width, role}]，用于 grounding 不要触发 under_specified 闸
+#   correct_template     必填，应命中的 template_id
+#   confusion_template   必填，最容易混淆的竞争 template_id（也是 mock 测注入为 RAG top-1 的 id）
+#   added                必填，添加日期 "YYYY-MM-DD"
+#   source               必填，来源（"initial seed" / "user report 2026-XX-XX" / "PR fix-X"）
+#   reason               必填，6 个月后能看懂"这对为啥容易混"
+#   flaky                可选，true 表示 real-llm 测可能不稳定，real-llm 套件会 warn 但不 fail
+#
+# ── 维护准则 ────────────────────────────────────────────────────────────────
+#   - append-only 优先：除非彻底改设计契约，不要删除已有样本——它们是历史回归疫苗
+#   - 测试断言精确到 template_id（与 selection_corpus 不同——混淆对要看具体走向）
+#   - pair-A / pair-B / FSM / coverage 四类至少各 1 条，确保最容易混的对都有兜底
+# ============================================================================
+
+confusion_pairs:
+
+  # ── pair-A: handshake_stable ↔ handshake_timeout × 4 ──────────────────────
+  # 两者都谈 valid / ready，但 stable 关注"等待期间 data 不变"，timeout 关注"ready 必须在 N 周期内"
+  # 描述里出现 stable / 稳定 / $stable / 数据保持 → stable；出现 max_cycles / 超时 / 周期内 → timeout
+
+  - id: pair_a_stable_axi_wdata
+    added: "2026-05-28"
+    source: "initial seed"
+    reason: "wvalid 等待 wready 期间 wdata 必须稳定 —— stable 场景，但 valid/ready 共享词汇极易被 RAG 误推为 timeout"
+    input: "AXI 写通道：wvalid 拉高且 wready 未响应期间，wdata 必须保持稳定不能改变"
+    code_type: assertion
+    signals:
+      - {name: wvalid, width: 1, role: valid}
+      - {name: wready, width: 1, role: ready}
+      - {name: wdata, width: 32, role: data}
+    correct_template: sva_handshake_stable_v1
+    confusion_template: sva_handshake_timeout_v1
+
+  - id: pair_a_stable_ar_addr
+    added: "2026-05-28"
+    source: "initial seed"
+    reason: "AXI 读地址通道：arvalid 期间 araddr 必须 $stable —— 又是 stable，没有任何 timeout 语义"
+    input: "AXI 读地址通道 arvalid 拉高等待 arready 期间，araddr 地址信号不允许变化"
+    code_type: assertion
+    signals:
+      - {name: arvalid, width: 1, role: valid}
+      - {name: arready, width: 1, role: ready}
+      - {name: araddr, width: 32, role: data}
+    correct_template: sva_handshake_stable_v1
+    confusion_template: sva_handshake_timeout_v1
+
+  - id: pair_a_timeout_axi_aw_16cycles
+    added: "2026-05-28"
+    source: "initial seed"
+    reason: "AXI 写地址通道 awvalid 拉高后 awready 必须在 16 周期内响应 —— 纯 timeout 场景，描述含 stable 词汇会被反向误推为 stable"
+    input: "AXI 写地址通道 awvalid 拉高之后，awready 必须在 16 个周期内响应到位，防止总线死锁"
+    code_type: assertion
+    signals:
+      - {name: awvalid, width: 1, role: valid}
+      - {name: awready, width: 1, role: ready}
+    correct_template: sva_handshake_timeout_v1
+    confusion_template: sva_handshake_stable_v1
+
+  - id: pair_a_timeout_axis_tvalid
+    added: "2026-05-28"
+    source: "initial seed"
+    reason: "AXI-Stream tvalid 等待 tready 不能超过 8 周期 —— timeout 场景"
+    input: "AXI-Stream 接口 tvalid 拉高后，tready 不能超过 8 周期未响应，否则视为通路阻塞"
+    code_type: assertion
+    signals:
+      - {name: tvalid, width: 1, role: valid}
+      - {name: tready, width: 1, role: ready}
+    correct_template: sva_handshake_timeout_v1
+    confusion_template: sva_handshake_stable_v1
+
+  # ── pair-B: timing_max_delay ↔ handshake_timeout × 4 ──────────────────────
+  # 两者都谈"在 N 周期内响应"，但 timing_max_delay 是通用两事件（req → ack 各 $rose），
+  # handshake_timeout 是 AXI valid/ready 协议（valid 持续拉高等待 ready）
+  # 描述含 AXI / valid / ready / 协议握手 → handshake_timeout；含 req / ack / 通用 / 两事件 → timing_max_delay
+
+  - id: pair_b_max_delay_req_ack
+    added: "2026-05-28"
+    source: "initial seed"
+    reason: "req / ack 两事件通用时序，不涉及任何协议握手 —— 应走 timing_max_delay，但 ack 触发器与 ready 极易被 RAG 混淆"
+    input: "通用接口：当 req 信号拉高之后，ack 信号必须在 8 个周期之内响应，是两个独立事件的时序约束"
+    code_type: assertion
+    signals:
+      - {name: req, width: 1, role: start}
+      - {name: ack, width: 1, role: end}
+    correct_template: sva_timing_max_delay_v1
+    confusion_template: sva_handshake_timeout_v1
+
+  - id: pair_b_max_delay_start_done
+    added: "2026-05-28"
+    source: "initial seed"
+    reason: "流水线 start → done 延迟约束 —— 通用两事件，非协议握手"
+    input: "流水线启动 start 触发后，done 信号必须在 32 周期内拉高，验证整体延迟上限"
+    code_type: assertion
+    signals:
+      - {name: start, width: 1, role: start}
+      - {name: done, width: 1, role: end}
+    correct_template: sva_timing_max_delay_v1
+    confusion_template: sva_handshake_timeout_v1
+
+  - id: pair_b_timeout_axi_b_channel
+    added: "2026-05-28"
+    source: "initial seed"
+    reason: "AXI 写响应通道 bvalid/bready 协议握手超时 —— 是协议握手语义，不是通用两事件"
+    input: "AXI 写响应通道 bvalid 拉高后，bready 必须在 16 周期内响应，是 AXI 协议握手的超时约束"
+    code_type: assertion
+    signals:
+      - {name: bvalid, width: 1, role: valid}
+      - {name: bready, width: 1, role: ready}
+    correct_template: sva_handshake_timeout_v1
+    confusion_template: sva_timing_max_delay_v1
+
+  - id: pair_b_timeout_axi_r_channel
+    added: "2026-05-28"
+    source: "initial seed"
+    reason: "AXI 读数据通道 rvalid/rready 协议握手超时"
+    input: "AXI 读数据通道协议握手超时：rvalid 拉高后 rready 必须在 8 周期内响应，验证 AXI4 valid-ready 握手不发生死锁"
+    code_type: assertion
+    signals:
+      - {name: rvalid, width: 1, role: valid}
+      - {name: rready, width: 1, role: ready}
+    correct_template: sva_handshake_timeout_v1
+    confusion_template: sva_timing_max_delay_v1
+
+  # ── FSM 类 × 1 ────────────────────────────────────────────────────────────
+  # fsm_state_transition（业务 condition 触发）↔ reset_behavior（rst_n 边沿触发）
+  # 都涉及"状态等于某个枚举值"语义，混淆点是触发条件不同
+
+  - id: fsm_business_condition_not_reset
+    added: "2026-05-28"
+    source: "initial seed"
+    reason: "FSM 业务条件触发跳转 —— 不是复位事件，但 cur_state == IDLE 的等值表达式与 reset_behavior 模板高度重合"
+    input: "FSM 状态机：当 cur_state 处于 IDLE 且 start_valid 信号拉高时，下一拍状态必须跳转到 ACTIVE"
+    code_type: assertion
+    signals:
+      - {name: cur_state, width: 4, role: state}
+      - {name: start_valid, width: 1, role: enable}
+    correct_template: sva_fsm_state_transition_v1
+    confusion_template: sva_reset_behavior_v1
+
+  # ── coverage 类 × 1 ──────────────────────────────────────────────────────
+  # cov_transition_coverage（边覆盖：A→B 转移）↔ cov_value_coverage（点覆盖：状态取值分布）
+  # 都聚焦"状态"语义；混淆点是 transition vs value
+
+  - id: coverage_transition_not_value
+    added: "2026-05-28"
+    source: "initial seed"
+    reason: "FSM 状态间转移路径覆盖（边覆盖）—— 不是单个状态的取值分布；用户写'转移路径全覆盖'易被误推为 value_coverage"
+    input: "统计 FSM 状态机 IDLE → ACTIVE、ACTIVE → DONE、DONE → IDLE 等所有合法状态转移路径的覆盖率"
+    code_type: coverage
+    signals:
+      - {name: cur_state, width: 3, role: state}
+    correct_template: cov_transition_coverage_v1
+    confusion_template: cov_value_coverage_v1

@@ -25,10 +25,17 @@ keywords:
   - 当信号满足时
   - 跳转合法性
 description: |
-  在特定业务条件（非复位）满足时，FSM 必须从指定状态跳转到目标状态，防止非法状态转换。
-  触发条件是业务逻辑信号（如 valid、enable、last_beat），而非复位信号。
-  典型场景：IDLE 且 valid=1 时必须跳到 ACTIVE、BUSY 不能直接跳到 IDLE 必须经过 DRAIN。
-  若验证的是"复位释放后状态必须回到初始值"（rst_n 触发），请使用 sva_reset_behavior_v1。
+  做什么：在特定业务条件（condition）满足时，断言 FSM 必须从 from_state 跳转到 to_state，防止非法状态转换或漏转换。触发条件是业务信号（valid / enable / last_beat 等），不是复位边沿。
+  典型场景：IDLE 且 valid=1 时下一拍必须跳到 ACTIVE；ACTIVE 在 last_beat 置高时必须跳到 DONE；BUSY 不能直接跳到 IDLE 必须经过 DRAIN。
+  边界：请勿用于"复位释放后状态必须回到初始值"（rst_n $rose 触发，无业务 condition）—— 那是 sva_reset_behavior_v1；也不要用于"状态转换路径覆盖率统计"（不是断言）—— 那是 cov_transition_coverage_v1。
+differentiators:
+  - 触发条件是业务信号 condition 表达式（vs sva_reset_behavior_v1 的 rst_n 边沿）
+  - 显式 from_state / to_state 双状态参数，断言"必须跳"的强约束（vs 覆盖率"曾经发生过"的弱观察）
+  - 必填 condition 参数（sv_boolean_expr 类型）；sva_reset_behavior_v1 无此参数
+non_use_cases:
+  - 验证复位释放后 FSM 回到 IDLE / INIT 初始状态（应用 sva_reset_behavior_v1）
+  - 统计 FSM 状态转换路径覆盖率（应用 cov_transition_coverage_v1）
+  - 验证 valid/ready 协议握手或数据稳定性
 parameters:
   - name: module_name
     type: string

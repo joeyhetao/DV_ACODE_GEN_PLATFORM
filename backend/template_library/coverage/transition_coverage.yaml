@@ -21,10 +21,17 @@ keywords:
   - 相邻状态
   - 状态迁移
 description: |
-  收集 FSM 状态之间的转移路径覆盖率（边覆盖）：验证哪些"从状态 A 跳到状态 B"的转移边被触发过。
-  本模板统计的是相邻时刻之间的状态迁移，而非单一时刻的状态取值。
-  典型场景：验证 IDLE→ACTIVE、ACTIVE→DONE、DONE→IDLE 等所有合法转移路径都被测试覆盖。
-  若只需覆盖状态信号在各采样时刻的取值分布（不关心转移路径），请使用 cov_value_coverage_v1。
+  做什么：收集 FSM 状态之间的转移路径覆盖率（边覆盖 transition bin），用 `state_list => state_list` 列出所有合法两态转移，验证哪些 A→B 边被实际触发。
+  典型场景：验证 IDLE→ACTIVE、ACTIVE→DONE、DONE→IDLE 等所有合法 FSM 路径都被测试覆盖；4-state 状态机回归测试需要覆盖 12 条边中至少 N 条；BUSY → DRAIN → IDLE 路径强约束验证。
+  边界：请勿用于"只需统计状态信号各取值的分布"（点覆盖，不关心 transition）—— 那是 cov_value_coverage_v1；也不要用于"断言状态必须从 A 跳到 B"（断言而非覆盖率）—— 那是 sva_fsm_state_transition_v1。
+differentiators:
+  - bins 使用 `state_list => state_list` 转移语法（vs cov_value_coverage_v1 的点 bin）
+  - 必填 state_list 参数列举所有状态名（vs cov_value_coverage_v1 的 bins_expr 区间）
+  - 同时含 coverpoint 取值分布 + transition bin 双覆盖，便于一次性看状态健康度
+non_use_cases:
+  - 只需统计单个信号的取值分布（应用 cov_value_coverage_v1）
+  - 断言 FSM 必须在某条件下跳转（应用 sva_fsm_state_transition_v1，是断言不是覆盖率）
+  - 统计两个独立信号的交叉组合（应用 cov_cross_coverage_v1）
 parameters:
   - name: group_name
     type: string

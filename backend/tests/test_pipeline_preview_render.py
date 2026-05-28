@@ -596,6 +596,10 @@ def _patch_preview_deps(rag_candidates, llm_selection, db_get_return_value=None,
     ))
     fake_llm = MagicMock()
     fake_llm.select_template = AsyncMock(return_value=llm_selection)
+    # A8：pipeline 会在 step1 选中后调 await llm.verify_step1_selection；
+    # 默认返 True（"通过验证"），由测试按需 override 这一字段成 AsyncMock(return_value=False)
+    # 来覆盖 A8 否定分支。否则 MagicMock 默认子属性不是 awaitable，会 TypeError。
+    fake_llm.verify_step1_selection = AsyncMock(return_value=True)
     stack.enter_context(patch(
         "app.services.core.pipeline.get_default_llm_client",
         new=AsyncMock(return_value=fake_llm),
@@ -710,6 +714,7 @@ async def test_pipeline_preview_off_topic_gate_disabled_skips_check():
         ))
         fake_llm = MagicMock()
         fake_llm.select_template = AsyncMock(return_value=llm_refused)
+        fake_llm.verify_step1_selection = AsyncMock(return_value=True)
         stack.enter_context(patch(
             "app.services.core.pipeline.get_default_llm_client",
             new=AsyncMock(return_value=fake_llm),
@@ -833,6 +838,7 @@ async def test_pipeline_preview_keyword_supplement_fills_when_rag_empty():
     ))
     fake_llm = MagicMock()
     fake_llm.select_template = AsyncMock(return_value=llm_pick)
+    fake_llm.verify_step1_selection = AsyncMock(return_value=True)
     stack.enter_context(patch(
         "app.services.core.pipeline.get_default_llm_client",
         new=AsyncMock(return_value=fake_llm),
@@ -883,6 +889,7 @@ async def test_pipeline_preview_rag_empty_and_no_supplement_raises_empty_retriev
     ))
     fake_llm = MagicMock()
     fake_llm.select_template = AsyncMock()
+    fake_llm.verify_step1_selection = AsyncMock(return_value=True)
     stack.enter_context(patch(
         "app.services.core.pipeline.get_default_llm_client",
         new=AsyncMock(return_value=fake_llm),
@@ -939,6 +946,7 @@ async def test_pipeline_preview_intent_cache_hit_returns_quick_render():
     stack.enter_context(patch("app.services.core.pipeline.rag_retrieve", new=rag_mock))
     fake_llm = MagicMock()
     fake_llm.select_template = AsyncMock()
+    fake_llm.verify_step1_selection = AsyncMock(return_value=True)
     stack.enter_context(patch(
         "app.services.core.pipeline.get_default_llm_client",
         new=AsyncMock(return_value=fake_llm),
@@ -1001,6 +1009,7 @@ async def test_pipeline_preview_intent_cache_schema_drift_bypasses_cache():
         param_mapping={"signal": "valid", "state_list": "IDLE,RUN"},
         confidence=0.9,
     ))
+    fake_llm.verify_step1_selection = AsyncMock(return_value=True)
     stack.enter_context(patch(
         "app.services.core.pipeline.get_default_llm_client",
         new=AsyncMock(return_value=fake_llm),
@@ -1146,6 +1155,7 @@ async def test_pipeline_preview_code_type_match_passes():
     ))
     fake_llm = MagicMock()
     fake_llm.select_template = AsyncMock(return_value=llm_pick)
+    fake_llm.verify_step1_selection = AsyncMock(return_value=True)
     stack.enter_context(patch(
         "app.services.core.pipeline.get_default_llm_client",
         new=AsyncMock(return_value=fake_llm),
@@ -1190,6 +1200,7 @@ async def test_pipeline_preview_code_type_borderline_under_margin_passes():
     ))
     fake_llm = MagicMock()
     fake_llm.select_template = AsyncMock(return_value=llm_pick)
+    fake_llm.verify_step1_selection = AsyncMock(return_value=True)
     stack.enter_context(patch(
         "app.services.core.pipeline.get_default_llm_client",
         new=AsyncMock(return_value=fake_llm),
@@ -1235,6 +1246,7 @@ async def test_pipeline_preview_code_type_gate_disabled_skips_check():
     ))
     fake_llm = MagicMock()
     fake_llm.select_template = AsyncMock(return_value=llm_pick)
+    fake_llm.verify_step1_selection = AsyncMock(return_value=True)
     stack.enter_context(patch(
         "app.services.core.pipeline.get_default_llm_client",
         new=AsyncMock(return_value=fake_llm),
@@ -1818,3 +1830,313 @@ async def test_no_matching_template_gate_disabled_skips():
         assert result.confidence_source == "rag_fallback"
     finally:
         settings.no_match_gate_enabled = original
+
+
+# ── A8 step1 二次验证 ────────────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_step1_verify_yes_keeps_llm_selection():
+    """LLM step1 选中 + verify=yes → 正常返回 PreviewResult，confidence_source=llm_step1。
+
+    显式开 STEP1_VERIFY_ENABLED——它在 config.py 中默认 False（标定后才开），但本测试
+    锁的契约就是"verify 开启时回 yes 不影响 step1 决策"，所以必须显式开启。
+    """
+    from app.core.config import get_settings
+
+    rag = [_make_rag_candidate("sva_handshake_timeout_v1", score=0.85)]
+    llm_sel = TemplateSelectionOutput(
+        template_id="sva_handshake_timeout_v1",
+        param_mapping={"module_name": "axi_dma", "valid": "awvalid", "ready": "awready"},
+        confidence=0.9,
+    )
+
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "module_name", "required": True},
+        {"name": "valid", "required": True, "role_hint": "valid"},
+        {"name": "ready", "required": True, "role_hint": "ready"},
+    ]
+    fake_tmpl.id = "sva_handshake_timeout_v1"
+    fake_tmpl.name = "Valid-Ready握手超时检测断言"
+    fake_tmpl.version = "1.0.0"
+
+    stack, fake_db = _patch_preview_deps(rag, llm_sel, db_get_return_value=fake_tmpl)
+    settings = get_settings()
+    original = settings.step1_verify_enabled
+    settings.step1_verify_enabled = True
+    try:
+        with stack:
+            result = await pipeline_preview(
+                _make_preview_inp("axi_dma 模块 valid=awvalid ready=awready 握手超时断言"),
+                fake_db,
+            )
+    finally:
+        settings.step1_verify_enabled = original
+
+    assert result.template_id == "sva_handshake_timeout_v1"
+    assert result.confidence_source == "llm_step1"
+
+
+@pytest.mark.asyncio
+async def test_step1_verify_no_demotes_to_rag_fallback_and_triggers_no_match():
+    """LLM step1 选中但 verify=no → confidence_source 降级 rag_fallback → 第五道闸触发
+    NoMatchingTemplateError。即"二次验证识破 LLM 误选"路径。
+    """
+    from app.services.core.pipeline import NoMatchingTemplateError
+    from contextlib import ExitStack
+
+    rag = [_make_rag_candidate("sva_handshake_timeout_v1", score=0.75)]
+    # LLM step1 给出选择，但 verify_step1_selection 会返 False 模拟"LLM 自审发现选错了"
+    llm_sel = TemplateSelectionOutput(
+        template_id="sva_handshake_timeout_v1",
+        param_mapping={},
+        confidence=0.9,
+    )
+
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = []
+    fake_tmpl.id = "sva_handshake_timeout_v1"
+    fake_tmpl.name = "Valid-Ready握手超时检测断言"
+    fake_tmpl.version = "1.0.0"
+
+    stack = ExitStack()
+    stack.enter_context(patch(
+        "app.services.core.pipeline.dense_top1_score", new=AsyncMock(return_value=0.9),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.normalize_intent",
+        new=AsyncMock(return_value=("normalized", "hash_verify_no")),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.lookup_history", new=AsyncMock(return_value=None),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.rag_retrieve", new=AsyncMock(return_value=rag),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline._keyword_supplement", new=AsyncMock(return_value=[]),
+    ))
+    fake_llm = MagicMock()
+    fake_llm.select_template = AsyncMock(return_value=llm_sel)
+    # 关键：verify 返 False 模拟二次验证否定
+    fake_llm.verify_step1_selection = AsyncMock(return_value=False)
+    stack.enter_context(patch(
+        "app.services.core.pipeline.get_default_llm_client",
+        new=AsyncMock(return_value=fake_llm),
+    ))
+    fake_db = MagicMock()
+    fake_db.get = AsyncMock(return_value=fake_tmpl)
+
+    from app.core.config import get_settings
+    settings = get_settings()
+    original = settings.step1_verify_enabled
+    settings.step1_verify_enabled = True  # 显式开（config.py 默认 False）
+    try:
+        with stack, pytest.raises(NoMatchingTemplateError) as excinfo:
+            await pipeline_preview(_make_preview_inp("verify-no 触发降级测试"), fake_db)
+    finally:
+        settings.step1_verify_enabled = original
+
+    # 二次验证否定 → 降级 rag_fallback → no_matching_template 闸（默认开启）拦下
+    assert excinfo.value.detector == "no_matching_template"
+    # verify_step1_selection 确实被 await 调用了（confirm pipeline 真走了 A8 路径）
+    fake_llm.verify_step1_selection.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_step1_verify_disabled_skips_verification():
+    """STEP1_VERIFY_ENABLED=false → 不调 verify_step1_selection；LLM step1 选择直接生效。"""
+    from contextlib import ExitStack
+
+    rag = [_make_rag_candidate("sva_handshake_timeout_v1", score=0.85)]
+    llm_sel = TemplateSelectionOutput(
+        template_id="sva_handshake_timeout_v1",
+        param_mapping={"module_name": "axi_dma", "valid": "awvalid", "ready": "awready"},
+        confidence=0.9,
+    )
+
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "module_name", "required": True},
+        {"name": "valid", "required": True, "role_hint": "valid"},
+        {"name": "ready", "required": True, "role_hint": "ready"},
+    ]
+    fake_tmpl.id = "sva_handshake_timeout_v1"
+    fake_tmpl.name = "Valid-Ready握手超时检测断言"
+    fake_tmpl.version = "1.0.0"
+
+    stack = ExitStack()
+    stack.enter_context(patch(
+        "app.services.core.pipeline.dense_top1_score", new=AsyncMock(return_value=0.9),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.normalize_intent",
+        new=AsyncMock(return_value=("normalized", "hash_verify_off")),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.lookup_history", new=AsyncMock(return_value=None),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline.rag_retrieve", new=AsyncMock(return_value=rag),
+    ))
+    stack.enter_context(patch(
+        "app.services.core.pipeline._keyword_supplement", new=AsyncMock(return_value=[]),
+    ))
+    fake_llm = MagicMock()
+    fake_llm.select_template = AsyncMock(return_value=llm_sel)
+    # 即便 verify mock 配成 False，禁用开关后也不应被调用
+    fake_llm.verify_step1_selection = AsyncMock(return_value=False)
+    stack.enter_context(patch(
+        "app.services.core.pipeline.get_default_llm_client",
+        new=AsyncMock(return_value=fake_llm),
+    ))
+    fake_db = MagicMock()
+    fake_db.get = AsyncMock(return_value=fake_tmpl)
+
+    from app.core.config import get_settings
+    settings = get_settings()
+    original = settings.step1_verify_enabled
+    settings.step1_verify_enabled = False
+    try:
+        with stack:
+            result = await pipeline_preview(
+                _make_preview_inp("axi_dma 模块 valid=awvalid ready=awready 握手超时"),
+                fake_db,
+            )
+        # 关键：verify 没被调用
+        fake_llm.verify_step1_selection.assert_not_awaited()
+        # 关键：step1 选择按原样生效（即便 verify mock 返 False 也不影响）
+        assert result.template_id == "sva_handshake_timeout_v1"
+        assert result.confidence_source == "llm_step1"
+    finally:
+        settings.step1_verify_enabled = original
+
+
+# ── A9 reranker score gate ─────────────────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_step1_reranker_gate_fires_when_selected_score_below_threshold():
+    """LLM step1 选中 id 的 reranker score 低于阈值 → NoMatchingTemplateError，
+    redirect_to 走贡献页路径。"""
+    from app.services.core.pipeline import NoMatchingTemplateError
+    from app.core.config import get_settings
+
+    settings = get_settings()
+    # 构造 selected_score (0.10) 显著低于阈值 (0.30) 的场景
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.10)]
+    llm_sel = TemplateSelectionOutput(
+        template_id="sva_handshake_stable_v1",
+        param_mapping={},
+        confidence=0.9,
+    )
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = []
+    fake_tmpl.id = "sva_handshake_stable_v1"
+    fake_tmpl.name = "Stable"
+    fake_tmpl.version = "1.0.0"
+
+    stack, fake_db = _patch_preview_deps(rag, llm_sel, db_get_return_value=fake_tmpl)
+
+    original_gate = settings.step1_reranker_gate_enabled
+    original_thresh = settings.reranker_min_score_threshold
+    settings.step1_reranker_gate_enabled = True
+    settings.reranker_min_score_threshold = 0.30
+    try:
+        with stack, pytest.raises(NoMatchingTemplateError) as excinfo:
+            await pipeline_preview(_make_preview_inp("reranker gate 触发测试"), fake_db)
+    finally:
+        settings.step1_reranker_gate_enabled = original_gate
+        settings.reranker_min_score_threshold = original_thresh
+
+    e = excinfo.value
+    assert e.detector == "no_matching_template"
+    assert e.top_score == pytest.approx(0.10)
+    assert e.redirect_to.startswith("/contribute/new?")
+
+
+@pytest.mark.asyncio
+async def test_step1_reranker_gate_disabled_skips():
+    """STEP1_RERANKER_GATE_ENABLED=false → 即便 selected_score 远低于阈值也不拦，
+    PreviewResult 正常返回。逃生通道。"""
+    from app.core.config import get_settings
+
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.05)]
+    llm_sel = TemplateSelectionOutput(
+        template_id="sva_handshake_stable_v1",
+        param_mapping={"module_name": "dut", "valid": "v", "ready": "r", "data": "d"},
+        confidence=0.9,
+    )
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "module_name", "required": True, "default": "dut"},
+        {"name": "valid", "required": True, "role_hint": "valid"},
+        {"name": "ready", "required": True, "role_hint": "ready"},
+        {"name": "data", "required": True, "role_hint": "data"},
+    ]
+    fake_tmpl.id = "sva_handshake_stable_v1"
+    fake_tmpl.name = "Stable"
+    fake_tmpl.version = "1.0.0"
+
+    stack, fake_db = _patch_preview_deps(rag, llm_sel, db_get_return_value=fake_tmpl)
+
+    settings = get_settings()
+    original_gate = settings.step1_reranker_gate_enabled
+    original_us = settings.under_specified_gate_enabled
+    settings.step1_reranker_gate_enabled = False
+    # 关 under_specified 闸：本测试只关心 reranker gate 是否被跳过，参数完整性不在范围
+    settings.under_specified_gate_enabled = False
+    try:
+        with stack:
+            result = await pipeline_preview(
+                _make_preview_inp("dut 模块 valid=v ready=r data=d 握手稳定性"),
+                fake_db,
+            )
+        assert result.template_id == "sva_handshake_stable_v1"
+    finally:
+        settings.step1_reranker_gate_enabled = original_gate
+        settings.under_specified_gate_enabled = original_us
+
+
+@pytest.mark.asyncio
+async def test_step1_reranker_gate_passes_when_score_above_threshold():
+    """selected_score 高于阈值 → 不抛，正常走流水线。回归保护，防 A9 误拦边缘真请求。"""
+    from app.core.config import get_settings
+
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.55)]  # 0.55 > 0.30
+    llm_sel = TemplateSelectionOutput(
+        template_id="sva_handshake_stable_v1",
+        param_mapping={"module_name": "dut", "valid": "v", "ready": "r", "data": "d"},
+        confidence=0.9,
+    )
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "module_name", "required": True, "default": "dut"},
+        {"name": "valid", "required": True, "role_hint": "valid"},
+        {"name": "ready", "required": True, "role_hint": "ready"},
+        {"name": "data", "required": True, "role_hint": "data"},
+    ]
+    fake_tmpl.id = "sva_handshake_stable_v1"
+    fake_tmpl.name = "Stable"
+    fake_tmpl.version = "1.0.0"
+
+    stack, fake_db = _patch_preview_deps(rag, llm_sel, db_get_return_value=fake_tmpl)
+
+    settings = get_settings()
+    original_gate = settings.step1_reranker_gate_enabled
+    original_thresh = settings.reranker_min_score_threshold
+    original_us = settings.under_specified_gate_enabled
+    settings.step1_reranker_gate_enabled = True
+    settings.reranker_min_score_threshold = 0.30
+    settings.under_specified_gate_enabled = False
+    try:
+        with stack:
+            result = await pipeline_preview(
+                _make_preview_inp("dut 模块 valid=v ready=r data=d 握手稳定性"),
+                fake_db,
+            )
+        assert result.template_id == "sva_handshake_stable_v1"
+        assert result.confidence_source == "llm_step1"
+    finally:
+        settings.step1_reranker_gate_enabled = original_gate
+        settings.reranker_min_score_threshold = original_thresh
+        settings.under_specified_gate_enabled = original_us

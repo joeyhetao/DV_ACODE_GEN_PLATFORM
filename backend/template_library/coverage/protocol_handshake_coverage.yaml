@@ -25,9 +25,17 @@ keywords:
   - 握手覆盖率
   - AXI4握手
 description: |
-  收集 AXI4/AXI4-Lite/AXI4-Stream Valid/Ready 握手协议的四种关键场景覆盖率：
-  握手成功（valid=1,ready=1）、valid 等待（valid=1,ready=0）、ready 预备（valid=0,ready=1）、双方空闲（valid=0,ready=0）。
-  本模板专用于 AXI 协议握手场景的专项覆盖；若需对任意两个独立信号做值域交叉覆盖，请使用 cov_cross_coverage_v1。
+  做什么：专用于 AXI4 / AXI4-Lite / AXI4-Stream Valid/Ready 握手协议，固定收集四种语义命名场景覆盖率——握手成功（valid=1,ready=1）、valid 等待（valid=1,ready=0）、ready 预备（valid=0,ready=1）、双方空闲（valid=0,ready=0）。
+  典型场景：AXI 写地址通道 awvalid/awready 四态分布、AXI-Stream tvalid/tready 流控场景覆盖、确认接口在 ready 预备态的覆盖情况。
+  边界：请勿用于"任意两个独立信号做值域交叉"（无协议语义，自由 bin）—— 那是 cov_cross_coverage_v1；也不要用于"valid 等待期间 data 必须稳定"（断言而非覆盖率）—— 那是 sva_handshake_stable_v1。
+differentiators:
+  - 固定四种握手场景（handshake_done / valid_wait / ready_preemptive / both_inactive），bins 由模板硬编码（vs cov_cross_coverage_v1 的自由 bins_a/bins_b）
+  - 参数只需 valid / ready 信号名（vs cov_cross_coverage_v1 需要 signal_a/b + bins_a/b 四参数）
+  - 输出 cross bin 自带 binsof 表达式，无需用户写 bin 切片逻辑
+non_use_cases:
+  - 对任意两个非协议信号做值域交叉覆盖（应用 cov_cross_coverage_v1）
+  - 断言 valid 等待期间 data 必须稳定（应用 sva_handshake_stable_v1）
+  - 断言 ready 必须在 N 周期内响应（应用 sva_handshake_timeout_v1）
 parameters:
   - name: group_name
     type: string

@@ -14,8 +14,17 @@ keywords:
   - 组合覆盖
   - corner_case
 description: |
-  对任意两个独立信号的值域进行交叉覆盖率统计，用于发现信号组合的未覆盖 corner case。
-  适用于通用信号对（非协议专用）；若需覆盖 AXI valid/ready 握手的特定场景（握手成功/等待/预备），请使用 cov_protocol_handshake_v1。
+  做什么：对任意两个独立信号 signal_a / signal_b 各建一个 coverpoint，并用 `cross cp_a, cp_b` 收集组合覆盖率，发现信号对的未覆盖 corner case 组合。
+  典型场景：cmd_type × data_size 组合是否全覆盖、mode × priority 组合矩阵、enable × addr_range 边界条件交叉。
+  边界：请勿用于"AXI valid/ready 握手四种场景"（语义命名 bin 而非自由信号交叉）—— 那是 cov_protocol_handshake_v1；也不要用于"FSM 状态间转移路径"—— 那是 cov_transition_coverage_v1。
+differentiators:
+  - 通用两信号交叉，参数命名是 signal_a / signal_b（vs cov_protocol_handshake_v1 的 valid / ready 协议角色名）
+  - 必填 bins_a 和 bins_b 两组独立 bins_expr（其他 coverage 模板没有 bins_a/b 双参数）
+  - 不内置场景命名（如握手成功 / valid 等待），让用户完全自定义 bin
+non_use_cases:
+  - 收集 AXI valid/ready 握手四种场景覆盖率（应用 cov_protocol_handshake_v1，含语义命名 bin）
+  - 统计单个信号的取值分布（应用 cov_value_coverage_v1）
+  - 统计 FSM 状态之间的转移路径（应用 cov_transition_coverage_v1）
 parameters:
   - name: group_name
     type: string

@@ -23,8 +23,17 @@ keywords:
   - 死锁
   - 协议
 description: |
-  专用于 AXI4/AXI4-Lite/AXI4-Stream 的 Valid/Ready 握手协议超时检测：Valid 信号持续拉高直到 Ready 响应，验证 Ready 必须在规定周期内到来，防止死锁或性能退化。
-  本模板适用于 AXI 风格的 valid/ready 协议接口；若验证的是通用 req→ack 时序约束（两个独立边沿事件，非协议握手），请使用 sva_timing_max_delay_v1。
+  做什么：专用于 AXI4 / AXI4-Lite / AXI4-Stream Valid/Ready 握手协议的超时检测——valid 持续拉高直到 ready 响应，断言 ready 必须在指定 max_cycles 周期内到来。
+  典型场景：AXI awvalid → awready 在 16 周期内完成、axis tvalid 拉高后 tready 不超过 N 周期、AXI-Lite 写地址通道防死锁约束。
+  边界：请勿用于"valid 等待期间 data 必须 $stable"（数据稳定性）—— 那是 sva_handshake_stable_v1；也不要用于"通用 req → ack 两事件时序上限"（非协议握手）—— 那是 sva_timing_max_delay_v1。
+differentiators:
+  - 专为 AXI valid/ready 协议设计：valid 持续拉高直到 ready 响应（vs sva_timing_max_delay_v1 的两个独立 $rose 事件）
+  - 关注的是等待周期数 / 超时门限，不检测数据稳定性（vs sva_handshake_stable_v1 的 $stable）
+  - 必填 max_cycles 参数，sva_handshake_stable_v1 没有
+non_use_cases:
+  - 验证 valid 等待期间 data 不变（应用 sva_handshake_stable_v1）
+  - 验证非协议握手的两事件时序延迟（应用 sva_timing_max_delay_v1）
+  - 验证 FSM 状态转换或复位行为
 parameters:
   - name: module_name
     type: string

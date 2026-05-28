@@ -21,10 +21,17 @@ keywords:
   - 控制信号
   - 寄存器取值
 description: |
-  统计信号在各采样时刻的取值分布（点覆盖）：验证信号的每个合法取值或区间是否被触发过。
-  本模板关注单一信号的值域覆盖，不涉及相邻时刻之间的状态转移路径。
-  典型场景：error_code 的 0~15 每个值都必须被覆盖、status 寄存器所有枚举值覆盖率。
-  若需覆盖 FSM 状态之间的转移路径（A→B 边覆盖），请使用 cov_transition_coverage_v1。
+  做什么：统计单一信号在各采样时刻的取值分布（点覆盖 coverpoint），验证每个合法取值或区间是否至少被触发过一次，bins 由 bins_expr 定义。
+  典型场景：error_code 的 0~15 每个值都必须被覆盖、status 寄存器所有枚举值覆盖率、4 位 cmd 信号每个 opcode 被采样过。
+  边界：请勿用于"FSM 状态 A → B 转移路径覆盖"（边覆盖，不是点覆盖）—— 那是 cov_transition_coverage_v1；也不要用于"两个独立信号的值组合覆盖"—— 那是 cov_cross_coverage_v1。
+differentiators:
+  - 单一 coverpoint 上的点覆盖（bins），不涉及 transitions 或 cross
+  - 必填 bins_expr 参数（如 `{[0:15]}` / `{0, 1, 2, 3}`），其他 coverage 模板没有该参数
+  - 信号位宽 signal_width 用于推导默认 bins 区间
+non_use_cases:
+  - 统计 FSM 状态之间的转移路径覆盖率（应用 cov_transition_coverage_v1）
+  - 统计两个信号组合（AxB）的交叉覆盖率（应用 cov_cross_coverage_v1）
+  - 统计 valid/ready 握手四种场景覆盖率（应用 cov_protocol_handshake_v1）
 parameters:
   - name: group_name
     type: string
