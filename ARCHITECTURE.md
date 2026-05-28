@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.20  
+**版本**：v2.21  
 **状态**：已确认  
-**日期**：2026-05-27  
+**日期**：2026-05-28  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -46,6 +46,14 @@
   - 双层审核机制成型：第一层是 Step 2 用户对 LLM 输出的语义级校对（编辑或接受 `template_name / description / demo_code`），第二层是管理员三栏审核（不变）
   - schema 变更：`ContributionCreate.original_intent` 升必填（去掉 `Optional`），`template_name / description / demo_code` 改为 `Optional`；新增 `ContributionPreviewRequest / ContributionPreviewResponse`；`ContributionOut` 增 `use_immediately_available`
   - 前端：`MyContributionsPage` 提交 Modal 改为 Ant Design 两步 Steps；`contributions.ts` 新增 `contributionsApi.preview()` 方法与 `ContributionPreview` 接口
+- v2.20 → v2.21：**Step1 模板选择精度提升 — 候选渲染扩容 + description audit + 混淆语料 + 二次验证 + reranker score gate**——
+  - §3.15.3 Step 5a：`_step1_select_id` 候选渲染由单行字符串改为 Markdown 多行块（`### {i}. {template_id}  {name}\n描述：...`）；description 截断阈值由 60 char 扩到 **1000 char**（spec 中先记的 300 在 review NEW-1 后改为 1000，原因是 `lib_manager.py import` 在描述末尾追加合成的"区别要点："/"不适用场景："两段，合成总长实测最长达 812 char，需余量避免末项被切）；`_step1_select_id` 的 `max_tokens` **保持 64 不变**（仅输入侧扩容，输出仍是 `template_id` 或 `"none"`）；GLM-4.7 实测 step1 延迟增幅 < 1s
+  - §3.15.3 Step 5a：新增 **A8 step1 二次验证**——`pipeline.py` 在 step1 选中且 `confidence_source == "llm_step1"` 时，调用 `llm.verify_step1_selection(normalized_intent, selected_id, candidates)` 发一条 yes/no 问询；LLM 答 `no` → 把 `confidence_source` 降级为 `"rag_fallback"` 并把 `template` 置空，让后续 fallback 链按 `rag_fallback` 走 RAG top-1，可被第五道闸 `NoMatchingTemplateError` 接管；fail-open（LLM 调用/解析失败一律视为通过）；`STEP1_VERIFY_ENABLED` 开关，**默认 `False`**（开启前需先用 `tests/test_template_confusion_corpus_real_llm.py --real-llm` 评估 false-negative 率）；`max_tokens=16` / `thinking=disabled`
+  - §3.15.3 Step 5a：新增 **A9 reranker score gate**（pipeline 层独立 gate）——A8 验证通过后查 `rag_candidates` 中 `template_id == selection.template_id` 那一条的 `score` 字段（即 stage3 reranker score，由 `services/rag/engine.py` enriched 写入），低于 `RERANKER_MIN_SCORE_THRESHOLD`（默认 0.30，未标定的经验占位值）→ 抛 `NoMatchingTemplateError(top_score=selected_score)`；`STEP1_RERANKER_GATE_ENABLED` 开关，**默认 `False`**（开启前需跑 `scripts/calibrate_reranker_threshold.py` 在 `template_selection_corpus.yaml + template_confusion_corpus.yaml` 上标定 `correct_p10 / wrong_p50` 中点后写回 `reranker_min_score_threshold`）
+  - §3.15.3 Step 5a：**A9 与 FIX-9 移除的 `no_match_score_threshold` 的语义区分**——FIX-9 拦的是 RAG **top-1** score（"top-1 分数低就整体否决 LLM"），cross-encoder 词汇重叠会让无关握手模板拿 1.0 分把 LLM 正确的 `none` 判断否决，已经移除；A9 拦的是 **LLM 选中的那个 template_id** 的 reranker score（"LLM 信心十足选了某 id，但该 id 客观重排得分仍偏低"），是 LLM 决策 + reranker 复核的双信号互证，触发更稀少且方向更精确。`no_match_score_threshold` 仍保留供日志/监控参考，**不参与触发判定**
+  - §6 模板 YAML 文件规范：新增 `differentiators`（list[str]，列出与最近邻模板的 2–3 条区别）与 `non_use_cases`（list[str]，列出 2–3 条不适用场景）两个可选字段；`description` 字段约定升级为"做什么 / 典型场景 / 边界（请勿用于 X 请用 Y）"三要素。`lib_manager.py import` 通过新增的 `_compose_description(base, differentiators, non_use_cases)` helper **在 import 时把两个字段拼到 `description` 列末尾**（"区别要点："/"不适用场景："标题段，每段 list 前缀 `- `），由现有列流转到 Qdrant payload + reranker text + pipeline.candidate_dicts + LLM prompt，**避免 DB schema 变更**；`lib_manager.py validate` 同步新增校验：`description` 缺失或 < 30 字节 WARN（鼓励补齐三要素），`differentiators` / `non_use_cases` 若存在必须是非空 list 否则 ERROR
+  - §8.4 环境变量新增三项：`STEP1_VERIFY_ENABLED`（默认 false）、`STEP1_RERANKER_GATE_ENABLED`（默认 false）、`RERANKER_MIN_SCORE_THRESHOLD`（默认 0.30）
+  - 新增配套测试基础设施：`backend/tests/data/template_confusion_corpus.yaml`（近邻混淆对回归语料 ≥10 条种子，涵盖 pair-A `handshake_stable` ↔ `handshake_timeout` × 4 / pair-B `timing_max_delay` ↔ `handshake_timeout` × 4 / FSM × 1 / coverage × 1）+ `test_template_confusion_corpus_mocked.py`（CI 必跑，mock RAG 把 `confusion_template` 注入为 top-1，断言 pipeline 最终选中 `correct_template`）+ `test_template_confusion_corpus_real_llm.py --real-llm`（手动套件）+ `scripts/calibrate_reranker_threshold.py`（A9 阈值标定）
 
 ---
 
@@ -1485,6 +1493,16 @@ Step 5a: TemplateSelect（LLM Step1）
   若 template_id 为空 / "none" / 不在候选 → 退化为 rag_candidates[0]
     （此时 confidence 重写为该候选的 RAG 分数，confidence_source = "rag_fallback"）
 
+  【候选渲染（v2.21，A4）】_step1_select_id 的 candidates_text 由单行串接改为
+  Markdown 多行块（`### {i}. {template_id}  {name}\n描述：...`），description 截断
+  60 → 1000 char（lib_manager.py import 时已把 differentiators / non_use_cases 拼到
+  description 末尾形成"区别要点："/"不适用场景："两段，合成总长实测最长 812 char，
+  截断设到 1000 留余量避免 non_use_cases 末项被切；review NEW-1 后由 spec 中的 300
+  改为当前值）。`max_tokens=64` **保持不变**（输出仅 ~10 token 的 template_id，仅
+  input 侧扩容；GLM-4.7 实测 step1 延迟增幅 < 1s）。系统提示新增提示语
+  "候选描述末尾可能附『区别要点』/『不适用场景』段，请优先用于区分判断"。
+  此项仅影响 openai_compat_client；anthropic_client 的 select_template 候选渲染保持不变。
+
   【负向选择准则（FIX-8）】_step1_select_id 与 anthropic_client.select_template 的系统提示
   显式约束：当候选模板的**核心验证语义**与用户意图不匹配（例如意图是"两信号互斥 /
   one-hot / 竞争检测"，但候选均为握手 / 稳定性 / 延迟 / FSM / 值域），
@@ -1495,6 +1513,33 @@ Step 5a: TemplateSelect（LLM Step1）
   即触发，score 值记入日志供监控 → HTTP 422
   no_matching_template + detail.redirect_to=/contribute/new?...）。
   即：模板覆盖空白由"贡献页"修复，不由 LLM 在 step1 强行掩盖。
+
+  【A8 step1 二次验证（v2.21）】当 confidence_source == "llm_step1" 且
+  settings.step1_verify_enabled == True 时，pipeline 调用
+  llm.verify_step1_selection(normalized_intent, selected_template_id, candidates)
+  发一条 yes/no 问询确认核心验证语义是否一致。LLM 答 "no" → 把 confidence_source
+  降级为 "rag_fallback" 并把 template 置空，让后续 fallback 链按 rag_fallback 走
+  RAG top-1，可被第五道闸 NoMatchingTemplateError 接管。fail-open 原则：LLM 调用
+  失败 / 解析失败 / first-token 非 "no" 一律视为通过——避免新加这条验证反成误拒来源。
+  STEP1_VERIFY_ENABLED **默认 False**：开启前需用 confusion corpus 的 real-llm 套件
+  评估 false-negative 率。keyword_supplement 路径不验（已经是补救路径，不再加压）。
+  LLM 调用参数：max_tokens=16 / temperature=0 / thinking=disabled。
+
+  【A9 reranker score gate（v2.21，pipeline 层独立 gate）】A8 验证通过后再查
+  selection.template_id 在 rag_candidates 中的 score 字段（即 stage3 reranker score，
+  由 services/rag/engine.py enriched 写入）：若 selected_score < settings.
+  reranker_min_score_threshold（默认 0.30 经验占位值）且 settings.
+  step1_reranker_gate_enabled == True → 抛 NoMatchingTemplateError(top_score=
+  selected_score)，直跳贡献页。STEP1_RERANKER_GATE_ENABLED **默认 False**：开启前需
+  跑 scripts/calibrate_reranker_threshold.py 在 selection + confusion corpus 上标定
+  correct_p10 / wrong_p50 中点写入 reranker_min_score_threshold；未标定就上生产会
+  误拒 marginal 真请求。
+
+  【A9 与 FIX-9 移除的 no_match_score_threshold 的语义区分】FIX-9 拦的是 RAG **top-1**
+  score（"top-1 分数低就整体否决 LLM 决策"），cross-encoder 词汇重叠会让无关握手模板
+  拿 1.0 分把 LLM 正确的 none 判断否决，已经移除；A9 拦的是"LLM **选中** 的那个
+  template_id"的 reranker score，是 LLM 决策 + reranker 复核的双信号互证，触发条件
+  更稀少且方向更精确。no_match_score_threshold 字段保留供日志/监控，**不参与**触发判定。
 
 Step 5b: GenerationCacheLookup
   从意图正则提取 + LLM param_mapping 合并后查 get_generation_cache
@@ -2048,8 +2093,28 @@ keywords:
   - ready
   - 保持
 
-# 描述
-description: "当valid信号拉高且ready信号未到来时，数据信号必须在整个等待期间保持稳定，防止握手期间数据被意外修改"
+# 描述（三要素：做什么 / 典型场景 / 边界）
+# 约定（v2.21 / A10）：`description` 应同时覆盖"本模板做什么"+"典型场景"+
+# "边界：请勿用于 X 请用 Y"三要素；< 30 字节会被 lib_manager validate 标 WARN。
+description: |
+  做什么：当 valid 拉高且 ready 尚未响应（握手等待期间），断言数据/payload 信号必须保持稳定（$stable），关注的是"等待期间数据不变"。
+  典型场景：wvalid=1 但 wready=0 期间 wdata 不能改变；arvalid 期间 araddr 必须保持稳定。
+  边界：请勿用于"ready 必须在 N 周期内响应"（超时检测）—— 那是 sva_handshake_timeout_v1；也不要用于"req → ack 响应时间上限"（通用两事件时序）—— 那是 sva_timing_max_delay_v1。
+
+# 与最近邻模板的区别要点（v2.21 / A10，可选）
+# lib_manager.py import 时通过 _compose_description 拼到 description 列末尾形成
+# "区别要点：" 段（每项 `- ` 前缀），由现有列流转到 Qdrant payload / reranker text /
+# pipeline.candidate_dicts / LLM step1 prompt。声明此键即必须是非空 list（validate ERROR）。
+differentiators:
+  - 关注的是 valid 等待期间 data/payload 的 $stable 稳定性，不数等待周期、不抛超时
+  - 触发条件是 `valid && !ready`（握手未完成态），不关心首次 valid 上升沿后等多久 ready 才到
+
+# 不适用场景（v2.21 / A10，可选）
+# 同上：lib_manager.py import 时拼成 "不适用场景：" 段；声明此键即必须是非空 list。
+non_use_cases:
+  - 验证 ready 必须在 N 周期内响应（应用 sva_handshake_timeout_v1）
+  - 验证 FSM 状态转换或复位行为
+
 severity: error            # error | warning | info（仅断言使用）
 maturity: production       # draft | validated | production
 
@@ -2452,6 +2517,9 @@ location ~* \.(js|css|png|jpg|ico|svg|woff2?)$ {
 | `CODE_TYPE_MISMATCH_GATE_ENABLED` | code_type 一致性闸总开关（默认 `true`）；`OFFTOPIC_GATE_ENABLED=false` 时本闸自动跳 |
 | `CODE_TYPE_MISMATCH_MARGIN` | 别类 code_type dense 得分超过当前类多少时判定 mismatch（默认 `0.10`） |
 | `UNDER_SPECIFIED_GATE_ENABLED` | under_specified 闸总开关（默认 `true`）；设 `false` 时退回 v2.12 之前"系统编参数兜底总能产出代码"行为 |
+| `STEP1_VERIFY_ENABLED` | A8 step1 二次验证开关（默认 `false`）；开启前需用 confusion corpus 的 real-llm 套件评估 false-negative 率（详 §3.15.3 Step 5a / docs/test-manual.md §2.7） |
+| `STEP1_RERANKER_GATE_ENABLED` | A9 reranker score gate 开关（默认 `false`）；开启前必须先跑 `backend/scripts/calibrate_reranker_threshold.py` 在 selection + confusion corpus 上标定阈值（详 docs/test-manual.md §2.8） |
+| `RERANKER_MIN_SCORE_THRESHOLD` | A9 step1 选中模板的 stage3 reranker score 下限（默认 `0.30`，经验占位值；标定后写入 `backend/app/core/config.py` 默认值） |
 | `BACKUP_RETAIN_DAYS` | `7` | PostgreSQL 备份文件保留天数，超期自动删除 |
 | `QDRANT_SNAPSHOT_ENABLED` | `false` | 是否启用 Qdrant 每周快照（false 时只依赖 rebuild-index 恢复） |
 
