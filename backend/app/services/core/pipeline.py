@@ -389,6 +389,63 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
         if template and selection.template_id in supplement_ids:
             confidence_source = "keyword_supplement"
 
+        # A8 二次验证：step1 选中 + confidence_source=="llm_step1" 时，再发一条 yes/no
+        # 问询。若 LLM 二次回答否定 → 降级为 rag_fallback，进而被第五道闸（若开启）
+        # 拦下引导贡献。keyword_supplement 路径不验（已经是补救路径，不再加压）。
+        # fail-open：LLM 调用 / 解析失败默认 True（详见 base.LLMClient.verify_step1_selection）。
+        if template and confidence_source == "llm_step1" and settings.step1_verify_enabled:
+            _t = time.perf_counter()
+            verify_ok = await llm.verify_step1_selection(
+                normalized, selection.template_id, candidate_dicts
+            )
+            print(
+                f"[Timing] stage=step1_verify ms={int((time.perf_counter() - _t) * 1000)} "
+                f"ok={verify_ok}",
+                flush=True,
+            )
+            if not verify_ok:
+                print(
+                    f"[Pipeline] step1 verify=no: id={selection.template_id!r} "
+                    f"→ confidence_source 降级为 rag_fallback",
+                    flush=True,
+                )
+                confidence_source = "rag_fallback"
+                template = None  # 让下面的 fallback 链按 rag_fallback 走 RAG top1
+
+        # A9 reranker score gate（pipeline 层独立 gate）：A8 verify=yes 之后再查 LLM
+        # 选中的 template_id 在 stage3 reranker 输出里的 score。低于阈值 → 抛
+        # NoMatchingTemplateError 让用户去贡献。
+        # 与 FIX-9 移除的 RAG top-1 score 阈值的区分：FIX-9 拦的是"top-1 分数低就
+        # 整体否决 LLM 决策"，会让 cpu_req / dma_req 互斥意图被 score=1.0 的握手模
+        # 板带偏；A9 拦的是"LLM 信心十足选了某 id，但该 id 客观重排得分仍偏低"，是
+        # LLM 决策 + reranker 复核的双信号互证，触发更稀少且方向更精确。
+        # 注意：rag_candidates 中的 `score` 字段就是 stage3 reranker score
+        # （见 services/rag/engine.py:114 enriched["score"] = item["score"]）。
+        if (
+            template
+            and confidence_source == "llm_step1"
+            and settings.step1_reranker_gate_enabled
+        ):
+            selected_score = next(
+                (c["score"] for c in rag_candidates if c["template_id"] == selection.template_id),
+                None,
+            )
+            if (
+                selected_score is not None
+                and selected_score < settings.reranker_min_score_threshold
+            ):
+                print(
+                    f"[Gate] step1_reranker_gate: id={selection.template_id!r} "
+                    f"selected_score={selected_score:.4f} < threshold="
+                    f"{settings.reranker_min_score_threshold} → NoMatchingTemplate",
+                    flush=True,
+                )
+                raise NoMatchingTemplateError(
+                    original_intent=inp.original_intent,
+                    code_type=inp.code_type,
+                    top_score=selected_score,
+                )
+
     # Off-topic 检测的唯一信号是 normalize_intent 的 sentinel 输出（在本函数早期已检查并早返）。
     # 这里**不**再用 RAG cross-encoder 分数作为闸——实测发现 reranker 对不同 code_type 子语料
     # 的绝对分数分布完全不一致（assertion 给 0.833、coverage 直接给 1.0），无法跨语料校准；

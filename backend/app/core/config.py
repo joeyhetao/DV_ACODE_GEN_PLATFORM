@@ -71,6 +71,30 @@ class Settings(BaseSettings):
     no_match_gate_enabled: bool = True
     no_match_score_threshold: float = 0.60
 
+    # A8 step1 二次验证：LLM step1 选出 template_id 后，再发一条 yes/no 问询，确认
+    # 选中的模板核心验证语义与意图一致。若 LLM 答 'no' 则把 confidence_source 从
+    # "llm_step1" 降级为 "rag_fallback"，进而被 no_matching_template 闸（若开启）
+    # 拦下引导贡献。这是 A12 confusion corpus 的辅助防线。
+    # fail-open：LLM 调用失败 / 解析失败一律视为通过（避免新加这条验证反成误拒来源）。
+    # **默认 False**：每次 step1 增加一次 LLM call (~1s)，开启前需用 confusion corpus
+    # 的 real-llm 套件（test_template_confusion_corpus_real_llm.py --real-llm）评估
+    # false-negative 率（错拒真请求比例）；通过后再 STEP1_VERIFY_ENABLED=true 开启。
+    step1_verify_enabled: bool = False
+
+    # A9 reranker score gate（pipeline 层独立 gate）：LLM step1 选出 template_id 后，
+    # 查询该 id 在 stage3 reranker 输出中的 score，低于阈值 → 抛 NoMatchingTemplateError。
+    # 与 FIX-9 移除的 no_match_score_threshold 的语义区分：
+    #   no_match_score_threshold = RAG top-1 score 的阈值（FIX-9 移除，只信 LLM）
+    #   reranker_min_score_threshold = "被 LLM 选中" 的那个模板的 reranker score
+    # 即：A9 仅在 LLM 信心十足地选了某 id，但该 id 的 cross-encoder 重排得分仍偏低
+    # 时介入；典型场景是 LLM 被误导（如 description 信息不足）+ reranker 客观打低分。
+    # **默认 False**：0.30 是经验占位值，未在 corpus 上标定；强制要求先跑
+    # `scripts/calibrate_reranker_threshold.py` 在 selection + confusion corpus 上
+    # 取 correct_p10 / wrong_p50 中点写入 reranker_min_score_threshold 后，
+    # 再 STEP1_RERANKER_GATE_ENABLED=true 开启。未标定就上生产会误拒 marginal 真请求。
+    step1_reranker_gate_enabled: bool = False
+    reranker_min_score_threshold: float = 0.30
+
     # Celery
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"
