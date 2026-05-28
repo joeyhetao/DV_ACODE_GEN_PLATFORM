@@ -306,29 +306,32 @@ export default function MyContributionsPage() {
           <>
             {previewData?.name_conflict && (
               <Alert
-                type={previewData.is_semantic_duplicate ? 'info' : 'warning'}
+                type="warning"
                 showIcon
-                message={previewData.is_semantic_duplicate ? '库中已有相同场景模板' : '模板名称已被占用'}
+                message={`库中已有同名模板「${previewData.template_name}」`}
                 description={
-                  previewData.is_semantic_duplicate ? (
-                    <>
-                      库中已存在名为「{previewData.template_name}」且场景相同的模板，无需重复提交。
-                      <br />
-                      <Button
-                        type="link"
-                        size="small"
-                        style={{ padding: 0, marginTop: 4 }}
-                        onClick={() => { resetModal(); navigate('/generate') }}
-                      >
-                        前往代码生成页直接使用 →
-                      </Button>
-                    </>
-                  ) : (
-                    <>
-                      AI 生成的名称「{previewData.template_name}」已被库中另一个不同场景的模板占用，
-                      请在下方手动修改模板名称后再提交。
-                    </>
-                  )
+                  <>
+                    {previewData.existing_template_description && (
+                      <div style={{ marginBottom: 8 }}>
+                        <span style={{ color: '#666' }}>已有模板场景：</span>
+                        <span style={{ fontStyle: 'italic' }}>「{previewData.existing_template_description}」</span>
+                      </div>
+                    )}
+                    <div style={{ marginBottom: 8 }}>
+                      对比上方场景描述与你的需求：
+                    </div>
+                    <Button
+                      size="small"
+                      type="primary"
+                      style={{ marginRight: 8 }}
+                      onClick={() => { resetModal(); navigate('/generate') }}
+                    >
+                      场景相同，直接使用已有模板
+                    </Button>
+                    <span style={{ color: '#888', fontSize: 12 }}>
+                      或修改下方模板名称，提交新场景
+                    </span>
+                  </>
                 }
                 style={{ marginBottom: 16 }}
               />

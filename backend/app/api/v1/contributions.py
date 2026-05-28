@@ -28,7 +28,7 @@ from app.services.platform.contribution_service import (
     reject_contribution,
     request_revision,
 )
-from app.services.core.dedup import check_name_duplicate, check_semantic_duplicate, get_existing_template_id_by_name
+from app.services.core.dedup import check_name_duplicate, check_semantic_duplicate, get_existing_template_by_name
 from app.services.platform.parameter_extractor import (
     ContributionParseError,
     derive_parameters_from_demo,
@@ -84,26 +84,12 @@ async def preview_contribution(
     except ContributionParseError as e:
         raise _parse_failed_422(e)
 
-    existing_template_id = await get_existing_template_id_by_name(db, extracted.template_name)
-    name_conflict = existing_template_id is not None
-
-    # 仅名称冲突还不够——还需判断语义是否真正相同。
-    # 若语义相似度也超过 dedup_threshold，才算真正重复（可"直接使用"）。
-    # 若仅名称碰撞而 SVA 场景不同，前端应引导用户改名而非跳转。
-    is_semantic_duplicate = False
-    if name_conflict:
-        try:
-            similar = await check_semantic_duplicate(
-                description=extracted.description,
-                name=extracted.template_name,
-                keywords=extracted.keywords,
-            )
-            is_semantic_duplicate = any(
-                m["template_id"] == existing_template_id for m in similar
-            )
-        except Exception:
-            # Qdrant 不可用时降级：视为仅名称冲突，不展示"直接使用"，保守处理
-            is_semantic_duplicate = False
+    # 检查库中是否有同名模板，并同时取出其 description 供前端对比展示。
+    # 不依赖 Qdrant 评分：直接 DB 查询，稳定可靠，不受向量同步状态影响。
+    existing = await get_existing_template_by_name(db, extracted.template_name)
+    name_conflict = existing is not None
+    existing_template_id = existing[0] if existing else None
+    existing_template_description = existing[1] if existing else None
 
     # demo_code 回传 LLM 产出的**原始 SystemVerilog 代码**（含真实信号名 / 字面量），
     # 前端用它作为"立即使用"的可复制代码块；jinja_body 不暴露给前端——它在用户编辑后
@@ -116,7 +102,7 @@ async def preview_contribution(
         keywords=extracted.keywords,
         name_conflict=name_conflict,
         existing_template_id=existing_template_id,
-        is_semantic_duplicate=is_semantic_duplicate,
+        existing_template_description=existing_template_description,
     )
 
 

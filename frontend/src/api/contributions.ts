@@ -21,7 +21,7 @@ export interface ContributionPreview {
   keywords: string[]
   name_conflict: boolean
   existing_template_id?: string | null
-  is_semantic_duplicate?: boolean
+  existing_template_description?: string | null
 }
 export interface ContributionListItem {
   id: string; contributor_id: string; code_type: string; template_name: string; status: string; created_at: string

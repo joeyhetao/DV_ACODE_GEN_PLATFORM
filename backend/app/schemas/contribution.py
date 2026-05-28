@@ -42,8 +42,8 @@ class ContributionPreviewResponse(BaseModel):
     parameter_defs: list[dict]
     keywords: list[str]
     name_conflict: bool = False
-    existing_template_id: str | None = None  # 冲突模板在库中的 ID，供前端"直接使用"跳转
-    is_semantic_duplicate: bool = False       # True = 名称+语义均匹配，False = 仅名称碰撞
+    existing_template_id: str | None = None           # 冲突模板的 ID，供"直接使用"跳转
+    existing_template_description: str | None = None  # 冲突模板的场景描述，供用户对比判断
 
 
 class ContributionUpdate(BaseModel):
