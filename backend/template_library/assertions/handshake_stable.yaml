@@ -28,10 +28,17 @@ keywords:
   - 数据完整性
   - 握手等待
 description: |
-  当 valid 拉高且 ready 尚未响应（握手等待期间），数据/payload 信号不能发生变化。
-  本模板关注数据总线的稳定性约束，不检测超时、不计数等待周期。
-  典型场景：wvalid=1 但 wready=0 期间 wdata 不能改变；arvalid 期间地址信号必须保持稳定。
-  若需验证 ready 必须在 N 周期内响应（超时检测），请使用 sva_handshake_timeout_v1。
+  做什么：当 valid 拉高且 ready 尚未响应（握手等待期间），断言数据/payload 信号必须保持稳定（$stable），关注的是"等待期间数据不变"。
+  典型场景：wvalid=1 但 wready=0 期间 wdata 不能改变；arvalid 期间 araddr 必须保持稳定；axis tvalid 拉高等待 tready 时 tdata 不允许更新。
+  边界：请勿用于"ready 必须在 N 周期内响应"（超时检测）—— 那是 sva_handshake_timeout_v1；也不要用于"req → ack 响应时间上限"（通用两事件时序）—— 那是 sva_timing_max_delay_v1。
+differentiators:
+  - 关注的是 valid 等待期间 data/payload 的 $stable 稳定性，不数等待周期、不抛超时
+  - 触发条件是 `valid && !ready`（握手未完成态），不关心首次 valid 上升沿后等多久 ready 才到
+  - 必填参数包含 data（被保护的数据信号），sva_handshake_timeout_v1 没有 data
+non_use_cases:
+  - 验证 ready 必须在 N 周期内响应（应用 sva_handshake_timeout_v1）
+  - 验证通用 req → ack 时序延迟上限（应用 sva_timing_max_delay_v1）
+  - 验证 FSM 状态转换或复位行为
 parameters:
   - name: module_name
     type: string
