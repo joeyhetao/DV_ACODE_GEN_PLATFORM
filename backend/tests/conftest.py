@@ -13,6 +13,7 @@ import yaml
 
 _CORPUS_PATH = Path(__file__).parent / "data" / "offtopic_corpus.yaml"
 _TEMPLATE_CORPUS_PATH = Path(__file__).parent / "data" / "template_selection_corpus.yaml"
+_CONFUSION_CORPUS_PATH = Path(__file__).parent / "data" / "template_confusion_corpus.yaml"
 
 
 def pytest_addoption(parser):
@@ -64,6 +65,18 @@ def _load_template_corpus() -> dict:
 def load_template_corpus_cases(segment: str = "correct_mapping") -> list[dict]:
     """展开模板选择语料 YAML 为参数化 input 列表。每条 case 直接映射为一个测试用例。"""
     raw = _load_template_corpus().get(segment, []) or []
+    return [{**s, "_pid": s["id"]} for s in raw]
+
+
+def _load_confusion_corpus() -> dict:
+    with _CONFUSION_CORPUS_PATH.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+def load_confusion_corpus_cases(segment: str = "confusion_pairs") -> list[dict]:
+    """展开混淆对语料 YAML 为参数化 input 列表。每条 case 含 correct_template +
+    confusion_template，给 mock / real-llm 套件复用。"""
+    raw = _load_confusion_corpus().get(segment, []) or []
     return [{**s, "_pid": s["id"]} for s in raw]
 
 

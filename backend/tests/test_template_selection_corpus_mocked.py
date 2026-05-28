@@ -83,6 +83,9 @@ def _patch_pipeline_deps(
     fake_llm = MagicMock()
     fake_llm.select_template = AsyncMock(return_value=llm_sel)
     fake_llm.config_id = ""
+    # A8：pipeline 会在 step1 选中后调 await llm.verify_step1_selection；
+    # 默认返 True（"通过验证"），单测本身不关心 A8 行为。
+    fake_llm.verify_step1_selection = AsyncMock(return_value=True)
     stack.enter_context(patch(
         "app.services.core.pipeline.get_default_llm_client",
         new=AsyncMock(return_value=fake_llm),
