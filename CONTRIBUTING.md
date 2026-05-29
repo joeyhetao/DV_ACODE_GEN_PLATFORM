@@ -609,4 +609,59 @@ docker compose exec backend pytest tests/test_template_confusion_corpus_real_llm
 
 ---
 
+## 13. L3 反馈 `reason_tags` 维护流程
+
+L3 用户反馈的差评原因标签是固定枚举（不允许用户自定义），由 `backend/app/schemas/feedback.py::ReasonTagEnum` 与前端 `frontend/src/api/feedback.ts::REASON_TAG_OPTIONS` 双向定义。两份必须**同步演进**，否则前端选项与后端校验会错位 → 差评 Modal 提交后被 422 拦下。
+
+### 13.1 新增枚举值
+
+1. 后端先扩 `ReasonTagEnum`：
+   ```python
+   # backend/app/schemas/feedback.py
+   class ReasonTagEnum(str, Enum):
+       WRONG_TEMPLATE = "wrong_template"
+       # ...既有 6 项...
+       MY_NEW_TAG = "my_new_tag"  # 新增
+   ```
+2. 前端同步 `ReasonTag` 类型与 `REASON_TAG_OPTIONS`：
+   ```ts
+   // frontend/src/api/feedback.ts
+   export type ReasonTag =
+     | 'wrong_template' | ... | 'other'
+     | 'my_new_tag'  // 新增
+   export const REASON_TAG_OPTIONS = [
+     ...,
+     { value: 'my_new_tag', label: '中文标签' },  // 新增
+   ]
+   ```
+3. **不需要 migration** —— `generation_records.feedback_reason_tags` 是 JSONB 字段，没有 enum schema 约束；老记录的 7 项标签和新记录的 8 项标签可在同一列共存
+4. **不需要刷数据** —— 老数据天然不带新标签值，差评率 KPI 仍准确
+5. PR 描述里记一句"扩 reason_tag" + 选项理由（哪类用户反馈现有 7 项接不住），便于后续 audit
+
+### 13.2 删除枚举值
+
+`reason_tags` 是历史数据，**不要直接删** —— 已有 `generation_records.feedback_reason_tags` 列里存了这个值的行会变成"无人能解读"。grace 流程：
+
+1. **release N**：前端 `REASON_TAG_OPTIONS` 隐藏该项（用户不再能勾），后端 `ReasonTagEnum` 仍保留；现存数据照样读出
+2. **release N+1**：确认无新增数据后，后端从 `ReasonTagEnum` 移除 + 加一条 data backfill 把残存历史值 remap 到 `OTHER`（或对应的新枚举），上线后再删类型
+3. 跳过 grace 直接删的代价：差评率分析的旧数据该列变成 unknown，`/admin/analytics/intent-confusion` 端点对那些行的 Pydantic 反序列化会失败 → 500
+
+### 13.3 命名规范
+
+- `enum value`（DB 存的字面值）：`snake_case` 英文小写，如 `wrong_template` / `missing_disable_iff`
+- `label`（前端展示）：中文，放在 `REASON_TAG_OPTIONS[i].label`；若未来引入多语言，挪到 i18n bundle 后 `REASON_TAG_OPTIONS` 只保留 `value`
+- 长度：value ≤ 32 字符（与 `feedback_reason_tags` JSONB 数组元素约定），label ≤ 12 个汉字（Modal Checkbox 排版考虑）
+- 不要用 `general_issue` / `bug` 这种泛化词 —— 差评标签要够具体，否则就退化成 `other` 没有信号价值
+
+### 13.4 校验脚本
+
+新增/修改枚举后，本地至少跑：
+```bash
+docker compose exec backend pytest tests/test_feedback_api.py -v
+docker compose exec frontend npm run lint
+```
+若两侧值集不一致，前端 ESLint 不会拦（TS `as ReasonTag` 是宽松的），但运行时前端勾选新值发请求 → 后端 422 `validation_error`，前端只展示 toast 用户看不懂。**手动**比对 `ReasonTagEnum` 值集与 `REASON_TAG_OPTIONS.map(o => o.value)` 完全等价。
+
+---
+
 > 如有流程疑问，请在 GitHub Issues 中提出，或联系项目维护者。

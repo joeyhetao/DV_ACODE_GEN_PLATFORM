@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.21  
+**版本**：v2.22  
 **状态**：已确认  
-**日期**：2026-05-28  
+**日期**：2026-05-29  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -54,6 +54,12 @@
   - §6 模板 YAML 文件规范：新增 `differentiators`（list[str]，列出与最近邻模板的 2–3 条区别）与 `non_use_cases`（list[str]，列出 2–3 条不适用场景）两个可选字段；`description` 字段约定升级为"做什么 / 典型场景 / 边界（请勿用于 X 请用 Y）"三要素。`lib_manager.py import` 通过新增的 `_compose_description(base, differentiators, non_use_cases)` helper **在 import 时把两个字段拼到 `description` 列末尾**（"区别要点："/"不适用场景："标题段，每段 list 前缀 `- `），由现有列流转到 Qdrant payload + reranker text + pipeline.candidate_dicts + LLM prompt，**避免 DB schema 变更**；`lib_manager.py validate` 同步新增校验：`description` 缺失或 < 30 字节 WARN（鼓励补齐三要素），`differentiators` / `non_use_cases` 若存在必须是非空 list 否则 ERROR
   - §8.4 环境变量新增三项：`STEP1_VERIFY_ENABLED`（默认 false）、`STEP1_RERANKER_GATE_ENABLED`（默认 false）、`RERANKER_MIN_SCORE_THRESHOLD`（默认 0.30）
   - 新增配套测试基础设施：`backend/tests/data/template_confusion_corpus.yaml`（近邻混淆对回归语料 ≥10 条种子，涵盖 pair-A `handshake_stable` ↔ `handshake_timeout` × 4 / pair-B `timing_max_delay` ↔ `handshake_timeout` × 4 / FSM × 1 / coverage × 1）+ `test_template_confusion_corpus_mocked.py`（CI 必跑，mock RAG 把 `confusion_template` 注入为 top-1，断言 pipeline 最终选中 `correct_template`）+ `test_template_confusion_corpus_real_llm.py --real-llm`（手动套件）+ `scripts/calibrate_reranker_threshold.py`（A9 阈值标定）
+- v2.21 → v2.22：**L3 用户反馈 + L4 管理员分析仪表盘数据基础设施**——
+  - §4.1 `generation_records` 表新增 6 列（migration 006）：`feedback_rating SMALLINT`（1=好/2=一般/3=差）、`feedback_reason_tags JSONB`（7 项 `ReasonTagEnum` 枚举数组）、`feedback_comment TEXT(≤2048)`、`feedback_at TIMESTAMPTZ`、`generation_mode VARCHAR(16) DEFAULT 'rag'`（`'rag'` / `'llm_direct'` 为 L2 预留）、`gate_error_type VARCHAR(32)`（5 道闸触发标记）；全部 nullable，正常生成路径与 batch 老记录不受影响
+  - §4.1.1 新增 "feedback API 数据流" 子节：`POST /api/v1/feedback/{generation_record_id}` 写 4 个 feedback 列；权限 owner-or-admin（`record.user_id == current_user.id OR current_user.role in {lib_admin, super_admin}`），`rating=3` 必填 `reason_tags`（Pydantic `model_validator` 抛 `PydanticCustomError(type='reason_tags_required')`），成功返 204
+  - §4.1.2 新增 "admin analytics 模块" 子节：4 个 KPI 端点（`/admin/analytics/{feedback-summary, template-issues, intent-confusion, no-match-rate}`）的 SQL 聚合关键策略 + 数据源约定（`intent-confusion` 用 `rag_top3[0]` 作为 `expected_template`、`no-match-rate` 用 `gate_error_type='no_matching_template'`），全部要求 `lib_admin` / `super_admin`，`days` 窗 ∈ [1, 90] 默认 7
+  - §4.1.3 新增 "generate endpoint 422 catch 路径写 record" 子节：`api/v1/generate.py` 在 5 道闸 catch 块通过 `_record_gate_event` 写 `GenerationRecord(template_id=None, gate_error_type=<type>)`，`gate_error_type` 取值与异常一一对应（off_topic / code_type_mismatch / under_specified / no_matching_template / empty_retrieval）；**不修改 `services/core/pipeline.py` 闸判断逻辑**，仅在端点层补持久化，对确定性契约（§1.1）无影响
+  - §5.1 端点表追加 5 条：`POST /feedback/{id}`（普通用户/库管理员+） + 4 个 `/admin/analytics/*`（库管理员+）
 
 ---
 
@@ -1798,8 +1804,90 @@ lib_manager.py import template_library/ --dry-run
 | cache_hit | BOOLEAN | 是否命中 Redis 缓存（含历史意图库命中） |
 | intent_cache_hit | BOOLEAN | 是否命中历史意图知识库（区分普通缓存） |
 | created_at | TIMESTAMP | 生成时间 |
+| **feedback_rating** | SMALLINT NULL | L3 用户反馈评分：`1=好` / `2=一般` / `3=差`；NULL=未反馈（migration 006） |
+| **feedback_reason_tags** | JSONB NULL | 差评原因标签数组，元素来自 `ReasonTagEnum` 7 项枚举（`wrong_template` / `hallucinated_signal` / `syntax_error` / `semantic_error` / `style_bad` / `missing_disable_iff` / `other`）；rating=3 必填 |
+| **feedback_comment** | TEXT NULL | 反馈自由文本（≤ 2048 字符），所有评分档均可选填 |
+| **feedback_at** | TIMESTAMPTZ NULL | 反馈提交时间（UTC） |
+| **generation_mode** | VARCHAR(16) NULL DEFAULT 'rag' | 代码来源：`'rag'`（默认，走 RAG + 模板渲染）/ `'llm_direct'`（L2 直接 LLM 预留，本 PR 不产）；`cache_hit` 路径仍标 `'rag'`——含义为"代码来源"，与 `cache_hit` 的"是否命中"语义正交 |
+| **gate_error_type** | VARCHAR(32) NULL | 5 道闸触发记录标记：`'no_matching_template'` / `'off_topic'` / `'under_specified'` / `'code_type_mismatch'` / `'empty_retrieval'`；正常生成路径为 NULL；analytics `/no-match-rate` 端点的核心数据源 |
 
 索引：`intent_hash`（历史意图库查询）、`user_id`（用户历史查询）
+
+> **L3/L4 数据基础设施说明（migration 006）**：以上 6 列由 L3 用户反馈 + L4 分析仪表盘特性引入。`feedback_*` 4 列由 `POST /feedback/{id}` 写入（见下文"feedback API 数据流"）；`generation_mode` 默认 `'rag'`，正常生成与闸触发路径都写；`gate_error_type` 仅在 `api/v1/generate.py` 的 5 道闸 catch 块由 `_record_gate_event` 写入（见下文"generate endpoint 422 catch 路径写 record"）。**本 PR 不修改 `services/core/pipeline.py` 闸判断逻辑**，仅在端点层补持久化。
+
+#### 4.1.1 feedback API 数据流
+
+`POST /api/v1/feedback/{generation_record_id}` 唯一职责：把用户对单条 `generation_record` 的反馈写到上表 4 个 feedback 列。流程：
+
+```
+前端 GeneratePage result 阶段（FeedbackBar）
+  ↓ POST /api/v1/feedback/{record_id}  body: {rating, reason_tags?, comment?}
+api/v1/feedback.py::submit_feedback
+  ↓ 1. db.get(GenerationRecord, id) → 不存在则 404
+  ↓ 2. 权限校验：record.user_id == current_user.id OR current_user.role in {lib_admin, super_admin}
+  ↓    不满足 → 403
+  ↓ 3. Pydantic FeedbackCreate 已在端点入参校验：rating ∈ {1,2,3}（其他值 422），
+  ↓    rating=3 且 reason_tags 空 → 422 PydanticCustomError(type='reason_tags_required')
+  ↓ 4. 写 4 列：feedback_rating / feedback_reason_tags（[t.value for t in tags]）/
+  ↓    feedback_comment / feedback_at（datetime.now(timezone.utc)）
+  ↓ 5. 若原 record.generation_mode 为 NULL → 回填 'rag'（防 batch 老记录穿透）
+  ↓ 6. db.commit()
+返 HTTP 204 No Content
+```
+
+**幂等性**：未做去重——同一 `record_id` 重复 POST 会覆盖先前值（前端按钮已置灰防误操作）。如需历史保留改 L4 议题。
+
+**测试位置**：`backend/tests/test_feedback_api.py` 覆盖 422（rating=3 无 reason_tags）/ 403（user_id 不匹配） / 204（合法）三分支，全部 mock DB。
+
+#### 4.1.2 admin analytics 模块
+
+4 个端点全部在 `backend/app/api/v1/admin.py` 的 `# ── L4 analytics` 区块；时间窗 `days` 参数 `Query(7, ge=1, le=90)` 强制上限防全表扫；`require_role("lib_admin", "super_admin")` 守门。
+
+**关键 SQL 聚合**：
+
+| 端点 | 关键 SQL / 聚合策略 |
+|---|---|
+| `/feedback-summary` | 4 个并行 `count(*)`：`total_generations` / `total_feedbacks`（`feedback_rating IS NOT NULL`） / `bad_feedbacks`（`feedback_rating=3`） / `no_match_count`（`gate_error_type='no_matching_template'`）；`bad_rate` 分母用 `total_feedbacks` 避免 NaN |
+| `/template-issues` | 单 `group_by(template_id)`，`case((feedback_rating==3, 1), else_=0)` 累加 `bad_count`；Python 侧按 `(bad_rate, bad_count) DESC` 排序后切片，避免 SQL 方言差异 |
+| `/intent-confusion` | SQL 拉 `(original_intent, template_id, rag_top3)` where `feedback_rating=3 AND rag_top3 IS NOT NULL`；**Python 侧**对 `rag_top3[0]` 做 JSONB 路径访问、过滤 `expected != actual`、按 `(expected, actual)` 二元组聚合（不用用户原文做 key，脱敏 + 防基数爆炸）；末尾对桶内 `template_id` 集合做单次 `templates` 表反查拿 `code_type`（避免 N+1） |
+| `/no-match-rate` | `GenerationRecord.created_at.cast(Date)` 作为分桶 key（UTC 日界）；`func.sum(case((gate_error_type=='no_matching_template', 1), else_=0))` 算当日 `no_match_count`；不补零行——只返实际有数据的天数 |
+
+**数据源约定**：
+- `intent-confusion` 的 `expected_template` = `rag_top3[0].template_id`——视 RAG top-1 为"用户期望"的近似。语义弱于"用户补填期望模板"方案，但用户零负担、全自动，ROI 更高
+- `no-match-rate` 依赖 `gate_error_type` 列，**前提是 generate endpoint 422 catch 路径写 record**（见 §4.1.3）；否则该端点恒返 0
+- `rag_top3` 为空数组的边界（empty_retrieval 触发时）：Python 聚合 `if not isinstance(rag, list) or not rag: continue` 兜底
+
+**测试位置**：`backend/tests/test_admin_analytics.py` 覆盖 4 端点的空数据 + 有数据两分支，mock DB。
+
+#### 4.1.3 generate endpoint 422 catch 路径写 record（gate persistence）
+
+L4 `/no-match-rate` 与 `/feedback-summary` 的 `no_match_rate` 字段都依赖"闸触发时也有 `generation_records` 行"这条不变量。本 PR 在 `api/v1/generate.py` 的 5 道闸 catch 块补写：
+
+```python
+async def _record_gate_event(db, user_id, original_intent, gate_error_type):
+    # 1. 先 db.rollback()——pipeline 抛闸异常前可能往 session add 过中间对象
+    #    （intent_cache 之类），不清洁就直接 commit 会把脏对象一并持久化
+    # 2. db.add(GenerationRecord(user_id, original_intent,
+    #          template_id=None, output_code=None, confidence=None,
+    #          cache_hit=False, intent_cache_hit=False,
+    #          generation_mode='rag', gate_error_type=<type>))
+    # 3. db.commit()
+    # 失败兜底：logger.exception + rollback（不抛，闸响应优先于 analytics 持久化）
+```
+
+`gate_error_type` 取值与 pipeline 抛出的异常一一对应：
+
+| pipeline 异常 | `gate_error_type` 字面值 | HTTP 状态 |
+|---|---|---|
+| `OffTopicIntentError` | `off_topic` | 422 |
+| `CodeTypeMismatchError` | `code_type_mismatch` | 422 |
+| `UnderSpecifiedIntentError` | `under_specified` | 422 |
+| `NoMatchingTemplateError` | `no_matching_template` | 422 |
+| `EmptyRetrievalError` | `empty_retrieval` | 503 |
+
+**只在 `/generate` 与 `/generate/preview` 端点做**，`/generate/render` 不参与（renderer 自身不抛闸异常，且 record 在 preview 阶段已写）。**不改 pipeline 闸判断本身**——本 PR 是闸事件持久化的基础设施扩展，对确定性契约（§1.1）无影响。
+
+**与正常路径 record 的区分**：`gate_error_type IS NOT NULL` 即闸触发记录；`template_id` / `output_code` / `confidence` 均 NULL。`/template-issues` 端点 SQL where 加 `template_id IS NOT NULL` 自然排除这些行。
 
 **users（用户表）**
 
@@ -1994,6 +2082,11 @@ WHERE is_default = true;
 | GET | `/api/v1/notifications` | 获取当前用户通知列表 | 登录用户+ |
 | PUT | `/api/v1/notifications/{id}/read` | 标记通知已读 | 登录用户+ |
 | GET | `/api/v1/admin/audit-logs` | 查询管理员操作审计日志（按 action/operator/时间范围过滤，分页） | 超管 |
+| POST | `/api/v1/feedback/{generation_record_id}` | L3 用户反馈：写 `generation_records` 的 4 个 feedback 列；rating ∈ {1,2,3}（其他 422）；rating=3 必填 `reason_tags`（否则 422 `reason_tags_required`）；非 owner 且非 admin 返 403；成功 204 | 登录用户+（自己记录）/ 库管理员+（任意记录） |
+| GET | `/api/v1/admin/analytics/feedback-summary` | L4 KPI：`{days, total_generations, total_feedbacks, feedback_rate, bad_rate, no_match_rate}`；空数据各率返 0.0；`days` ∈ [1, 90] 默认 7 | 库管理员+ |
+| GET | `/api/v1/admin/analytics/template-issues` | L4 差评模板 top-N：`[{template_id, total_count, bad_count, bad_rate}]`，按 `bad_rate DESC, bad_count DESC` 排序；`limit` ∈ [1, 100] 默认 10 | 库管理员+ |
+| GET | `/api/v1/admin/analytics/intent-confusion` | L4 意图-模板混淆：`[{intent, expected_template, actual_template, code_type, count}]`；数据源仅 `feedback_rating=3 AND template_id != rag_top3[0].template_id`；`code_type` 由后端 join `templates` 表填好供前端复制 corpus 条目 | 库管理员+ |
+| GET | `/api/v1/admin/analytics/no-match-rate` | L4 按 UTC 日界聚合：`[{date, total, no_match_count, no_match_rate}]`；不补零行；依赖 `gate_error_type='no_matching_template'` 数据源 | 库管理员+ |
 
 ### 5.2 生成接口请求/响应示例
 
