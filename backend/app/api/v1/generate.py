@@ -89,6 +89,41 @@ def _no_matching_template_detail(e: NoMatchingTemplateError) -> dict:
     }
 
 
+async def _record_gate_event(
+    db: AsyncSession,
+    user_id: str,
+    original_intent: str,
+    gate_error_type: str,
+) -> None:
+    """L4 analytics 基础设施：5 道闸触发时写一条 GenerationRecord 用于聚合统计。
+
+    template_id / output_code / confidence 都留 None；analytics 端点用
+    `gate_error_type IS NOT NULL` 区分闸触发记录。
+
+    先 rollback：pipeline 抛闸异常之前可能往 db.session 里 add 过中间对象
+    （intent_cache 之类），那些状态本应随异常被丢弃；不先清洁就直接 add+commit
+    会把脏对象一并持久化，破坏 gate 语义。commit 失败再 rollback 一次兜底，
+    并 logger.exception 记录，避免把 analytics 写失败吞成沉默 bug。
+    """
+    try:
+        await db.rollback()
+        db.add(GenerationRecord(
+            user_id=user_id,
+            original_intent=original_intent,
+            template_id=None,
+            output_code=None,
+            confidence=None,
+            cache_hit=False,
+            intent_cache_hit=False,
+            generation_mode="rag",
+            gate_error_type=gate_error_type,
+        ))
+        await db.commit()
+    except Exception:
+        logger.exception("failed to persist gate event for analytics; ignoring")
+        await db.rollback()
+
+
 def _under_specified_detail(e: UnderSpecifiedIntentError) -> dict:
     # v3.0：under_specified 带 redirect_to=/intent-builder?...——前端 handleApiError
     # 读到后无脑 router.push，让用户进 IntentBuilder 多轮对话补足参数信息
@@ -138,14 +173,19 @@ async def generate(
     try:
         result = await run_pipeline(inp, db)
     except OffTopicIntentError as e:
+        await _record_gate_event(db, current_user.id, payload.text, "off_topic")
         raise HTTPException(status_code=422, detail=_off_topic_detail(e))
     except CodeTypeMismatchError as e:
+        await _record_gate_event(db, current_user.id, payload.text, "code_type_mismatch")
         raise HTTPException(status_code=422, detail=_code_type_mismatch_detail(e))
     except UnderSpecifiedIntentError as e:
+        await _record_gate_event(db, current_user.id, payload.text, "under_specified")
         raise HTTPException(status_code=422, detail=_under_specified_detail(e))
     except NoMatchingTemplateError as e:
+        await _record_gate_event(db, current_user.id, payload.text, "no_matching_template")
         raise HTTPException(status_code=422, detail=_no_matching_template_detail(e))
     except EmptyRetrievalError as e:
+        await _record_gate_event(db, current_user.id, payload.text, "empty_retrieval")
         raise HTTPException(status_code=503, detail=_empty_retrieval_detail(e))
     except ValueError as e:
         logger.warning(
@@ -243,14 +283,19 @@ async def preview(
             quick_render=result.quick_render,
         )
     except OffTopicIntentError as e:
+        await _record_gate_event(db, current_user.id, payload.text, "off_topic")
         raise HTTPException(status_code=422, detail=_off_topic_detail(e))
     except CodeTypeMismatchError as e:
+        await _record_gate_event(db, current_user.id, payload.text, "code_type_mismatch")
         raise HTTPException(status_code=422, detail=_code_type_mismatch_detail(e))
     except UnderSpecifiedIntentError as e:
+        await _record_gate_event(db, current_user.id, payload.text, "under_specified")
         raise HTTPException(status_code=422, detail=_under_specified_detail(e))
     except NoMatchingTemplateError as e:
+        await _record_gate_event(db, current_user.id, payload.text, "no_matching_template")
         raise HTTPException(status_code=422, detail=_no_matching_template_detail(e))
     except EmptyRetrievalError as e:
+        await _record_gate_event(db, current_user.id, payload.text, "empty_retrieval")
         raise HTTPException(status_code=503, detail=_empty_retrieval_detail(e))
     except ValueError as e:
         logger.warning(
@@ -304,6 +349,7 @@ async def render(
         raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {e}")
 
     # 仅在两步式路径（含 intent_hash）下写 GenerationRecord
+    record_id: str | None = None
     if payload.intent_hash:
         record = GenerationRecord(
             user_id=current_user.id,
@@ -318,11 +364,13 @@ async def render(
             confidence=payload.confidence,
             cache_hit=cache_hit,
             intent_cache_hit=(payload.confidence_source == "intent_cache"),
+            generation_mode="rag",
         )
         db.add(record)
         await db.commit()
+        record_id = record.id
 
-    return RenderResponse(code=code, cache_hit=cache_hit)
+    return RenderResponse(code=code, cache_hit=cache_hit, generation_record_id=record_id)
 
 
 @router.get("/code-types")

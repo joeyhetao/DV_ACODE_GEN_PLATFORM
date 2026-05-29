@@ -35,6 +35,47 @@ export const adminApi = {
     const res = await apiClient.post('/admin/backup')
     return res.data
   },
+  analytics: {
+    feedbackSummary: async (days = 7) => {
+      const res = await apiClient.get<{
+        days: number
+        total_generations: number
+        total_feedbacks: number
+        feedback_rate: number
+        bad_rate: number
+        no_match_rate: number
+      }>('/admin/analytics/feedback-summary', { params: { days } })
+      return res.data
+    },
+    templateIssues: async (days = 7, limit = 10) => {
+      const res = await apiClient.get<Array<{
+        template_id: string
+        total_count: number
+        bad_count: number
+        bad_rate: number
+      }>>('/admin/analytics/template-issues', { params: { days, limit } })
+      return res.data
+    },
+    intentConfusion: async (days = 7, limit = 10) => {
+      const res = await apiClient.get<Array<{
+        intent: string
+        expected_template: string
+        actual_template: string
+        code_type: string | null
+        count: number
+      }>>('/admin/analytics/intent-confusion', { params: { days, limit } })
+      return res.data
+    },
+    noMatchRate: async (days = 7) => {
+      const res = await apiClient.get<Array<{
+        date: string
+        total: number
+        no_match_count: number
+        no_match_rate: number
+      }>>('/admin/analytics/no-match-rate', { params: { days } })
+      return res.data
+    },
+  },
   llm: {
     list: async () => {
       const res = await apiClient.get<LLMConfig[]>('/admin/llm/configs')

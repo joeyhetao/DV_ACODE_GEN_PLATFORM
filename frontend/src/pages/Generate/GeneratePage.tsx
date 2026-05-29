@@ -2,14 +2,15 @@ import { useState, useEffect } from 'react'
 import { useNavigate, NavigateFunction, useLocation, useSearchParams } from 'react-router-dom'
 import {
   Card, Form, Input, Select, Button, Row, Col, Space, Tag,
-  Statistic, Divider, Typography, Table, Collapse, message, Modal, Spin,
+  Statistic, Divider, Typography, Table, Collapse, message, Modal, Spin, Checkbox,
 } from 'antd'
 import {
   ThunderboltOutlined, CopyOutlined, SendOutlined, PlusOutlined, DeleteOutlined,
-  LoadingOutlined,
+  LoadingOutlined, LikeOutlined, MehOutlined, DislikeOutlined,
 } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
 import { generateApi, PreviewResponse, SignalInfo } from '../../api/generate'
+import { feedbackApi, ReasonTag, REASON_TAG_OPTIONS } from '../../api/feedback'
 import ConfirmationPanel from '../../components/ConfirmationPanel'
 
 const { TextArea } = Input
@@ -37,6 +38,7 @@ interface ResultDisplay {
   confidence: number
   confidence_source: string
   rag_candidates: Array<{ template_id: string; name: string; score: number }>
+  generation_record_id?: string | null
 }
 
 interface IntentBuilderReturnState {
@@ -61,6 +63,12 @@ export default function GeneratePage() {
   // v3.0：source 用于区分 direct vs intent_builder 回流（仅用于上报 PipelineInput.source 字段）
   const [requestSource, setRequestSource] = useState<string>(initialSource)
   const [signals, setSignals] = useState<SignalRow[]>([])
+  // L3 feedback：每个 result.generation_record_id 独立 lock，重新生成时归零
+  const [feedbackSubmitted, setFeedbackSubmitted] = useState(false)
+  const [badRatingModalOpen, setBadRatingModalOpen] = useState(false)
+  const [badReasonTags, setBadReasonTags] = useState<ReasonTag[]>([])
+  const [badComment, setBadComment] = useState('')
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false)
 
   useEffect(() => {
     generateApi.codeTypes().then(setCodeTypes).catch(() => {})
@@ -169,6 +177,7 @@ export default function GeneratePage() {
           rag_candidates: preview.rag_candidates.map((c) => ({
             template_id: c.template_id, name: c.name, score: c.score,
           })),
+          generation_record_id: res.generation_record_id ?? null,
         },
       })
     } catch (e: unknown) {
@@ -178,7 +187,49 @@ export default function GeneratePage() {
   }
 
   const handleCancel = () => setState({ phase: 'idle' })
-  const handleReset = () => setState({ phase: 'idle' })
+  const handleReset = () => {
+    setState({ phase: 'idle' })
+    setFeedbackSubmitted(false)
+    setBadReasonTags([])
+    setBadComment('')
+  }
+
+  // ── L3 反馈提交（rating 1=好 / 2=一般 / 3=差）────────────────────────
+  const submitFeedback = async (rating: 1 | 2 | 3, reason_tags?: ReasonTag[], comment?: string) => {
+    if (state.phase !== 'result') return
+    const recordId = state.result.generation_record_id
+    if (!recordId) {
+      message.warning('当前结果缓存命中或来自旧版本接口，暂不支持反馈')
+      return
+    }
+    setFeedbackSubmitting(true)
+    try {
+      await feedbackApi.submit(recordId, { rating, reason_tags, comment: comment || undefined })
+      message.success('感谢反馈')
+      setFeedbackSubmitted(true)
+      setBadRatingModalOpen(false)
+      setBadReasonTags([])
+      setBadComment('')
+    } catch (e: unknown) {
+      const err = e as { response?: { status?: number; data?: { detail?: unknown } } }
+      const detail = err.response?.data?.detail
+      const detailStr = typeof detail === 'string' ? detail : detail ? JSON.stringify(detail).slice(0, 200) : ''
+      message.error(`反馈提交失败${err.response?.status ? `（HTTP ${err.response.status}）` : ''}${detailStr ? `: ${detailStr}` : ''}`)
+    } finally {
+      setFeedbackSubmitting(false)
+    }
+  }
+
+  const handleGoodRating = () => { void submitFeedback(1) }
+  const handleNeutralRating = () => { void submitFeedback(2) }
+  const handleBadRatingOpen = () => setBadRatingModalOpen(true)
+  const handleBadRatingSubmit = async () => {
+    if (badReasonTags.length === 0) {
+      message.warning('请至少选择一个差评原因')
+      return
+    }
+    await submitFeedback(3, badReasonTags, badComment)
+  }
 
   const copyCode = () => {
     if (state.phase === 'result' && state.result.code) {
@@ -353,7 +404,65 @@ export default function GeneratePage() {
                   theme="vs"
                 />
               </div>
+              <Divider style={{ marginTop: 16, marginBottom: 12 }} />
+              <Space size="small">
+                <Text type="secondary" style={{ fontSize: 13 }}>对生成结果的评价：</Text>
+                <Button
+                  size="small"
+                  icon={<LikeOutlined />}
+                  disabled={feedbackSubmitted || !state.result.generation_record_id}
+                  loading={feedbackSubmitting}
+                  onClick={handleGoodRating}
+                >好</Button>
+                <Button
+                  size="small"
+                  icon={<MehOutlined />}
+                  disabled={feedbackSubmitted || !state.result.generation_record_id}
+                  loading={feedbackSubmitting}
+                  onClick={handleNeutralRating}
+                >一般</Button>
+                <Button
+                  size="small"
+                  icon={<DislikeOutlined />}
+                  danger
+                  disabled={feedbackSubmitted || !state.result.generation_record_id}
+                  loading={feedbackSubmitting}
+                  onClick={handleBadRatingOpen}
+                >差</Button>
+                {feedbackSubmitted && <Text type="success" style={{ fontSize: 12 }}>已提交反馈</Text>}
+              </Space>
             </Card>
+
+            <Modal
+              title="差评反馈"
+              open={badRatingModalOpen}
+              onCancel={() => setBadRatingModalOpen(false)}
+              onOk={handleBadRatingSubmit}
+              confirmLoading={feedbackSubmitting}
+              okText="提交"
+              cancelText="取消"
+              width={520}
+            >
+              <div style={{ marginBottom: 12 }}>
+                <Text>请选择差评原因（至少一项，可多选）：</Text>
+              </div>
+              <Checkbox.Group
+                options={REASON_TAG_OPTIONS.map((o) => ({ label: o.label, value: o.value }))}
+                value={badReasonTags}
+                onChange={(v) => setBadReasonTags(v as ReasonTag[])}
+                style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+              />
+              <div style={{ marginTop: 16, marginBottom: 8 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>补充说明（可选，2KB 以内）：</Text>
+              </div>
+              <Input.TextArea
+                rows={3}
+                maxLength={2048}
+                value={badComment}
+                onChange={(e) => setBadComment(e.target.value)}
+                placeholder="例如：生成代码缺少 disable iff，或将 wr_en 误写为 wren。"
+              />
+            </Modal>
 
             {state.result.rag_candidates.length > 0 && (
               <Collapse size="small" items={[{
