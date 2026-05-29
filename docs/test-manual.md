@@ -1186,3 +1186,198 @@ message.error(`${fallbackMsg}（HTTP <status>: <detail 200 字符摘要>）`)
 ```
 
 即任意 generic 失败都会显示 HTTP 状态码 + detail 摘要，方便回归测试时直接看 toast 定位是 500 / 503 / 422 异常路径。后端则可用 §0.5 的 `ERROR` 过滤抓 traceback。
+
+---
+
+## 12. L3 用户反馈机制验证
+
+### §12.1 提交三档评分
+
+**前置**：登录普通用户，跑一次成功生成（任意 §1.x 路径都行），停留在 result 阶段（看到代码卡片）。
+
+**步骤**：
+1. 代码卡片下方应出现一行 3 个按钮：👍 好评 / 😐 一般 / 👎 差评
+2. **点 👍 好评**：按钮立即变 loading → 转灰 → 右侧出现「已提交反馈」文字。预期：无 Modal，单击即提交，rating=1
+3. 后端日志（§0.5）应出现 `POST /api/v1/feedback/<record_id> HTTP/1.1" 204`
+4. SQL 验证（`docker compose exec postgres psql -U postgres -d ic_codegen -c`）：
+   ```sql
+   SELECT id, feedback_rating, feedback_reason_tags, feedback_comment, feedback_at, generation_mode
+     FROM generation_records ORDER BY created_at DESC LIMIT 1;
+   ```
+   期望：`feedback_rating=1`, `feedback_reason_tags=NULL`, `feedback_comment=NULL`, `feedback_at` 是当前 UTC 时间戳，`generation_mode='rag'`
+
+**重复提交防护**：
+5. 再点其他档（😐 一般 / 👎 差评）应**无反应**——按钮已 disabled。预期：DB 该行 `feedback_rating` 仍为 1，不被覆盖
+6. 触发一次新生成（编辑参数后 Render，或重新 Preview），按钮组应**重新激活**（`feedbackSubmitted` 按 `generation_record_id` 独立 lock，新 record 归零）
+
+### §12.2 差评 Modal + reason_tags 必填
+
+**步骤**：
+1. 跑一次新生成进入 result 阶段
+2. 点 **👎 差评** → 弹出「差评反馈」Modal，含：
+   - 7 个 Checkbox 选项（模板选错 / 幻觉信号名 / 语法错误 / 语义错误 / 风格不佳 / 缺少 disable iff / 其他）
+   - 一个 TextArea comment 输入框
+   - 「取消」「确定」按钮
+3. **不选任何 reason_tag 直接点「确定」**：前端 toast `请至少选择一个差评原因`，**不发请求**（后端日志无 POST），Modal 不关闭。这是关键拦截
+4. 勾选 `模板选错` + `语义错误`，填 `comment = "这条用了 handshake 模板但我要的是 timing 约束"`，点「确定」
+5. 期望：按钮组转灰、Modal 关闭、`已提交反馈` 出现
+6. SQL 验证：
+   ```sql
+   SELECT feedback_rating, feedback_reason_tags, feedback_comment
+     FROM generation_records ORDER BY created_at DESC LIMIT 1;
+   ```
+   期望：`feedback_rating=3`, `feedback_reason_tags=["wrong_template", "semantic_error"]`（JSONB 数组），`feedback_comment='这条用了 handshake 模板但我要的是 timing 约束'`
+
+### §12.3 后端校验闸（前端绕过场景）
+
+通过 cURL 直接测后端 schema 校验（前端的拦截只是 UX，后端必须有强制约束）：
+
+```bash
+# 取 JWT（§0.6）
+TOKEN=$(curl -s ... | jq -r .access_token)
+
+# 取一条自己的 record id
+RECORD_ID=$(docker compose exec -T postgres psql -U postgres -d ic_codegen -t -c \
+  "SELECT id FROM generation_records WHERE user_id='<your_uuid>' ORDER BY created_at DESC LIMIT 1" | tr -d ' ')
+
+# 1) rating=3 但 reason_tags 为空 → 422 reason_tags_required
+curl -s -X POST http://localhost/api/v1/feedback/$RECORD_ID \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"rating": 3}' | jq
+# 期望：HTTP 422，detail[0].type="reason_tags_required"，msg 含 "reason_tags 字段必填"
+
+# 2) rating=5（非 {1,2,3}）→ 422 校验错误
+curl -s -X POST http://localhost/api/v1/feedback/$RECORD_ID \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"rating": 5}' | jq
+# 期望：HTTP 422，detail[0].type="literal_error"（Pydantic Literal[1,2,3] 标准错误）
+
+# 3) 别人的 record → 403
+SOMEONE_ELSE_ID=$(docker compose exec -T postgres psql -U postgres -d ic_codegen -t -c \
+  "SELECT id FROM generation_records WHERE user_id!='<your_uuid>' LIMIT 1" | tr -d ' ')
+curl -s -X POST http://localhost/api/v1/feedback/$SOMEONE_ELSE_ID \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"rating": 1}' | jq
+# 期望：HTTP 403，detail="无权对他人的生成记录评分"
+# 注：用 lib_admin / super_admin 账号同请求应该 204
+```
+
+### §12.4 闸触发路径的 record 持久化（L4 数据基础设施）
+
+L4 `/no-match-rate` 端点依赖"5 道闸触发时也有 GenerationRecord 行"。手动验证：
+
+1. 触发 `no_matching_template`（§2.5 总线仲裁互斥约束意图） → 收到 422 + 直跳贡献页
+2. SQL：
+   ```sql
+   SELECT id, user_id, template_id, output_code, gate_error_type, generation_mode
+     FROM generation_records
+     WHERE gate_error_type IS NOT NULL ORDER BY created_at DESC LIMIT 3;
+   ```
+   期望：最新一行 `gate_error_type='no_matching_template'`, `template_id IS NULL`, `output_code IS NULL`, `generation_mode='rag'`, `user_id` 是当前登录用户
+3. 同理触发 off-topic（§2.1 诗歌意图）→ 应写一行 `gate_error_type='off_topic'`
+4. 触发 under_specified（§2.3 缺信号名意图）→ 应写一行 `gate_error_type='under_specified'`
+
+**若 gate_error_type 行**不**出现**：说明 `api/v1/generate.py` `_record_gate_event` 调用链漏掉了某个闸，分析仪表盘 KPI 会失真。日志应有 `failed to persist gate event for analytics; ignoring` 表示写失败被吞——这种应改 ERROR 等级排查。
+
+---
+
+## 13. 管理员分析仪表盘使用说明
+
+**前置**：登录 `lib_admin` 或 `super_admin` 账号，访问 `/admin/analytics`（顶部导航「数据分析」入口）。
+
+### §13.1 4 个端点 curl 示例
+
+```bash
+TOKEN=$(curl -s -X POST http://localhost/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"<pw>"}' | jq -r .access_token)
+
+# 1) feedback-summary
+curl -s "http://localhost/api/v1/admin/analytics/feedback-summary?days=7" \
+  -H "Authorization: Bearer $TOKEN" | jq
+# 期望响应字段：
+# {
+#   "days": 7,
+#   "total_generations": <int>,
+#   "total_feedbacks": <int>,
+#   "feedback_rate": <0..1, 4 位小数>,
+#   "bad_rate": <0..1, 4 位小数>,
+#   "no_match_rate": <0..1, 4 位小数>
+# }
+# 空数据时各 rate=0.0，不报 500
+
+# 2) template-issues
+curl -s "http://localhost/api/v1/admin/analytics/template-issues?days=7&limit=10" \
+  -H "Authorization: Bearer $TOKEN" | jq
+# 期望：数组每行 {template_id, total_count, bad_count, bad_rate}，按 bad_rate DESC 排序
+
+# 3) intent-confusion
+curl -s "http://localhost/api/v1/admin/analytics/intent-confusion?days=7&limit=10" \
+  -H "Authorization: Bearer $TOKEN" | jq
+# 期望：数组每行 {intent (≤200 字符), expected_template, actual_template, code_type, count}
+# 数据源仅 feedback_rating=3 且 template_id != rag_top3[0].template_id
+
+# 4) no-match-rate
+curl -s "http://localhost/api/v1/admin/analytics/no-match-rate?days=7" \
+  -H "Authorization: Bearer $TOKEN" | jq
+# 期望：数组每行 {date (ISO date), total, no_match_count, no_match_rate}
+# 不补零行——只返实际有数据的天数
+
+# 权限校验：普通用户访问 → 403
+curl -s "http://localhost/api/v1/admin/analytics/feedback-summary" \
+  -H "Authorization: Bearer $REGULAR_USER_TOKEN" -w "%{http_code}\n" -o /dev/null
+# 期望：403
+```
+
+### §13.2 仪表盘 KPI 卡片含义
+
+| 卡片 | 数据源 | 解读 |
+|---|---|---|
+| 总生成数 | `total_generations` | 时间窗内所有 `generation_records` 行数（含 gate 触发记录） |
+| 反馈率 | `feedback_rate = total_feedbacks / total_generations` | 多少比例的生成被用户评了分。低于 5% 说明 UI 引导不够，用户根本不点反馈按钮 |
+| 差评率 | `bad_rate = bad_feedbacks / total_feedbacks` | **分母是反馈数不是生成数**——表达"在愿意反馈的用户里，差评占比"。> 30% 说明库或 LLM 有系统性问题 |
+| NoMatch 率 | `no_match_rate = no_match_count / total_generations` | 触发 `no_matching_template` 闸的比例。> 10% 说明库覆盖度不够，需要主动扩 templates |
+
+### §13.3 仪表盘视觉验收
+
+打开 `/admin/analytics` 页面后逐项核查：
+
+1. 顶部 KPI 卡片行（4 个 `Statistic`）数字与上面 curl 响应一致
+2. 7 天趋势折线图（`@ant-design/charts` Line）：X 轴日期（ISO date 倒序或顺序）、Y 轴 `no_match_rate`；hover 时 tooltip 显示当日 `total` / `no_match_count`
+3. 差评模板 top-10 表：
+   - 列：template_id / total_count / bad_count / bad_rate（百分比展示）
+   - 默认按 bad_rate 降序，可点表头排序
+4. intent confusion 表：
+   - 列：intent（截断显示） / expected_template / actual_template / code_type / count / 操作（含「复制为 corpus 条目」按钮）
+   - 点「复制为 corpus 条目」→ toast `已复制为 corpus 条目，可粘贴到 template_selection_corpus.yaml`
+   - 在终端 `pbpaste`（mac）或粘到任意编辑器，应得到完整 YAML 块：
+     ```yaml
+       - id: confusion_<timestamp>_<expected>_vs_<actual>
+         intent: "<原始意图 ≤200 字符>"
+         code_type: <actual_template 的 code_type>
+         expected_template: <rag_top3[0].template_id>
+         note: "From production confusion log: intent classified as ... but expected ... (count=N)"
+     ```
+   - 若 `code_type` 为空（actual_template 已被删）→ 出现 `code_type: ""  # template not found — please fill manually`
+5. 空数据兜底：DB 无任何反馈数据时，4 个 KPI 卡片显示 0.00% 而非 NaN/NaN，表格显示「暂无数据」占位
+
+### §13.4 intent_confusion → corpus 闭环（手动 append）
+
+发现 confusion 表里的混淆样本想加入回归测试时，标准流程：
+
+1. 仪表盘点「复制为 corpus 条目」
+2. 编辑 `backend/tests/data/template_selection_corpus.yaml`，把剪贴板 YAML 块 append 到末尾（按 `code_type` 分组就近放）
+3. 跑 `docker compose exec backend pytest tests/test_template_selection_corpus_mocked.py -v` 确认新条目通过 mock 套件
+4. PR 提交时附上「源于 production confusion 第 N 条」的说明，便于后续追溯
+
+**不**做自动写回：corpus 是版本控制的契约，需要 human-in-the-loop 审 audit；自动化只在贡献入库时由 `corpus_service.py` 写 `template_corpus_cases` DB 表（参见 CONTRIBUTING.md §12 近邻模板混淆对回归语料维护流程）。
+
+### §13.5 Stage 2/3 启动条件参考
+
+参考产品路线图的"观察期决策门"判定何时进入 L4 增强阶段：
+
+- **`bad_rate > 30%` 且持续 2 周** → 触发"模板系统性优化"工单（追查 top-10 表的 bad rate 集中模板）
+- **`no_match_rate > 15%` 且持续 2 周** → 触发"模板库扩容"工单（看 intent-confusion 表的高频未覆盖意图）
+- **`feedback_rate < 5%` 且持续 4 周** → 触发"反馈 UX 重设计"工单（用户根本不点反馈按钮，数据信号失效）
+
+阈值未硬编码到代码里——观察期决策由库管理员根据仪表盘手动判定，本表仅作参考起步值。

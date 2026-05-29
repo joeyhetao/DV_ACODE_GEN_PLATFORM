@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 产品需求文档（PRD）
 
-**版本**：v3.1  
+**版本**：v3.2  
 **状态**：起草中  
-**日期**：2026-05-27  
+**日期**：2026-05-29  
 **变更**：
 - v1.0 → v2.0：输入方式由"自然语言+Excel信号表"调整为"双表格结构化输入"（SVA需求表 + 功能覆盖率需求表）
 - v2.0 → v2.1：新增模板贡献与审核机制，处理 RAG 置信度 < 50% 时模板缺口的知识沉淀闭环
@@ -26,6 +26,12 @@
   - PipelineInput 新增可选字段 `source: "intent_builder" | "direct" = "direct"`，仅供日志/统计区分入口（不影响路由逻辑）。
   - **不**加新的低 confidence 硬闸——v2.13 的 4 道闸（off-topic / code_type_mismatch / under_specified / empty_retrieval）已覆盖所有"用户问题"场景，置信度保留为信息性元数据，由前端 ConfirmationPanel 软提示「贡献新模板」入口决定后续动作
 - v3.0 → v3.1：**§3.7 模板贡献向导从 4 字段再次简化为 2 字段**（FEAT-10）——用户只填 `original_intent + code_type` 两件，`template_name / description / demo_code` 由后端 LLM 一次性生成；前端提交 Modal 改为两步 Steps：Step 1 输入意图调 `POST /api/v1/contributions/preview` 取预览；Step 2 展示并允许编辑 `template_name / description / demo_code`，提供「提交审核」与「立即使用」两个按钮。新增**双层审核**机制：第一层是用户在 Step 2 对 LLM 输出做语义级验证（编辑或接受），第二层是管理员三栏审核（不变）。「立即使用」直接在 Step 2 页面内展示可复制代码框（`<pre>` 块 + 复制按钮），**不再跳转 `/generate`**——避免 `pending_review` 贡献因不在 Qdrant 中触发 `no_matching_template` 闸进入循环。LLM 生成的 `template_name` 走 `^(sva|cov)_[a-z][a-z0-9_]*_v\d+$` 命名规范校验 + `check_name_duplicate`，重名时预览响应携带 `name_conflict: true` 非阻塞提示（前端 Warning Alert 引导改名后重提）。`ContributionOut` 新增 `use_immediately_available: bool` 恒 true 字段供前端条件渲染。原 4 字段提交路径（`template_name + description + demo_code` 全传）作为分支 3 完全向后兼容；`parameter_defs` 显式传入仍走 v2 批量路径不调 LLM。
+- v3.1 → v3.2：**新增 §3.9 L3 用户反馈机制 + §3.10 L4 管理员分析仪表盘**——
+  - §3.9 GeneratePage `result` 阶段插入 3 档评分按钮（1=好/2=一般/3=差）；差评点击弹出 reason_tags 多选 Modal（7 项固定枚举：`wrong_template` / `hallucinated_signal` / `syntax_error` / `semantic_error` / `style_bad` / `missing_disable_iff` / `other`）+ 可选 `comment` 文本框（≤ 2048 字符）；任一档提交成功后整组按钮置灰
+  - §3.9 `POST /api/v1/feedback/{generation_record_id}`：rating ∈ {1,2,3}（其他 422）、rating=3 必填 reason_tags（否则 422 `reason_tags_required`）；权限 owner-or-admin（普通用户只能评自己的记录，库管理员+ 可补评他人）；成功返 204；写入 `generation_records` 的 4 个 feedback 列 + 回填 `generation_mode='rag'`（若原 NULL）
+  - §3.10 新增 4 个 KPI 端点（`/admin/analytics/{feedback-summary, template-issues, intent-confusion, no-match-rate}`），全部要求 `lib_admin` / `super_admin`，`days` 窗 ∈ [1, 90] 默认 7；`intent-confusion` 仅从 `feedback_rating=3 AND template_id != rag_top3[0].template_id` 聚合（视 RAG top-1 为期望模板），`no-match-rate` 按 UTC 日界统计 `gate_error_type='no_matching_template'`
+  - §3.10 新建 `AdminAnalyticsPage`（`/admin/analytics`）：KPI 卡片行 + 7 天 NoMatch 趋势折线图（`@ant-design/charts` Line） + 差评模板 top-10 表 + intent confusion 表（每行含「复制为 corpus 条目」按钮，生成 `template_selection_corpus.yaml` 兼容 YAML 块写入剪贴板，闭环回归测试语料）
+  - Stage 范围（明确不做）：不发送邮件/Webhook 推送、不实现批量任务行级反馈、不允许用户修改已提交反馈、不实现 CSV 导出、不做 Redis 缓存、不做差评率突增告警（留待 L5）
 
 ---
 
@@ -534,6 +540,103 @@ LLM 静默标准化（旧 §3.8 第一层）**保留但角色降级**：
 1. 否则 LLM 会引导用户产出"看起来标准但库里没有任何模板能渲染"的句子——用户走出 IntentBuilder 又被 RAG empty / under_specified 打回来
 2. 让 IntentBuilder 既是"意图标准化器"也是"模板发现器"——对库里有的需求几乎不会走到贡献路径
 3. 对库里**没有**的需求自然显式化（LLM 会明说"候选都不像"），引导用户去 §3.7 贡献
+
+---
+
+### 3.9 用户反馈机制（L3）
+
+**背景**：v3.0 之前，平台只在管理员侧收集"贡献被采纳"这一种正向信号；普通用户对每次生成结果的质量判断（"这条对/这条错"）没有结构化采集渠道，模板库优化只能靠管理员主观采样。L3 把"质量信号"沉淀到 `generation_records` 表，**为 §3.10 分析仪表盘提供原始数据**。
+
+#### 3.9.1 3 档评分按钮
+
+GeneratePage 在 `result` 阶段（生成代码渲染完成后）于代码卡片下方插入反馈条，3 个按钮一字排开：
+
+| 按钮 | rating 值 | 交互 |
+|---|---|---|
+| 👍 好评 | 1 | 单击即提交，无 Modal |
+| 😐 一般 | 2 | 单击即提交，无 Modal |
+| 👎 差评 | 3 | 单击弹差评 Modal（见 §3.9.2），Modal 内 Submit 才提交 |
+
+提交成功后整组按钮置灰（`feedbackSubmitted=true`），右侧显示"已提交反馈"文字；同一 `generation_record_id` 只允许评一次。重新发起一次新生成后 `feedbackSubmitted` 归零。
+
+#### 3.9.2 差评 Modal（reason_tags + comment）
+
+差评必须至少选 1 个 `reason_tag`（前端 `Checkbox.Group` + 不选则 Submit 按钮触发 `message.warning('请至少选择一个差评原因')`，不发请求）。固定 7 项枚举（Stage 1 不允许用户自定义，新增需走 §CONTRIBUTING.md 流程）：
+
+| 枚举值 | 中文标签 |
+|---|---|
+| `wrong_template` | 模板选错 |
+| `hallucinated_signal` | 幻觉信号名 |
+| `syntax_error` | 语法错误 |
+| `semantic_error` | 语义错误 |
+| `style_bad` | 风格不佳 |
+| `missing_disable_iff` | 缺少 disable iff |
+| `other` | 其他 |
+
+Modal 内还有可选 `comment` 文本框（≤ 2048 字符），允许用户描述具体问题。`comment` 在所有评分档位都可填（不限于差评）。
+
+#### 3.9.3 提交契约
+
+| 维度 | 值 |
+|---|---|
+| 端点 | `POST /api/v1/feedback/{generation_record_id}` |
+| 权限 | JWT 登录用户；普通用户只能给**自己**的 `generation_record` 评分；`lib_admin` / `super_admin` 可补评他人记录（兜底审核场景） |
+| 成功响应 | HTTP 204 No Content |
+| 失败响应 | 422（rating 非 1/2/3、rating=3 但 reason_tags 空）/ 403（user_id 不匹配且非 admin）/ 404（generation_record 不存在） |
+| 写入字段 | `generation_records.feedback_rating` / `feedback_reason_tags`（JSONB 数组）/ `feedback_comment` / `feedback_at`（UTC 时间）；若原记录 `generation_mode` 为空则回填 `'rag'` |
+
+**Stage 范围（明确不做）**：
+- 不做反馈数据的邮件 / Webhook 推送（仅入库）
+- 不做好评/一般评分触发任何自动流程（仅存储）
+- 不实现批量任务行级反馈（仅单条生成路径）
+- 不允许用户修改已提交的反馈（如需修改让 admin 走 PATCH）
+
+---
+
+### 3.10 管理员分析仪表盘（L4）
+
+**背景**：库管理员需要从"高频差评模板 / NoMatchingTemplate 趋势 / 意图-模板混淆热点"三个维度发现要修复的模板，**让模板库改进有数据驱动**。L4 把 §3.9 用户反馈、`generate.py` 5 道闸触发事件、`rag_top3` 候选日志聚合为 4 个 KPI 端点，前端 `/admin/analytics` 一站式呈现。
+
+#### 3.10.1 4 个 KPI 端点
+
+全部要求 `lib_admin` / `super_admin`；时间窗 `days` 默认 7、上限 90（防全表扫）。
+
+| 端点 | 返回字段 | 数据源 / 聚合逻辑 |
+|---|---|---|
+| `GET /api/v1/admin/analytics/feedback-summary` | `{days, total_generations, total_feedbacks, feedback_rate, bad_rate, no_match_rate}` | `total_*` = `count(generation_records)` 按时间窗；`bad_rate` = 差评数 / **反馈总数**（防 0/0 NaN）；`no_match_rate` = `gate_error_type='no_matching_template'` 记录数 / 总生成数 |
+| `GET /api/v1/admin/analytics/template-issues` | `[{template_id, total_count, bad_count, bad_rate}]` top-N（默认 10） | 仅取 `template_id IS NOT NULL AND feedback_rating IS NOT NULL` 记录，按 `template_id` group by；排序 by `bad_rate DESC, bad_count DESC` |
+| `GET /api/v1/admin/analytics/intent-confusion` | `[{intent, expected_template, actual_template, code_type, count}]` top-N | **仅** `feedback_rating=3 AND template_id != rag_top3[0].template_id`；`expected_template = rag_top3[0].template_id`（视 RAG top-1 为期望），`actual_template = template_id`；按 `(expected, actual)` 二元组聚合（不用用户原文做 key，脱敏 + 防基数爆炸），`intent` 字段返代表性截断样本（200 字符）；`code_type` 从 `templates` 表 join 出 actual 的 code_type，为前端复制 corpus 条目准备 |
+| `GET /api/v1/admin/analytics/no-match-rate` | `[{date, total, no_match_count, no_match_rate}]` | 按 UTC 日界 group by；`no_match_count` = 当日 `gate_error_type='no_matching_template'` 记录数；`total` = 当日所有 `generation_records`（含 gate 触发记录）；**不补零行**——不足 days 天时只返实际有数据的天数 |
+
+无数据情况下所有率值返 `0.0`、列表返 `[]`，**不报 500**。
+
+#### 3.10.2 仪表盘页面（`/admin/analytics`）
+
+`AdminAnalyticsPage.tsx` 挂载于 `/admin/analytics`，`RequireAdmin` 包裹。布局：
+
+1. **KPI 卡片行**（Ant Design `Statistic`）：4 个数字 / 百分比展示总生成数、反馈率、差评率、NoMatch 率
+2. **7 天趋势折线图**（`@ant-design/charts` Line）：消费 `/no-match-rate` 数据，X 轴日期、Y 轴 `no_match_rate`
+3. **差评模板 top-10 表**（Ant Design `Table`）：消费 `/template-issues`，列含 template_id / total_count / bad_count / bad_rate
+4. **intent confusion 表**（Ant Design `Table`）：消费 `/intent-confusion`，每行末尾有「复制为 corpus 条目」按钮——点击后将该行格式化为 `template_selection_corpus.yaml` 兼容的 YAML 块（含 id / intent / code_type / expected_template / note）写入剪贴板
+
+#### 3.10.3 intent-confusion → corpus 闭环
+
+混淆样本是回归测试语料的天然来源（CONTRIBUTING.md §12 近邻模板混淆对回归语料维护流程）。「复制为 corpus 条目」按钮生成的 YAML 格式直接兼容 `backend/tests/data/template_selection_corpus.yaml`：
+
+```yaml
+  - id: confusion_<timestamp>_<expected>_vs_<actual>
+    intent: "<原始意图前 200 字符>"
+    code_type: <actual_template 的 code_type，由后端 join 自动填好>
+    expected_template: <rag_top3[0].template_id>
+    note: "From production confusion log: intent classified as <actual> but expected <expected> (count=N)"
+```
+
+管理员复制后人工 append 到 yaml（**不**自动写回—— Stage 1 不做），下次 PR 上 CI 时回归套件自动守护这条规则。
+
+**Stage 范围（明确不做）**：
+- 不实现 CSV 导出（仅前端单条复制）
+- 不做仪表盘数据的 Redis 缓存（量级 < 1 周生成数，PG 直查足够）
+- 不实现 L4 自动告警（差评率突增邮件等，留待 L5）
 
 ---
 
