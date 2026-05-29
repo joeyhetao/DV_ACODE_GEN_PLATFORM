@@ -76,10 +76,10 @@ class Settings(BaseSettings):
     # "llm_step1" 降级为 "rag_fallback"，进而被 no_matching_template 闸（若开启）
     # 拦下引导贡献。这是 A12 confusion corpus 的辅助防线。
     # fail-open：LLM 调用失败 / 解析失败一律视为通过（避免新加这条验证反成误拒来源）。
-    # **默认 False**：每次 step1 增加一次 LLM call (~1s)，开启前需用 confusion corpus
-    # 的 real-llm 套件（test_template_confusion_corpus_real_llm.py --real-llm）评估
-    # false-negative 率（错拒真请求比例）；通过后再 STEP1_VERIFY_ENABLED=true 开启。
-    step1_verify_enabled: bool = False
+    # **默认 True**（2026-05-29 启用）：fix-step1 ticket 完成 + A12 confusion corpus
+    # 上线 + reranker calibration 后开启。每次 step1 增加一次 LLM call (~1s)。若发现
+    # 误拒率异常升高，可在运行环境通过 STEP1_VERIFY_ENABLED=false 临时关闭。
+    step1_verify_enabled: bool = True
 
     # A9 reranker score gate（pipeline 层独立 gate）：LLM step1 选出 template_id 后，
     # 查询该 id 在 stage3 reranker 输出中的 score，低于阈值 → 抛 NoMatchingTemplateError。
@@ -88,10 +88,11 @@ class Settings(BaseSettings):
     #   reranker_min_score_threshold = "被 LLM 选中" 的那个模板的 reranker score
     # 即：A9 仅在 LLM 信心十足地选了某 id，但该 id 的 cross-encoder 重排得分仍偏低
     # 时介入；典型场景是 LLM 被误导（如 description 信息不足）+ reranker 客观打低分。
-    # **默认 False**：0.30 是经验占位值，未在 corpus 上标定；强制要求先跑
-    # `scripts/calibrate_reranker_threshold.py` 在 selection + confusion corpus 上
-    # 取 correct_p10 / wrong_p50 中点写入 reranker_min_score_threshold 后，
-    # 再 STEP1_RERANKER_GATE_ENABLED=true 开启。未标定就上生产会误拒 marginal 真请求。
+    # **默认 False**（2026-05-29 calibration 结果：correct_p10=0.58 < wrong_p50=0.67，
+    # 两段重叠，reranker 在 confusion 对上判别力不足，任何阈值都会误拒 ≥10% correct）：
+    # 待 plan 路线图 Stage 1 观察期结束、differentiators / description 进一步优化 +
+    # 重跑 calibrate_reranker_threshold.py 产出正 gap 后再启用。强行启用会误拒 marginal
+    # 真请求或失去 gate 拦截能力（取决于阈值方向）。
     step1_reranker_gate_enabled: bool = False
     reranker_min_score_threshold: float = 0.30
 
