@@ -74,6 +74,7 @@ export interface RenderConfirmedRequest {
 export interface RenderConfirmedResponse {
   code: string
   cache_hit: boolean
+  generation_record_id?: string | null
 }
 
 export const generateApi = {

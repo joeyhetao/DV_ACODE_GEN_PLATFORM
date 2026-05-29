@@ -75,6 +75,9 @@ class RenderRequest(BaseModel):
 class RenderResponse(BaseModel):
     code: str
     cache_hit: bool = False
+    # 两步式路径写入 GenerationRecord 后回填 record.id 给前端，让用户可以在结果页提交反馈。
+    # legacy 重渲染路径不写 record，此处保持 None。
+    generation_record_id: str | None = None
 
 
 # ── 方案 3：两步式 preview 端点 schema ──────────────────────────────────────

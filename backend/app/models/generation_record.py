@@ -1,7 +1,7 @@
 from __future__ import annotations
 import uuid
 from datetime import datetime, timezone
-from sqlalchemy import Boolean, DateTime, Float, ForeignKey, String, Text
+from sqlalchemy import Boolean, DateTime, Float, ForeignKey, SmallInteger, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 from app.core.database import Base
@@ -28,3 +28,13 @@ class GenerationRecord(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+    # L3 feedback columns (migration 006)
+    feedback_rating: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    feedback_reason_tags: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    feedback_comment: Mapped[str | None] = mapped_column(Text, nullable=True)
+    feedback_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # 代码来源：'rag'（默认，走 RAG+模板）；'llm_direct'（L2 预留）
+    generation_mode: Mapped[str | None] = mapped_column(String(16), nullable=True, default="rag")
+    # 5 道闸触发类型：'no_matching_template' / 'off_topic' / 'under_specified'
+    # / 'code_type_mismatch' / 'empty_retrieval'；正常生成路径为 None
+    gate_error_type: Mapped[str | None] = mapped_column(String(32), nullable=True)
