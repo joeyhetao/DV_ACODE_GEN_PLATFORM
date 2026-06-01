@@ -66,9 +66,11 @@ async def test_feedback_summary_empty_returns_zeros():
         _scalar_result(0),  # bad_feedbacks
         _scalar_result(0),  # no_match_count
     )
-    res = await analytics_feedback_summary(days=7, db=db, current_user=_admin_user())
+    res = await analytics_feedback_summary(days=7, generation_mode=None, db=db, current_user=_admin_user())
+    # FEAT-11 Stage 2：响应新增 generation_mode 字段（默认 None=全部）
     assert res == {
         "days": 7,
+        "generation_mode": None,
         "total_generations": 0,
         "total_feedbacks": 0,
         "feedback_rate": 0.0,
@@ -86,7 +88,7 @@ async def test_feedback_summary_with_data_computes_rates():
         _scalar_result(10),
         _scalar_result(8),
     )
-    res = await analytics_feedback_summary(days=30, db=db, current_user=_admin_user())
+    res = await analytics_feedback_summary(days=30, generation_mode=None, db=db, current_user=_admin_user())
     assert res["total_generations"] == 100
     assert res["total_feedbacks"] == 40
     assert res["feedback_rate"] == 0.4
@@ -103,7 +105,7 @@ async def test_feedback_summary_no_feedback_but_generations_keeps_bad_rate_zero(
         _scalar_result(0),
         _scalar_result(0),
     )
-    res = await analytics_feedback_summary(days=7, db=db, current_user=_admin_user())
+    res = await analytics_feedback_summary(days=7, generation_mode=None, db=db, current_user=_admin_user())
     assert res["feedback_rate"] == 0.0
     assert res["bad_rate"] == 0.0
 
@@ -113,7 +115,7 @@ async def test_feedback_summary_no_feedback_but_generations_keeps_bad_rate_zero(
 @pytest.mark.asyncio
 async def test_template_issues_empty_returns_empty_list():
     db = _make_db_with_results(_all_result([]))
-    res = await analytics_template_issues(days=7, limit=10, db=db, current_user=_admin_user())
+    res = await analytics_template_issues(days=7, limit=10, generation_mode=None, db=db, current_user=_admin_user())
     assert res == []
 
 
@@ -126,7 +128,7 @@ async def test_template_issues_sorts_by_bad_rate_desc_then_bad_count_desc():
         SimpleNamespace(template_id="tplD", total_count=8, bad_count=4),
     ]
     db = _make_db_with_results(_all_result(rows))
-    res = await analytics_template_issues(days=7, limit=10, db=db, current_user=_admin_user())
+    res = await analytics_template_issues(days=7, limit=10, generation_mode=None, db=db, current_user=_admin_user())
     # tplB: 2/4=0.5; tplD: 4/8=0.5; tplA: 2/10=0.2; tplC: 2/20=0.1
     # 0.5 平手 → bad_count 降序：tplD(4) > tplB(2)
     assert [r["template_id"] for r in res] == ["tplD", "tplB", "tplA", "tplC"]
@@ -141,7 +143,7 @@ async def test_template_issues_respects_limit():
         for i in range(1, 30)
     ]
     db = _make_db_with_results(_all_result(rows))
-    res = await analytics_template_issues(days=7, limit=5, db=db, current_user=_admin_user())
+    res = await analytics_template_issues(days=7, limit=5, generation_mode=None, db=db, current_user=_admin_user())
     assert len(res) == 5
 
 

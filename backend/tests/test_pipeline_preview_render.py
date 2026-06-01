@@ -1032,8 +1032,9 @@ async def test_pipeline_preview_intent_cache_schema_drift_bypasses_cache():
             _make_preview_inp("信号 valid 状态 IDLE RUN"), fake_db,
         )
 
-    # 关键：走了 RAG / LLM 完整路径，没有 quick_render
-    assert result.quick_render is False
+    # 关键：走了 RAG / LLM 完整路径——既未命中 intent_cache，RAG/LLM 都被实际调用。
+    # 注：FEAT-11 之后高置信 RAG 也可能令 quick_render=True，那是正确行为
+    # （与 intent_cache 短路不同源）。
     assert result.confidence_source != "intent_cache"
     rag_mock.assert_awaited_once()
     fake_llm.select_template.assert_awaited_once()
@@ -2138,5 +2139,212 @@ async def test_step1_reranker_gate_passes_when_score_above_threshold():
         assert result.confidence_source == "llm_step1"
     finally:
         settings.step1_reranker_gate_enabled = original_gate
+        settings.reranker_min_score_threshold = original_thresh
+        settings.under_specified_gate_enabled = original_us
+
+
+# ── FEAT-11 A：高置信 RAG 自动 quick_render（跳过 ConfirmationPanel）─────────
+
+def _make_high_conf_template_mock():
+    """构造一个让所有 required 参数都能落到 llm/regex/signal_list/default 的 fake template。
+
+    所有四个 required 参数：module_name（LLM 给 grounded 值）/ valid / ready / clk（default）。
+    """
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "module_name", "required": True, "default": "dut"},
+        {"name": "valid", "required": True, "role_hint": "valid"},
+        {"name": "ready", "required": True, "role_hint": "ready"},
+        {"name": "clk", "required": True, "default": "clk"},
+    ]
+    fake_tmpl.id = "sva_handshake_stable_v1"
+    fake_tmpl.name = "Stable"
+    fake_tmpl.version = "1.0.0"
+    return fake_tmpl
+
+
+@pytest.mark.asyncio
+async def test_feat11_high_conf_all_green_sets_quick_render_true():
+    """四条件齐绿：confidence_source=llm_step1 + verify_ok + score≥阈值 + 全高置信源
+    → PreviewResult.quick_render=True，让前端跳过 ConfirmationPanel 直渲。"""
+    from app.core.config import get_settings
+
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.85)]
+    llm_full = TemplateSelectionOutput(
+        template_id="sva_handshake_stable_v1",
+        param_mapping={"module_name": "axi_dma", "valid": "awvalid", "ready": "awready"},
+        confidence=0.95,
+    )
+    fake_tmpl = _make_high_conf_template_mock()
+    stack, fake_db = _patch_preview_deps(rag, llm_full, db_get_return_value=fake_tmpl)
+
+    settings = get_settings()
+    original_verify = settings.step1_verify_enabled
+    original_thresh = settings.reranker_min_score_threshold
+    settings.step1_verify_enabled = True
+    settings.reranker_min_score_threshold = 0.30
+    try:
+        with stack:
+            result = await pipeline_preview(
+                _make_preview_inp("axi_dma 模块 valid=awvalid ready=awready 握手稳定性断言"),
+                fake_db,
+            )
+        assert result.quick_render is True
+        assert result.confidence_source == "llm_step1"
+    finally:
+        settings.step1_verify_enabled = original_verify
+        settings.reranker_min_score_threshold = original_thresh
+
+
+@pytest.mark.asyncio
+async def test_feat11_quick_render_false_when_verify_disabled():
+    """step1_verify_enabled=False → 即便其他三条件齐绿，也禁高置信直渲（缺一个独立信号）。"""
+    from app.core.config import get_settings
+
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.85)]
+    llm_full = TemplateSelectionOutput(
+        template_id="sva_handshake_stable_v1",
+        param_mapping={"module_name": "axi_dma", "valid": "awvalid", "ready": "awready"},
+        confidence=0.95,
+    )
+    fake_tmpl = _make_high_conf_template_mock()
+    stack, fake_db = _patch_preview_deps(rag, llm_full, db_get_return_value=fake_tmpl)
+
+    settings = get_settings()
+    original_verify = settings.step1_verify_enabled
+    original_thresh = settings.reranker_min_score_threshold
+    settings.step1_verify_enabled = False
+    settings.reranker_min_score_threshold = 0.30
+    try:
+        with stack:
+            result = await pipeline_preview(
+                _make_preview_inp("axi_dma 模块 valid=awvalid ready=awready 握手稳定性断言"),
+                fake_db,
+            )
+        assert result.quick_render is False
+    finally:
+        settings.step1_verify_enabled = original_verify
+        settings.reranker_min_score_threshold = original_thresh
+
+
+@pytest.mark.asyncio
+async def test_feat11_quick_render_false_when_score_below_threshold():
+    """selected_score < reranker_min_score_threshold → 即便其他三条件齐绿，禁直渲。"""
+    from app.core.config import get_settings
+
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.20)]
+    llm_full = TemplateSelectionOutput(
+        template_id="sva_handshake_stable_v1",
+        param_mapping={"module_name": "axi_dma", "valid": "awvalid", "ready": "awready"},
+        confidence=0.95,
+    )
+    fake_tmpl = _make_high_conf_template_mock()
+    stack, fake_db = _patch_preview_deps(rag, llm_full, db_get_return_value=fake_tmpl)
+
+    settings = get_settings()
+    original_verify = settings.step1_verify_enabled
+    original_thresh = settings.reranker_min_score_threshold
+    original_gate = settings.step1_reranker_gate_enabled
+    settings.step1_verify_enabled = True
+    settings.reranker_min_score_threshold = 0.30
+    # A9 gate 关 —— 避免 0.20<0.30 直接抛 NoMatchingTemplateError 掩盖测试目标
+    settings.step1_reranker_gate_enabled = False
+    try:
+        with stack:
+            result = await pipeline_preview(
+                _make_preview_inp("axi_dma 模块 valid=awvalid ready=awready 握手稳定性断言"),
+                fake_db,
+            )
+        assert result.quick_render is False
+    finally:
+        settings.step1_verify_enabled = original_verify
+        settings.reranker_min_score_threshold = original_thresh
+        settings.step1_reranker_gate_enabled = original_gate
+
+
+@pytest.mark.asyncio
+async def test_feat11_quick_render_false_when_rag_fallback():
+    """confidence_source=rag_fallback（LLM 拒所有候选）→ 禁直渲，必须走 ConfirmationPanel。"""
+    from app.core.config import get_settings
+
+    rag = [_make_rag_candidate("sva_handshake_stable_v1", score=0.85)]
+    llm_refused = TemplateSelectionOutput(
+        template_id="",
+        param_mapping={},
+        confidence=0.0,
+    )
+    fake_tmpl = _make_high_conf_template_mock()
+    stack, fake_db = _patch_preview_deps(rag, llm_refused, db_get_return_value=fake_tmpl)
+
+    settings = get_settings()
+    original_verify = settings.step1_verify_enabled
+    original_thresh = settings.reranker_min_score_threshold
+    original_no_match = settings.no_match_gate_enabled
+    original_us = settings.under_specified_gate_enabled
+    settings.step1_verify_enabled = True
+    settings.reranker_min_score_threshold = 0.30
+    # 关掉 no_match + under_specified 闸，让 rag_fallback 路径走到结尾产 PreviewResult
+    settings.no_match_gate_enabled = False
+    settings.under_specified_gate_enabled = False
+    try:
+        with stack:
+            result = await pipeline_preview(
+                _make_preview_inp("axi_dma 模块 valid=awvalid ready=awready 握手稳定性"),
+                fake_db,
+            )
+        assert result.confidence_source == "rag_fallback"
+        assert result.quick_render is False
+    finally:
+        settings.step1_verify_enabled = original_verify
+        settings.reranker_min_score_threshold = original_thresh
+        settings.no_match_gate_enabled = original_no_match
+        settings.under_specified_gate_enabled = original_us
+
+
+@pytest.mark.asyncio
+async def test_feat11_quick_render_false_when_param_has_semantic_fallback():
+    """所有四条件齐绿但有 required 参数落在 semantic_fallback → 禁直渲。
+
+    placeholder / semantic_fallback 都不是用户/LLM 给的，强制走 ConfirmationPanel
+    让用户先确认再渲染。本测试关闭 under_specified 闸，否则会先于本判定拦下。
+    """
+    from app.core.config import get_settings
+
+    rag = [_make_rag_candidate("cov_transition_coverage_v1", score=0.85)]
+    # state_list 既无 LLM 给值也无 regex 提取 → 落到 semantic_fallback="IDLE, ACTIVE, DONE"
+    llm_partial = TemplateSelectionOutput(
+        template_id="cov_transition_coverage_v1",
+        param_mapping={"signal": "cur_state", "group_name": "fsm_cg"},
+        confidence=0.95,
+    )
+    fake_tmpl = MagicMock()
+    fake_tmpl.parameters = [
+        {"name": "signal", "required": True},
+        {"name": "group_name", "required": True, "default": "fsm_cg"},
+        {"name": "state_list", "required": True},
+        {"name": "clk", "required": True, "default": "clk"},
+    ]
+    fake_tmpl.id = "cov_transition_coverage_v1"
+    fake_tmpl.name = "transition cov"
+    fake_tmpl.version = "1.0.0"
+    stack, fake_db = _patch_preview_deps(rag, llm_partial, db_get_return_value=fake_tmpl)
+
+    settings = get_settings()
+    original_verify = settings.step1_verify_enabled
+    original_thresh = settings.reranker_min_score_threshold
+    original_us = settings.under_specified_gate_enabled
+    settings.step1_verify_enabled = True
+    settings.reranker_min_score_threshold = 0.30
+    settings.under_specified_gate_enabled = False  # 否则会先拦 state_list 缺失
+    try:
+        with stack:
+            result = await pipeline_preview(
+                _make_preview_inp("cur_state 状态转换覆盖率 fsm_cg"),
+                fake_db,
+            )
+        # 至少有一个参数落 semantic_fallback / placeholder → 必须 False
+        assert result.quick_render is False
+    finally:
+        settings.step1_verify_enabled = original_verify
         settings.reranker_min_score_threshold = original_thresh
         settings.under_specified_gate_enabled = original_us
