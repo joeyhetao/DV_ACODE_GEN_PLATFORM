@@ -129,9 +129,35 @@ def _since(days: int) -> datetime:
     return datetime.now(timezone.utc) - timedelta(days=days)
 
 
+_ALLOWED_GENERATION_MODES = {"rag", "llm_direct"}
+
+
+def _validate_generation_mode_filter(generation_mode: str | None) -> str | None:
+    """Query 参数 generation_mode 校验。None / 空串 → 不过滤；其他值校验白名单。
+
+    detail 用结构化 dict（与项目其他错误响应风格一致），让前端能按 detail.type
+    精准识别这类参数错误。
+    """
+    if generation_mode is None or generation_mode == "":
+        return None
+    if generation_mode not in _ALLOWED_GENERATION_MODES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "type": "invalid_generation_mode",
+                "message": (
+                    f"无效的 generation_mode '{generation_mode}'，"
+                    "合法值：rag / llm_direct"
+                ),
+            },
+        )
+    return generation_mode
+
+
 @router.get("/analytics/feedback-summary")
 async def analytics_feedback_summary(
     days: int = Query(7, ge=1, le=90),
+    generation_mode: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role("lib_admin", "super_admin")),
 ):
@@ -139,31 +165,51 @@ async def analytics_feedback_summary(
 
     无数据时各率返 0.0，不报 500。`bad_rate` 分母用 total_feedbacks，
     避免没人评分时把差评率写成 0/0 → NaN。
+
+    FEAT-11 Stage 2：generation_mode 可选 'rag' / 'llm_direct'，omit = 全部。
+    no_match_count 仅对 'rag' 路径有意义（llm_direct 不经过 5 道闸），过滤
+    'llm_direct' 时本字段恒 0；分子分母都在同一 mode 内统计，比率仍有意义。
     """
     since = _since(days)
+    mode_filter = _validate_generation_mode_filter(generation_mode)
+
+    def _apply_mode(stmt):
+        if mode_filter is not None:
+            return stmt.where(GenerationRecord.generation_mode == mode_filter)
+        return stmt
+
     total_generations = (await db.execute(
-        select(func.count(GenerationRecord.id)).where(GenerationRecord.created_at >= since)
+        _apply_mode(
+            select(func.count(GenerationRecord.id)).where(GenerationRecord.created_at >= since)
+        )
     )).scalar() or 0
     total_feedbacks = (await db.execute(
-        select(func.count(GenerationRecord.id)).where(
-            GenerationRecord.created_at >= since,
-            GenerationRecord.feedback_rating.isnot(None),
+        _apply_mode(
+            select(func.count(GenerationRecord.id)).where(
+                GenerationRecord.created_at >= since,
+                GenerationRecord.feedback_rating.isnot(None),
+            )
         )
     )).scalar() or 0
     bad_feedbacks = (await db.execute(
-        select(func.count(GenerationRecord.id)).where(
-            GenerationRecord.created_at >= since,
-            GenerationRecord.feedback_rating == 3,
+        _apply_mode(
+            select(func.count(GenerationRecord.id)).where(
+                GenerationRecord.created_at >= since,
+                GenerationRecord.feedback_rating == 3,
+            )
         )
     )).scalar() or 0
     no_match_count = (await db.execute(
-        select(func.count(GenerationRecord.id)).where(
-            GenerationRecord.created_at >= since,
-            GenerationRecord.gate_error_type == "no_matching_template",
+        _apply_mode(
+            select(func.count(GenerationRecord.id)).where(
+                GenerationRecord.created_at >= since,
+                GenerationRecord.gate_error_type == "no_matching_template",
+            )
         )
     )).scalar() or 0
     return {
         "days": days,
+        "generation_mode": mode_filter,
         "total_generations": total_generations,
         "total_feedbacks": total_feedbacks,
         "feedback_rate": round(total_feedbacks / total_generations, 4) if total_generations else 0.0,
@@ -176,15 +222,35 @@ async def analytics_feedback_summary(
 async def analytics_template_issues(
     days: int = Query(7, ge=1, le=90),
     limit: int = Query(10, ge=1, le=100),
+    generation_mode: str | None = Query(None),
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role("lib_admin", "super_admin")),
 ):
     """差评 template top-N：每行 {template_id, bad_count, total_count, bad_rate}。
 
-    数据源：window 内 template_id 非空且有反馈的记录；按 bad_rate 降序，
-    tie-break by bad_count 降序。空数据返 []。
+    数据源：window 内有反馈的记录；按 bad_rate 降序，tie-break by bad_count 降序。
+    空数据返 []。
+
+    FEAT-11 Stage 2：generation_mode 可选 'rag' / 'llm_direct'，omit = 全部。
+    - 'rag'：template_id 必非 NULL，按 template_id 分组（保持原行为）。
+    - 'llm_direct'：template_id 必为 NULL（freeform 不走模板）→ 聚合为单行
+      template_id="__llm_direct__"，让前端能显示差评量；
+      不再要求 IS NOT NULL 否则永远返空。
+    - 不过滤（默认）：合并两路；NULL 行同样归入 "__llm_direct__"，让 admin
+      一眼看出哪些差评来自 freeform。
     """
     since = _since(days)
+    mode_filter = _validate_generation_mode_filter(generation_mode)
+
+    where_clauses = [
+        GenerationRecord.created_at >= since,
+        GenerationRecord.feedback_rating.isnot(None),
+    ]
+    if mode_filter == "rag":
+        where_clauses.append(GenerationRecord.template_id.isnot(None))
+    if mode_filter is not None:
+        where_clauses.append(GenerationRecord.generation_mode == mode_filter)
+
     stmt = (
         select(
             GenerationRecord.template_id.label("template_id"),
@@ -193,11 +259,7 @@ async def analytics_template_issues(
                 case((GenerationRecord.feedback_rating == 3, 1), else_=0)
             ).label("bad_count"),
         )
-        .where(
-            GenerationRecord.created_at >= since,
-            GenerationRecord.template_id.isnot(None),
-            GenerationRecord.feedback_rating.isnot(None),
-        )
+        .where(*where_clauses)
         .group_by(GenerationRecord.template_id)
     )
     rows = (await db.execute(stmt)).all()
@@ -205,8 +267,10 @@ async def analytics_template_issues(
     for r in rows:
         total = int(r.total_count or 0)
         bad = int(r.bad_count or 0)
+        # template_id IS NULL → llm_direct 记录；放统一桶 "__llm_direct__"
+        tid = r.template_id if r.template_id is not None else "__llm_direct__"
         items.append({
-            "template_id": r.template_id,
+            "template_id": tid,
             "total_count": total,
             "bad_count": bad,
             "bad_rate": round(bad / total, 4) if total else 0.0,

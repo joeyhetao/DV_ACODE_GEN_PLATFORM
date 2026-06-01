@@ -9,7 +9,7 @@ import {
   LoadingOutlined, LikeOutlined, MehOutlined, DislikeOutlined,
 } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
-import { generateApi, PreviewResponse, SignalInfo } from '../../api/generate'
+import { generateApi, GenerationMode, PreviewResponse, SignalInfo } from '../../api/generate'
 import { feedbackApi, ReasonTag, REASON_TAG_OPTIONS } from '../../api/feedback'
 import ConfirmationPanel from '../../components/ConfirmationPanel'
 
@@ -39,6 +39,8 @@ interface ResultDisplay {
   confidence_source: string
   rag_candidates: Array<{ template_id: string; name: string; score: number }>
   generation_record_id?: string | null
+  // FEAT-11 Stage 2：'rag'（默认）显示 LLM fallback 按钮；'llm_direct' 隐藏按钮 + 显示非确定性标签
+  generation_mode: GenerationMode
 }
 
 interface IntentBuilderReturnState {
@@ -69,6 +71,8 @@ export default function GeneratePage() {
   const [badReasonTags, setBadReasonTags] = useState<ReasonTag[]>([])
   const [badComment, setBadComment] = useState('')
   const [feedbackSubmitting, setFeedbackSubmitting] = useState(false)
+  // FEAT-11 Stage 2：用户点 LLM fallback 时单独 loading（与 isBusy 分离，避免覆盖左侧 submit 按钮文案）
+  const [llmFallbackLoading, setLlmFallbackLoading] = useState(false)
 
   useEffect(() => {
     generateApi.codeTypes().then(setCodeTypes).catch(() => {})
@@ -178,6 +182,8 @@ export default function GeneratePage() {
             template_id: c.template_id, name: c.name, score: c.score,
           })),
           generation_record_id: res.generation_record_id ?? null,
+          // /render 始终走 RAG 路径；后端漏返时也默认 'rag'，避免老接口透传成 undefined
+          generation_mode: res.generation_mode ?? 'rag',
         },
       })
     } catch (e: unknown) {
@@ -229,6 +235,39 @@ export default function GeneratePage() {
       return
     }
     await submitFeedback(3, badReasonTags, badComment)
+  }
+
+  // FEAT-11 Stage 2：用户对 RAG 结果不满意 → 调 /generate/llm-fallback 拿 LLM 直接生成代码
+  const handleLLMFallback = async () => {
+    if (state.phase !== 'result') return
+    const recordId = state.result.generation_record_id
+    if (!recordId) {
+      message.warning('当前结果未关联生成记录，无法触发 LLM 兜底')
+      return
+    }
+    setLlmFallbackLoading(true)
+    try {
+      const res = await generateApi.llmFallback(recordId)
+      setState({
+        phase: 'result',
+        result: {
+          ...state.result,
+          code: res.code,
+          cache_hit: res.cache_hit,
+          generation_record_id: res.generation_record_id,
+          generation_mode: res.generation_mode,
+        },
+      })
+      // 新记录 → 反馈状态归零，让用户给 llm_direct 结果独立评分
+      setFeedbackSubmitted(false)
+      setBadReasonTags([])
+      setBadComment('')
+      message.success('已切换为 LLM 直接生成')
+    } catch (e: unknown) {
+      handleApiError(e, 'LLM 直接生成失败，请稍后重试', navigate)
+    } finally {
+      setLlmFallbackLoading(false)
+    }
   }
 
   const copyCode = () => {
@@ -387,7 +426,19 @@ export default function GeneratePage() {
             </Card>
 
             <Card
-              title={<>生成代码 <Text type="secondary" style={{ fontSize: 12, fontWeight: 'normal' }}>— {state.result.template_name}</Text></>}
+              title={
+                <>
+                  生成代码{' '}
+                  <Text type="secondary" style={{ fontSize: 12, fontWeight: 'normal' }}>
+                    — {state.result.template_name}
+                  </Text>
+                  {state.result.generation_mode === 'llm_direct' && (
+                    <Tag color="orange" style={{ marginLeft: 8 }}>
+                      LLM 直接生成 · 非确定性
+                    </Tag>
+                  )}
+                </>
+              }
               extra={
                 <Space>
                   <Button icon={<CopyOutlined />} onClick={copyCode}>复制</Button>
@@ -431,6 +482,25 @@ export default function GeneratePage() {
                 >差</Button>
                 {feedbackSubmitted && <Text type="success" style={{ fontSize: 12 }}>已提交反馈</Text>}
               </Space>
+              {/* FEAT-11 Stage 2：仅 'rag' 结果显示兜底按钮——已经是 llm_direct 不允许再链式 fallback */}
+              {state.result.generation_mode === 'rag' && (
+                <>
+                  <Divider style={{ marginTop: 12, marginBottom: 12 }} />
+                  <Space direction="vertical" size="small" style={{ width: '100%' }}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      RAG 结果不符合预期？可以让 LLM 直接生成（结果是非确定性的，每次可能不同）。
+                    </Text>
+                    <Button
+                      type="default"
+                      loading={llmFallbackLoading}
+                      disabled={!state.result.generation_record_id}
+                      onClick={handleLLMFallback}
+                    >
+                      对生成结果不满意？尝试 LLM 直接生成
+                    </Button>
+                  </Space>
+                </>
+              )}
             </Card>
 
             <Modal
