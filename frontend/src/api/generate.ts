@@ -71,10 +71,21 @@ export interface RenderConfirmedRequest {
   code_type: string
 }
 
+export type GenerationMode = 'rag' | 'llm_direct'
+
 export interface RenderConfirmedResponse {
   code: string
   cache_hit: boolean
   generation_record_id?: string | null
+  // FEAT-11 Stage 2：默认 'rag'；前端用此决定是否显示 LLM fallback 按钮
+  generation_mode?: GenerationMode
+}
+
+export interface LLMFallbackResponse {
+  code: string
+  generation_record_id: string
+  generation_mode: 'llm_direct'
+  cache_hit: boolean
 }
 
 export const generateApi = {
@@ -101,6 +112,18 @@ export const generateApi = {
   },
   codeTypes: async () => {
     const res = await apiClient.get<{ id: string; display_name: string }[]>('/generate/code-types')
+    return res.data
+  },
+  // FEAT-11 Stage 2：用户点"对生成结果不满意？尝试 LLM 直接生成"时触发
+  llmFallback: async (generation_record_id: string) => {
+    // freeform 生成走单次 LLM 调用：GLM-4.7 thinking off p50≈3s；为兼容偏慢的
+    // thinking-on 模型（曾观察到 60-120s 偶发），设 120s timeout。比 preview 端
+    // 的 5min 短（preview 是三段 LLM 累加），但对单次调用足够。
+    const res = await apiClient.post<LLMFallbackResponse>(
+      '/generate/llm-fallback',
+      { generation_record_id },
+      { timeout: 120000 },
+    )
     return res.data
   },
 }
