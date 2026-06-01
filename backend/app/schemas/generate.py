@@ -78,6 +78,26 @@ class RenderResponse(BaseModel):
     # 两步式路径写入 GenerationRecord 后回填 record.id 给前端，让用户可以在结果页提交反馈。
     # legacy 重渲染路径不写 record，此处保持 None。
     generation_record_id: str | None = None
+    # FEAT-11 Stage 2：前端需要在 result 阶段区分 'rag' / 'llm_direct' 来决定
+    # 是否显示"对结果不满意？尝试 LLM 直接生成"按钮 + "LLM 直接生成 · 非确定性"标签。
+    # /render 端点始终走 RAG 路径，恒返 'rag'；/generate/llm-fallback 才返 'llm_direct'。
+    generation_mode: Literal["rag", "llm_direct"] = "rag"
+
+
+class LLMFallbackRequest(BaseModel):
+    """FEAT-11 Stage 2：触发 llm_direct 兜底所需的最小入参——只要源 RAG 记录的 id。
+
+    端点内会从该记录读 original_intent / code_type / params_used / clk / rst，
+    避免前端重复携带表单字段（且强制以记录为真相源）。
+    """
+    generation_record_id: str
+
+
+class LLMFallbackResponse(BaseModel):
+    code: str
+    generation_record_id: str
+    generation_mode: Literal["llm_direct"] = "llm_direct"
+    cache_hit: bool = False
 
 
 # ── 方案 3：两步式 preview 端点 schema ──────────────────────────────────────

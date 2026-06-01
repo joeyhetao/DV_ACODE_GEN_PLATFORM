@@ -5,7 +5,11 @@ import anthropic
 import httpx
 
 from app.schemas.intent import TemplateSelectionOutput
-from app.services.llm.base import LLMClient
+from app.services.llm.base import (
+    LLMClient,
+    build_freeform_prompt,
+    extract_sv_code_block,
+)
 
 
 def _anthropic_thinking_tokens(msg) -> str:
@@ -167,6 +171,40 @@ class AnthropicLLMClient(LLMClient):
             if getattr(block, "type", None) == "text":
                 return block.text.strip()
         return ""
+
+    async def generate_code_freeform(
+        self,
+        intent: str,
+        code_type: str,
+        signals: list[dict],
+        clk: str,
+        rst: str,
+    ) -> str:
+        """FEAT-11 Stage 2 兜底：LLM 直接生成代码，绕过 RAG + Jinja2。
+
+        Anthropic 原生 messages.create，无 thinking 参数（默认即 off）。max_tokens 给 4096——
+        即便 GLM-4.7 大模板也极少超 800 tokens；Claude 大模型可能用更多 system 输出。
+        """
+        system, user = build_freeform_prompt(intent, code_type, signals, clk, rst)
+        _t = time.perf_counter()
+        msg = await self._client.messages.create(
+            model=self._model,
+            max_tokens=4096,
+            temperature=0.0,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        print(
+            f"[Timing] llm=generate_code_freeform ms={int((time.perf_counter() - _t) * 1000)} "
+            f"reasoning_tokens={_anthropic_thinking_tokens(msg)} thinking=n/a",
+            flush=True,
+        )
+        text = ""
+        for block in msg.content:
+            if getattr(block, "type", None) == "text":
+                text = block.text
+                break
+        return extract_sv_code_block(text)
 
     async def test_basic(self) -> str:
         msg = await self._client.messages.create(

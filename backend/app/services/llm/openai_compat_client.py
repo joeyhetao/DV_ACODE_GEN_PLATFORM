@@ -6,7 +6,11 @@ import httpx
 import openai
 
 from app.schemas.intent import TemplateSelectionOutput
-from app.services.llm.base import LLMClient
+from app.services.llm.base import (
+    LLMClient,
+    build_freeform_prompt,
+    extract_sv_code_block,
+)
 
 
 # thinking 模型（GLM-4.7、DeepSeek-R1 等）单次推理 20-60s。显式设 read=300s 避免默认
@@ -363,6 +367,39 @@ class OpenAICompatLLMClient(LLMClient):
             flush=True,
         )
         return (resp.choices[0].message.content or "").strip()
+
+    async def generate_code_freeform(
+        self,
+        intent: str,
+        code_type: str,
+        signals: list[dict],
+        clk: str,
+        rst: str,
+    ) -> str:
+        """FEAT-11 Stage 2 兜底：LLM 直接生成代码，绕过 RAG + Jinja2。
+
+        thinking 硬编码 disabled——freeform 代码生成不需要 reasoning_tokens 占用输出空间，
+        且 GLM-4.7 在 thinking on 时常返 finish=length。max_tokens=4096 覆盖典型断言/覆盖率。
+        """
+        system, user = build_freeform_prompt(intent, code_type, signals, clk, rst)
+        _t = time.perf_counter()
+        resp = await self._client.chat.completions.create(
+            model=self._model,
+            max_tokens=4096,
+            temperature=0.0,
+            extra_body={"thinking": {"type": "disabled"}},
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        )
+        print(
+            f"[Timing] llm=generate_code_freeform ms={int((time.perf_counter() - _t) * 1000)} "
+            f"reasoning_tokens={_reasoning_tokens(resp)} thinking=off",
+            flush=True,
+        )
+        content = resp.choices[0].message.content or ""
+        return extract_sv_code_block(content)
 
     async def test_basic(self) -> str:
         resp = await self._client.chat.completions.create(

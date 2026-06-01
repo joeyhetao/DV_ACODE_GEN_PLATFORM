@@ -382,6 +382,13 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
 
     template = None
     confidence_source = "llm_step1"
+    # FEAT-11 A：跨 A8/A9/quick_render 闸共享的状态——
+    #   verify_ok: True=A8 显式通过，False=A8 拒，None=A8 未启用（quick_render 视为不达标）。
+    #   selected_score: LLM 选中的 template_id 在 stage3 reranker 输出里的 score；
+    #     原本只在 A9 启用时计算，此处提前到 confidence_source=="llm_step1" 时无条件算
+    #     一次，供 A9 与 quick_render 高置信判定共用（成本是一次 dict 查找，可忽略）。
+    verify_ok: bool | None = None
+    selected_score: float | None = None
     if selection.template_id and selection.template_id.lower() not in ("none", "", "null"):
         template = await db.get(Template, selection.template_id)
         # LLM 选中的若是 keyword 补充注入的候选（RAG 三阶段未召回），标专门的源——
@@ -412,7 +419,19 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
                 confidence_source = "rag_fallback"
                 template = None  # 让下面的 fallback 链按 rag_fallback 走 RAG top1
 
-        # A9 reranker score gate（pipeline 层独立 gate）：A8 verify=yes 之后再查 LLM
+        # FEAT-11 A：selected_score 无条件计算（confidence_source 仍为 llm_step1 时）。
+        # 与下方 A9 gate 共享；quick_render 高置信判定也用同一份值。
+        # 隐性规则：当 LLM 选中的是 keyword_supplement 注入的候选（不在 RAG top-N 里）
+        # 时，confidence_source 已被改为 "keyword_supplement"，本块不会执行——所以
+        # keyword_supplement 路径既不触发 A9 reranker gate 也不参与高置信 quick_render
+        # 判定。这是有意的：keyword 补充本身就是 RAG 召回失败的兜底，不应再加额外门槛。
+        if template and confidence_source == "llm_step1":
+            selected_score = next(
+                (c["score"] for c in rag_candidates if c["template_id"] == selection.template_id),
+                None,
+            )
+
+        # A9 reranker score gate（pipeline 层独立 gate）：A8 verify=yes 之后查 LLM
         # 选中的 template_id 在 stage3 reranker 输出里的 score。低于阈值 → 抛
         # NoMatchingTemplateError 让用户去贡献。
         # 与 FIX-9 移除的 RAG top-1 score 阈值的区分：FIX-9 拦的是"top-1 分数低就
@@ -425,26 +444,20 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
             template
             and confidence_source == "llm_step1"
             and settings.step1_reranker_gate_enabled
+            and selected_score is not None
+            and selected_score < settings.reranker_min_score_threshold
         ):
-            selected_score = next(
-                (c["score"] for c in rag_candidates if c["template_id"] == selection.template_id),
-                None,
+            print(
+                f"[Gate] step1_reranker_gate: id={selection.template_id!r} "
+                f"selected_score={selected_score:.4f} < threshold="
+                f"{settings.reranker_min_score_threshold} → NoMatchingTemplate",
+                flush=True,
             )
-            if (
-                selected_score is not None
-                and selected_score < settings.reranker_min_score_threshold
-            ):
-                print(
-                    f"[Gate] step1_reranker_gate: id={selection.template_id!r} "
-                    f"selected_score={selected_score:.4f} < threshold="
-                    f"{settings.reranker_min_score_threshold} → NoMatchingTemplate",
-                    flush=True,
-                )
-                raise NoMatchingTemplateError(
-                    original_intent=inp.original_intent,
-                    code_type=inp.code_type,
-                    top_score=selected_score,
-                )
+            raise NoMatchingTemplateError(
+                original_intent=inp.original_intent,
+                code_type=inp.code_type,
+                top_score=selected_score,
+            )
 
     # Off-topic 检测的唯一信号是 normalize_intent 的 sentinel 输出（在本函数早期已检查并早返）。
     # 这里**不**再用 RAG cross-encoder 分数作为闸——实测发现 reranker 对不同 code_type 子语料
@@ -529,6 +542,31 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
                 code_type=inp.code_type,
             )
 
+    # FEAT-11 A：四条件齐绿 → 高置信 RAG，跳过 ConfirmationPanel 直渲。
+    # 与 intent_cache 命中走的 quick_render 是同一旗标，前端代码路径透明承接。
+    # 判定四条件：
+    #   1) confidence_source == "llm_step1"（rag_fallback / keyword_supplement 不算）
+    #   2) settings.step1_verify_enabled 且 A8 verify=yes（disabled 时禁直渲——
+    #      没二次校验就少了一个独立信号，不够稳）
+    #   3) selected_score >= settings.reranker_min_score_threshold（独立于 A9 开关；
+    #      score 现在已无条件计算，gate 是否开启不影响本判定）
+    #   4) 所有 param sources ∈ {llm, regex, signal_list, default}——
+    #      semantic_fallback / placeholder 一定不算（under_specified 闸已拦但
+    #      关闸时仍可能漏过，本判定双保险）。
+    is_high_conf_rag = _is_high_confidence_rag(
+        confidence_source=confidence_source,
+        verify_ok=verify_ok,
+        selected_score=selected_score,
+        params_with_source=params_with_source,
+        settings=settings,
+    )
+    if is_high_conf_rag:
+        print(
+            f"[Pipeline] FEAT-11 high-confidence RAG: template={template.id} "
+            f"selected_score={selected_score:.4f} → quick_render=True",
+            flush=True,
+        )
+
     print(f"[Timing] stage=preview_total ms={int((time.perf_counter() - _t_total) * 1000)}", flush=True)
 
     # 构建 RAG 候选摘要（含 parameters 供前端切换用）
@@ -552,8 +590,37 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
         params=params_with_source,
         intent_hash=intent_hash,
         normalized_intent=normalized,
-        quick_render=False,
+        quick_render=is_high_conf_rag,
     )
+
+
+_HIGH_CONFIDENCE_PARAM_SOURCES = frozenset({"llm", "regex", "signal_list", "default"})
+
+
+def _is_high_confidence_rag(
+    confidence_source: str,
+    verify_ok: bool | None,
+    selected_score: float | None,
+    params_with_source: dict[str, dict],
+    settings,
+) -> bool:
+    """FEAT-11 A：判断是否所有四条件均满足，足以跳过 ConfirmationPanel 直渲。
+
+    任一条件不达标即 False（保证默认行为不回归）。详细判定见调用点上方注释。
+    """
+    if confidence_source != "llm_step1":
+        return False
+    if not settings.step1_verify_enabled or verify_ok is not True:
+        return False
+    if (
+        selected_score is None
+        or selected_score < settings.reranker_min_score_threshold
+    ):
+        return False
+    for meta in params_with_source.values():
+        if meta.get("source") not in _HIGH_CONFIDENCE_PARAM_SOURCES:
+            return False
+    return True
 
 
 async def pipeline_render(req: RenderInput, db: AsyncSession) -> tuple[str, bool]:
