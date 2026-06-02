@@ -6,6 +6,7 @@ from app.models.llm_config import LLMConfig
 from app.models.contribution import TemplateContribution
 from app.models.notification import Notification
 from app.models.audit_log import AdminAuditLog
+from app.models.improvement_report import ImprovementReport
 
 __all__ = [
     "User",
@@ -17,4 +18,5 @@ __all__ = [
     "TemplateContribution",
     "Notification",
     "AdminAuditLog",
+    "ImprovementReport",
 ]

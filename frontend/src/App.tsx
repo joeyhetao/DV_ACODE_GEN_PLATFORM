@@ -14,6 +14,8 @@ import AdminContributionsPage from './pages/Admin/AdminContributionsPage'
 import AdminLLMPage from './pages/Admin/AdminLLMPage'
 import AdminUsersPage from './pages/Admin/AdminUsersPage'
 import AdminAnalyticsPage from './pages/Admin/AdminAnalyticsPage'
+import AdminImprovementReportsPage from './pages/Admin/AdminImprovementReportsPage'
+import AdminImprovementReportDetailPage from './pages/Admin/AdminImprovementReportDetailPage'
 
 function RequireAuth({ children }: { children: React.ReactNode }) {
   const token = useAuthStore((s) => s.token)
@@ -61,6 +63,8 @@ export default function App() {
           <Route path="admin/llm" element={<RequireAdmin><AdminLLMPage /></RequireAdmin>} />
           <Route path="admin/users" element={<RequireAdmin><AdminUsersPage /></RequireAdmin>} />
           <Route path="admin/analytics" element={<RequireAdmin><AdminAnalyticsPage /></RequireAdmin>} />
+          <Route path="admin/improvement-reports" element={<RequireAdmin><AdminImprovementReportsPage /></RequireAdmin>} />
+          <Route path="admin/improvement-reports/:id" element={<RequireAdmin><AdminImprovementReportDetailPage /></RequireAdmin>} />
         </Route>
       </Routes>
     </BrowserRouter>
