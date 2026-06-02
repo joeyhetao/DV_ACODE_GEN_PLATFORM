@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-IC verification assistant code generation platform: structured Excel input → deterministic SVA assertion / UVM functional coverage code. Authoritative spec is `PRD.md` (**v3.0**) and `ARCHITECTURE.md` (v2.19). README and CONTRIBUTING are in Chinese; design docs are the source of truth.
+IC verification assistant code generation platform: structured Excel input → deterministic SVA assertion / UVM functional coverage code. Authoritative spec is `PRD.md` (**v3.2**) and `ARCHITECTURE.md` (v2.22). README and CONTRIBUTING are in Chinese; design docs are the source of truth.
 
 **v3.0 user journey reversal (most important reading before changing pipeline / IntentBuilder / contribution code)**: open-ended NL is no longer salvaged by the pipeline. The 5 gates (off-topic / code_type_mismatch / no_matching_template / under_specified / empty_retrieval) all return 422/503 with a structured `detail`. `detail.redirect_to` is the v3.0 mechanism by which the backend tells the frontend where to route the user — `under_specified` routes to `/intent-builder?prefill=...&template_id=...&missing=...`; `no_matching_template` routes to `/contribute/new?description=...&code_type=...` (skipping IntentBuilder entirely); the other three are `null`. Frontend `handleApiError` checks `redirect_to` **first**, before any Modal — read [GeneratePage.tsx handleApiError](frontend/src/pages/Generate/GeneratePage.tsx) for the exact branching. IntentBuilder ([api/v1/intent_builder.py](backend/app/api/v1/intent_builder.py) + [services/intent/conversation.py](backend/app/services/intent/conversation.py)) is a RAG-grounded multi-turn chat with Redis 24h session ([services/intent/session.py](backend/app/services/intent/session.py))—LLM is forced to align user intent to existing templates and is not allowed to invent scenarios. Contribution wizard ([api/v1/contributions.py](backend/app/api/v1/contributions.py)) now takes 4 user fields; backend LLM reverse-derives parameter_defs / Jinja body / keywords via [services/platform/parameter_extractor.py](backend/app/services/platform/parameter_extractor.py) and validates through 3 gates (param_defs naming, Jinja2 renderability, keywords shape) before queuing for admin review.
 
@@ -83,15 +83,17 @@ npm run lint     # ESLint with --max-warnings 0
 
 **The single most important constraint**: the platform must produce identical output for identical input **for in-domain inputs that contain sufficient information**. The LLM is *only* allowed to choose a template ID and map signal names to template parameters — it never generates code. Code comes from Jinja2 rendering. **Contract v2.11 reversal**: when the input is in-domain but missing required parameters (no signal names, no state list, etc.), the platform now **rejects with HTTP 422** rather than fabricating placeholder code. Read `ARCHITECTURE.md` §1.1 before changing anything in `services/core/` or `services/llm/`.
 
-**Five hard gates before code is rendered**, in order at the top of `pipeline_preview`:
+**Seven hard gates before code is rendered**, in order at the top of `pipeline_preview`:
 
 1. **Off-topic gate**: `dense_top1_score(original_intent, code_type) < OFFTOPIC_DENSE_THRESHOLD` → `OffTopicIntentError` → HTTP 422. Threshold calibrated empirically against `backend/tests/data/offtopic_corpus.yaml`; rerun `backend/scripts/calibrate_offtopic_threshold.py` after major template-library changes.
 2. **Code-type mismatch gate**: For each non-selected code_type, run a dense_top1_score; if `max(other) - selected ≥ CODE_TYPE_MISMATCH_MARGIN` (default 0.10) → `CodeTypeMismatchError` → 422 with `detail.suggested_code_type`. Typical case: user picks "assertion" but writes "统计 ... 覆盖率".
 3. **No-matching-template gate** (post-LLM-step1, pre-step2): `confidence_source == "rag_fallback"` (LLM step1 explicitly rejected all candidates by returning `"none"`) → `NoMatchingTemplateError` → HTTP 422 with `detail.redirect_to="/contribute/new?description=...&code_type=..."`. **FIX-9** removed the previous `rag_candidates[0]["score"] < NO_MATCH_SCORE_THRESHOLD` co-condition because cross-encoder reranker can give 1.0 to semantically unrelated templates on lexical overlap (e.g., `req` keyword matching `sva_timing_max_delay_v1`), which would suppress the gate even after LLM correctly returned `none`. `top_score` is still logged for monitoring; `no_match_score_threshold` setting is kept but no longer participates in gate decision. This gate fires **before** under_specified — a clearly unknown scenario goes directly to the contribution page, skipping the 5-round IntentBuilder loop. Toggle: `NO_MATCH_GATE_ENABLED`.
-4. **Empty retrieval gate** (post-RAG): three-stage retrieval returned no candidates AND keyword supplement also empty → `EmptyRetrievalError` → **HTTP 503** (infrastructure issue — Qdrant / embedding service / empty template library). Distinct from off-topic; SRE looks at this, not the user.
-5. **Under-specified intent gate** ([`_detect_under_specified`](backend/app/services/core/pipeline.py), after `_map_params_with_source`): any required parameter resolved to a low-confidence source → `UnderSpecifiedIntentError` → HTTP 422 with `detail.missing_params=[{name, description, expr_type, role_hint}, ...]`. Low-confidence = `source ∈ {placeholder, semantic_fallback}` OR `source==llm AND value ∈ {"", 0, "0", "null", literal param name}`. The LLM is **not allowed** to fake-fill parameters with stubs.
+4. **Step1 verify gate (A8)** ([pipeline.py:392-413](backend/app/services/core/pipeline.py#L392-L413)): when `confidence_source == "llm_step1"` after step1 selection, fire a second yes/no probe to the same LLM (`verify_step1_selection` on `LLMClient` base) asking "did you really mean this id". `verify=no` → downgrade `confidence_source` to `"rag_fallback"` and clear `template`, which then feeds gate 3's `NoMatchingTemplateError` path. `keyword_supplement` path is **not** re-verified (already a rescue). Fail-open: any LLM error returns `True`. Toggle: `STEP1_VERIFY_ENABLED` (**default on** since PR #27 / commit `6c8c05e`).
+5. **Step1 reranker score gate (A9)** ([pipeline.py:415-447](backend/app/services/core/pipeline.py#L415-L447)): after A8 passes, if `confidence_source == "llm_step1"`, look up the LLM-selected template_id's stage3 cross-encoder score in `rag_candidates` and raise `NoMatchingTemplateError` when `selected_score < RERANKER_MIN_SCORE_THRESHOLD`. Distinct from the removed FIX-9 condition: FIX-9 vetoed by RAG top-1 score (broke mutually exclusive intents like cpu_req vs dma_req where a handshake template scored 1.0); A9 checks the **selected** id's own score, requiring LLM confidence and reranker agreement. Toggle: `STEP1_RERANKER_GATE_ENABLED` (**default off**).
+6. **Empty retrieval gate** (post-RAG): three-stage retrieval returned no candidates AND keyword supplement also empty → `EmptyRetrievalError` → **HTTP 503** (infrastructure issue — Qdrant / embedding service / empty template library). Distinct from off-topic; SRE looks at this, not the user.
+7. **Under-specified intent gate** ([`_detect_under_specified`](backend/app/services/core/pipeline.py), after `_map_params_with_source`): any required parameter resolved to a low-confidence source → `UnderSpecifiedIntentError` → HTTP 422 with `detail.missing_params=[{name, description, expr_type, role_hint}, ...]`. Low-confidence = `source ∈ {placeholder, semantic_fallback}` OR `source==llm AND value ∈ {"", 0, "0", "null", literal param name}`. The LLM is **not allowed** to fake-fill parameters with stubs.
 
-Each gate has an env switch (`OFFTOPIC_GATE_ENABLED` / `CODE_TYPE_MISMATCH_GATE_ENABLED` / `NO_MATCH_GATE_ENABLED` / `UNDER_SPECIFIED_GATE_ENABLED`) for emergency rollback. All exception classes are caught in [api/v1/generate.py](backend/app/api/v1/generate.py)'s except chain in this exact order — **don't reorder**, don't generalize to `except ValueError` (it'll mask the structured detail).
+Each gate has an env switch (`OFFTOPIC_GATE_ENABLED` / `CODE_TYPE_MISMATCH_GATE_ENABLED` / `NO_MATCH_GATE_ENABLED` / `STEP1_VERIFY_ENABLED` / `STEP1_RERANKER_GATE_ENABLED` / `UNDER_SPECIFIED_GATE_ENABLED`) for emergency rollback. All exception classes are caught in [api/v1/generate.py](backend/app/api/v1/generate.py)'s except chain in this exact order — **don't reorder**, don't generalize to `except ValueError` (it'll mask the structured detail).
 
 **v3.0 redirect_to field on error detail**: every gate's `detail` carries `redirect_to: str | None`. `under_specified` routes to `/intent-builder?prefill=...&template_id=...&missing=...`; `no_matching_template` routes to `/contribute/new?description=...&code_type=...`; off_topic / code_type_mismatch / empty_retrieval return `null`. Frontend `handleApiError` reads `redirect_to` first via `'redirect_to' in detail` type guard — if present, `navigate(detail.redirect_to)` without any Modal. Backend constructs the URL inside the exception class `__init__` using `urllib.parse.quote` (Chinese-safe). Don't move the redirect URL construction to the endpoint layer; the exception class owns it.
 
@@ -114,7 +116,7 @@ Consequence: **never call an LLM from `app/services/core/`**. LLM calls live in 
 
 Two-step flow (UI plan 3, see ARCHITECTURE §3.15–3.16):
 
-- `pipeline_preview(PipelineInput) → PreviewResult` does **off-topic gate** → **code-type mismatch gate** → normalize → intent-cache → RAG → keyword-supplement → LLM step1 (pick id) → LLM step2 (fill params) → multi-source param mapping → **under-specified gate**. Returns each parameter tagged with one of 6 `source`s: `llm` / `regex` / `signal_list` / `default` / `semantic_fallback` / `placeholder`. Frontend `ConfirmationPanel` + `ParametersForm` render these with colored badges.
+- `pipeline_preview(PipelineInput) → PreviewResult` does **off-topic gate** → **code-type mismatch gate** → normalize → intent-cache → RAG → keyword-supplement → LLM step1 (pick id) → **step1 verify gate (A8)** → **reranker score gate (A9)** → LLM step2 (fill params) → multi-source param mapping → **under-specified gate**. Returns each parameter tagged with one of 6 `source`s: `llm` / `regex` / `signal_list` / `default` / `semantic_fallback` / `placeholder`. Frontend `ConfirmationPanel` + `ParametersForm` render these with colored badges.
 - `pipeline_render(RenderInput) → (code, cache_hit)` renders the user-confirmed params with Jinja2, writes generation cache, saves intent history.
 - `quick_render=True` on a preview means intent-cache hit; the frontend skips the confirmation panel.
 
@@ -145,7 +147,7 @@ Legacy templates without `expr_type` fall back to the `IDENTIFIER_PARAMS` whitel
 
 ## Code-type registry (no-Python-code extension)
 
-`app/services/registry.py` (`CodeTypeRegistry`) loads `backend/data/code_types/*.yaml` at startup. Each YAML defines: Excel sheet name, schema file path, signal roles, normalization sentence pattern, scenario templates file, subcategories. **Adding a new code type = 3 YAML files (code_types + schemas + scenarios), zero Python changes**:
+`app/services/registry.py` (`CodeTypeRegistry`) loads `backend/data/code_types/*.yaml` at startup. Each YAML defines: Excel sheet name, schema file path, signal roles, normalization sentence pattern, scenario templates file, subcategories. Currently registered: `assertion.yaml` and `coverage.yaml` (plus a `hooks/` subdir for life-cycle scripts). **Adding a new code type = 3 YAML files (code_types + schemas + scenarios), zero Python changes**:
 
 - `excel_parser.py` reads column layout from `data/schemas/*.yaml` per code type.
 - `intent/normalizer.py` injects sentence patterns from registry into the LLM system prompt at runtime.
@@ -174,6 +176,15 @@ API keys are AES-256-GCM encrypted with `LLM_KEY_ENCRYPTION_SECRET`. GET only re
 
 Switching / 创建 / 删除 / 修改 default 配置的 LLM 都会**主动 flush 两层缓存** (`gen:*` + `intent_cache:*`) —— 实现在 [admin_llm.py](backend/app/api/v1/admin_llm.py) 的 set_default / create_config / update_config / delete_config 端点 commit 后调用 [`invalidate_all_llm_caches()`](backend/app/services/core/cache.py)。即便不同 LLM 的缓存通过 `llm_config_id` 维度天然分桶，flush 仍然必要：保证切换后新写入的缓存不会与旧条目并存 30/90 天。`llm_configs.is_default` 有 partial unique index（migration 004）兜底，防止多行同时 True 把 `factory.get_default_llm_client` 打成 500。
 
+## L3 user feedback & L4 admin analytics
+
+PR #25 (commit `5cde9d4`) added the feedback / analytics loop on top of the generation pipeline:
+
+- **L3 feedback ingest** — `POST /feedback/{generation_record_id}` ([api/v1/feedback.py](backend/app/api/v1/feedback.py)) writes `feedback_rating` / `feedback_reason_tags` / `feedback_comment` / `feedback_at` (4 columns) plus a one-time backfill of `generation_mode='rag'` if the record was missing it. Auth: regular users can only rate their own records; `lib_admin` / `super_admin` can rate any record (审核兜底). Response is `204 No Content`.
+- **L4 admin analytics** — four read-only aggregation endpoints on [api/v1/admin.py:124-300+](backend/app/api/v1/admin.py#L124): `GET /admin/analytics/feedback-summary` (rating distribution), `/template-issues` (low-rated templates), `/intent-confusion` (intents that bounced between templates), `/no-match-rate` (gate-3 trigger rate over time). These power the Admin dashboard introduced in PR #25.
+
+The feedback row never participates in the generation pipeline — it's a write-only side channel. Don't read `feedback_rating` from `services/core/`.
+
 ## Data layout
 
 - **PostgreSQL** = source of truth (templates, users, generation history, batch jobs, llm_configs, contributions, audit logs). `templates.qdrant_point_id` links to Qdrant; `sync_status ∈ {ok, syncing, sync_error}` flags cross-store drift — `lib_manager.py rebuild` re-pushes any row in `syncing` state to Qdrant and flips it back to `ok`.
@@ -188,7 +199,7 @@ Template Qdrant point IDs are **deterministic UUIDs** (`uuid.uuid5(NAMESPACE_DNS
 backend/app/
 ├── api/v1/        # endpoints flat (no endpoints/ subdir): auth, generate, batch,
 │                  # templates, admin, admin_llm, contributions, notifications,
-│                  # intent_builder; router.py mounts all under /api/v1
+│                  # intent_builder, feedback; router.py mounts all under /api/v1
 ├── core/          # config, database, security (JWT), vector_store (qdrant client)
 ├── models/        # SQLAlchemy ORM
 ├── schemas/       # Pydantic request/response (TemplateSelectionOutput etc.)
