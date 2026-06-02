@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.22  
+**版本**：v2.23  
 **状态**：已确认  
-**日期**：2026-05-29  
+**日期**：2026-06-02  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -60,6 +60,17 @@
   - §4.1.2 新增 "admin analytics 模块" 子节：4 个 KPI 端点（`/admin/analytics/{feedback-summary, template-issues, intent-confusion, no-match-rate}`）的 SQL 聚合关键策略 + 数据源约定（`intent-confusion` 用 `rag_top3[0]` 作为 `expected_template`、`no-match-rate` 用 `gate_error_type='no_matching_template'`），全部要求 `lib_admin` / `super_admin`，`days` 窗 ∈ [1, 90] 默认 7
   - §4.1.3 新增 "generate endpoint 422 catch 路径写 record" 子节：`api/v1/generate.py` 在 5 道闸 catch 块通过 `_record_gate_event` 写 `GenerationRecord(template_id=None, gate_error_type=<type>)`，`gate_error_type` 取值与异常一一对应（off_topic / code_type_mismatch / under_specified / no_matching_template / empty_retrieval）；**不修改 `services/core/pipeline.py` 闸判断逻辑**，仅在端点层补持久化，对确定性契约（§1.1）无影响
   - §5.1 端点表追加 5 条：`POST /feedback/{id}`（普通用户/库管理员+） + 4 个 `/admin/analytics/*`（库管理员+）
+- v2.22 → v2.23：**FEAT-11 Stage 2 双模生成（rag + llm_direct）落地**——
+  - §1.1 确定性契约修订（v2.15 之后第二次修订）：原"LLM 在 RAG 中的职责边界 ... 不生成任何代码"约束**收窄为仅对 `generation_mode='rag'` 路径**；新增 `generation_mode='llm_direct'` 路径，明确声明为**非确定性 by design**。`llm_direct` 路径只对 `gen_llm:*` Redis 7d TTL 缓存命中呈现"伪确定性"，TTL 过期或切换 LLM 默认配置后即重新生成。`rag`/`llm_direct` 标签必须在 record / 响应 / UI 三处同时打——后端 `GenerationRecord.generation_mode` 列、`POST /generate/llm-fallback` 响应 `generation_mode: "llm_direct"` 字段、前端 result 阶段 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>` 三处同步
+  - 新增 §3.17 `llm_direct` 生成路径完整文档：`POST /api/v1/generate/llm-fallback` 端点契约、`LLMClient.generate_code_freeform` 抽象方法 + 两实现（Anthropic native messages / OpenAI-compat chat + regex 提取 `systemverilog`/`sv`/`verilog` 围栏）、`gen_llm:{llm_config_id}:{sha256(canonical(intent+code_type+signals+clk+rst))}` 7d TTL 缓存（signals 按 name 排序保证顺序无关）、`parent_record_id` FK 回链契约（`ondelete=SET NULL`）、非确定性标签三处同步约定、三类 422 错误（`llm_direct_chained_not_allowed` / `llm_direct_no_code` / `llm_direct_internal_error`）的 detail 结构
+  - §3.15.3 / §3.16 扩展 **A 子项：高置信 RAG 自动 quick_render**——`pipeline_preview` 在 `_detect_under_specified` 之后新增 `_is_high_confidence_rag(result, settings, verify_ok, selected_score, params_with_source) -> bool` 判定，四条件齐绿（`confidence_source==llm_step1` + `step1_verify_enabled` 且 `verify_ok=True` + `selected_score >= reranker_min_score_threshold` + 所有 param sources ∈ `{llm, regex, signal_list, default}`）→ `quick_render=True`，与 intent_cache 命中共用同一旗标让前端跳过 ConfirmationPanel。`selected_score` 从 A9 gate 专用计算上移到 `confidence_source==llm_step1` 通用计算，A9 与高置信判定共用同一份值
+  - §3.12.2 `LLMClient` 抽象表新增第 4 条方法 `generate_code_freeform(intent, code_type, signals, clk, rst) -> str`；OpenAI-compat 实现硬编码 `extra_body={"thinking":{"type":"disabled"}}` + `max_tokens=2048`（与 normalize_intent / step1 一致禁 thinking），Anthropic 实现走 native messages API；prose-only 响应（无 ` ```systemverilog/sv/verilog``` ` 围栏）抛 `ValueError("no_sv_code_block")` 由端点翻译为 HTTP 422 `llm_direct_no_code`
+  - §3.6 缓存键设计扩为三类（增加 `gen_llm:*`）：`gen_llm:{llm_config_id}:{sha256(canonical(intent+code_type+signals+clk+rst))}` 7d TTL 用于 `llm_direct` 兜底缓存；`invalidate_all_llm_caches()` 同步 scan-delete 三个前缀（`gen:*` / `intent_cache:*` / `gen_llm:*`），切换默认 LLM 配置后 `llm_direct` 缓存与 RAG 两层缓存一起失效
+  - §3.15.2 `/render` 端点响应 `RenderResponse` 新增 `generation_mode: Literal["rag", "llm_direct"] = "rag"` 字段（枚举值仅这两项，Pydantic 在响应序列化时拦非法值），前端据此初始化 `state.result.generation_mode` 决定是否显示 `llm_direct` fallback 按钮；正常 RAG 路径恒返 `"rag"`
+  - §4.1 `generation_records` 表 `generation_mode` 列含义升级：从"L2 预留"变为"代码来源的真实标签"，新增 `parent_record_id VARCHAR(36) NULLABLE FK→generation_records.id ondelete=SET NULL` 列（migration 007），让 `llm_direct` 子记录回链触发本次 fallback 的源 RAG 记录；源记录被 admin 删除仅清空 FK，保留 `llm_direct` 子记录与其反馈数据
+  - §4.1.2 4 个 KPI 端点 SQL 聚合策略表新增 optional `generation_mode` query 参数：`feedback-summary` / `template-issues` / `intent-confusion` / `no-match-rate` 全部支持。`template-issues` 在 `generation_mode=llm_direct` 时把 `template_id IS NULL` 行归入 `__llm_direct__` 桶不再被默认 `IS NOT NULL` filter 排除
+  - §7 项目目录结构：`migrations/versions/` 列举更新为 001 / 002 / 003 / 004 / 005 / 006 / 007 七个迁移文件（含简要功能注释），不再仅列 001
+  - §5.1 端点表追加 1 条：`POST /generate/llm-fallback`（普通用户）
 
 ---
 
@@ -93,9 +104,16 @@ LLM 本质上是概率性的，但平台要求输出是确定性的。完整 RAG
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**LLM 在 RAG 中的职责边界**：接收检索到的模板作为上下文，输出"选择哪个模板 + 填入哪些参数"，**不生成任何代码**。代码生成完全由 Jinja2 完成。
+**LLM 在 RAG 中的职责边界**：接收检索到的模板作为上下文，输出"选择哪个模板 + 填入哪些参数"，**不生成任何代码**。代码生成完全由 Jinja2 完成。**该约束的适用范围**：仅对 `generation_mode='rag'` 路径生效；v2.23 / FEAT-11 引入的 `generation_mode='llm_direct'` 兜底路径是 explicit 例外（详见 §3.17），明确声明为**非确定性 by design**。
 
 **契约修订（v2.15）**：原"always produce code"契约范围收窄为**仅对域内（IC 验证）输入**。无关意图（诗歌/闲聊/数学题/通用代码请求等）经 RAG 之前的 dense 余弦阈值闸（threshold=0.44，原文 embedding × Qdrant top1 < 阈值）直接 HTTP 422 拒绝，不进入 LLM 调用链。阈值由 `backend/scripts/calibrate_offtopic_threshold.py` 在 `backend/tests/data/offtopic_corpus.yaml` 上经验校准；emergency kill-switch `OFFTOPIC_GATE_ENABLED=false`。
+
+**契约修订（v2.23 / FEAT-11，双模架构）**：原"系统决定产出代码时必为字节级确定"约束**仅对 `rag` 路径成立**。`llm_direct` 路径由 `POST /generate/llm-fallback` 端点暴露，调用 `LLMClient.generate_code_freeform(intent, code_type, signals, clk, rst)`，LLM 自由生成 SystemVerilog 代码，**不经过 Jinja2 渲染层**。同一输入再次调用可能产出不同代码——这是设计内行为。`llm_direct` 路径只在 `gen_llm:{llm_config_id}:{sha256(canonical(intent+code_type+signals+clk+rst))}` 7d TTL Redis 缓存命中时呈现"伪确定性"，TTL 过期或切换 LLM 默认配置后即重新生成。非确定性标签必须在三处同时打：
+- **后端记录层**：`GenerationRecord.generation_mode='llm_direct'` + `parent_record_id` FK 回链源 RAG 记录
+- **API 响应层**：`POST /generate/llm-fallback` 响应体含 `generation_mode: "llm_direct"` 字段；`POST /generate/render`（RAG 路径）响应体含 `generation_mode: "rag"` 字段
+- **前端 UI 层**：`llm_direct` 结果代码卡片头部强制渲染 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>` 提示用户当前结果不在确定性契约保护范围内
+
+链式禁止：源记录已是 `llm_direct` 时端点返 HTTP 422 `llm_direct_chained_not_allowed`——不允许 `llm_direct → llm_direct` 累积"漂得越来越远"的代码。
 
 **四层确定性保障**：
 
@@ -485,7 +503,7 @@ payload = {
 
 ### 3.6 缓存层（Redis）
 
-**缓存键设计**（两类缓存，均按 LLM 配置分桶）：
+**缓存键设计**（三类缓存，均按 LLM 配置分桶；`gen_llm:*` 由 v2.23 / FEAT-11 引入）：
 
 ```
 # 生成结果缓存（pipeline_render 写入，TTL 90天）
@@ -494,9 +512,15 @@ gen:{llm_config_id}:{template_id}:{template_version}:{sha256(canonical_json(sort
 # 意图归一化缓存（pipeline_preview Step 2 写入，TTL 30天）
 intent_cache:{llm_config_id}:{intent_hash}
   value = JSON({template_id, params, confidence, params_fingerprint})
+
+# llm_direct 兜底缓存（POST /generate/llm-fallback 写入，TTL 7天，v2.23 / FEAT-11）
+gen_llm:{llm_config_id}:{sha256(canonical(intent + code_type + signals_sorted_by_name + clk + rst))}
+  value = LLM 生成的 SystemVerilog 代码字符串
 ```
 
 空 `llm_config_id` 用 `_` 占位（测试 mock / 早期未配置场景）。`params_hash` 拆出 `template_id` / `version` 单独是为了支持 `invalidate_template_cache(template_id)` 用 `gen:*:{template_id}:*` 通配跨所有配置桶精准失效。
+
+`gen_llm:*` 的 canonical 序列化由 `services/core/cache.py::_canonical_llm_direct_signature(intent, code_type, signals, clk, rst)` 实现，`signals` 列表按 `name` 字段排序后 JSON dumps（`ensure_ascii=False, separators=(',', ':')`），保证同一逻辑输入在 signal 列表顺序不同时仍命中同一键。TTL 短于 `gen:*` 的 90d 是因为 `llm_direct` 路径本身非确定性，缓存只是给"同一用户连续点几次 fallback 按钮"加速，长时间复用会让用户误以为得到了确定性输出。
 
 **缓存策略**：
 - 命中：直接返回，跳过检索+LLM+渲染全部环节，100% 确定性
@@ -505,7 +529,7 @@ intent_cache:{llm_config_id}:{intent_hash}
 - 失效原语：
   - `invalidate_template_cache(tid)` —— 单模板 Admin 改/停用后调用，跨所有配置桶
   - `invalidate_all_intent_cache()` —— `lib_manager.py import` 批量重导后调用（模板可能整体被替换）
-  - `invalidate_all_llm_caches()` —— Admin LLM 配置 CRUD / set-default 时全清两个前缀（不同 LLM 对同一意图可能返不同 `(template_id, params)`，复用旧缓存会让切换形同没切；分桶不是为了切换后保留旧缓存，而是支撑单模板/单意图维度的精准失效）
+  - `invalidate_all_llm_caches()` —— Admin LLM 配置 CRUD / set-default 时**全清三个前缀**（`gen:*` / `intent_cache:*` / `gen_llm:*`，v2.23 / FEAT-11 起含 `gen_llm:*`）；不同 LLM 对同一意图可能返不同 `(template_id, params)` 或不同 `llm_direct` 代码，复用旧缓存会让切换形同没切；分桶不是为了切换后保留旧缓存，而是支撑单模板/单意图维度的精准失效
 
 **Redis 内存配置**（写入 `docker-compose.yml` 的 Redis 服务 command）：
 ```
@@ -1161,6 +1185,10 @@ services/llm/
 │   ├── chat(messages, max_tokens=1024, temperature=None) → str    # v3.0 通用多轮接口
 │   │   供 IntentBuilder 与贡献机制 LLM 反推共用；messages 与 OpenAI/Anthropic SDK
 │   │   原生格式一致（role: system/user/assistant），默认不打 thinking 开关
+│   ├── generate_code_freeform(intent, code_type, signals, clk, rst)
+│   │   → str  # v2.23 / FEAT-11 Stage 2：llm_direct 兜底自由生成 SystemVerilog
+│   │   prompt 强制单 ```systemverilog/sv/verilog``` 围栏；prose-only 响应抛
+│   │   ValueError("no_sv_code_block") 让端点翻译为 HTTP 422 llm_direct_no_code
 │   └── test_basic() → str                   # 连通性自检
 ├── anthropic_client.py       # Anthropic 原生 SDK 实现（tool_calling 单步返回）
 ├── openai_compat_client.py   # openai SDK + base_url 实现（两步纯文本，见下）
@@ -1176,6 +1204,7 @@ services/llm/
 | `normalize_intent` | `{"thinking":{"type":"disabled"}}`（硬编码） | 512 | 句式改写，无需 chain-of-thought |
 | `_step1_select_id` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 仅返回候选列表中的 template_id 或字符串 `"none"`；系统提示含负向选择准则（FIX-8）——核心验证语义不匹配时禁止信号名重映射强行适配，必须返 `"none"` 让 pipeline 走 rag_fallback → 第五道闸（详见 §3.15.3 Step 5a） |
 | `_step2_fill_params` | 由 `llm_configs.step2_disable_thinking` 运行时切换 | 2048（off）/ 1024（on） | 仅针对所选模板的 required 参数生成 JSON；prompt 注入示例输出，正则提取响应中第一个 JSON 对象（兼容 ` ```json``` ` 围栏） |
+| `generate_code_freeform`（v2.23 / FEAT-11） | `{"thinking":{"type":"disabled"}}`（硬编码） | 2048 | `llm_direct` 兜底完整代码生成；prompt 注入 `intent + code_type + signals + clk + rst` 并强制单 ` ```systemverilog/sv/verilog``` ` 围栏，正则提取首块。**理由**：自由生成已经够大不再额外开 thinking，且与 normalize / step1 一致禁 thinking 保稳定延迟；输出 token 较多（一段完整 SVA / coverage 代码），`max_tokens=2048` 与 step2 off-thinking 同档 |
 | `test_basic` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 连通性自检 |
 
 `_step2_fill_params` 的两档配置：
@@ -1584,6 +1613,17 @@ Step 8: CacheWrite
 
 **Env 关闸**：`UNDER_SPECIFIED_GATE_ENABLED=false` 临时退回到 v2.12 之前的"始终产出"行为，仅用于线上误拦应急。
 
+**Step 8a：高置信 RAG 自动 quick_render（v2.23 / FEAT-11 A 子项）**：
+
+`pipeline_preview` 在 `_detect_under_specified` 通过后、构造 `PreviewResult` 之前，调用 `_is_high_confidence_rag(confidence_source: str, verify_ok: bool | None, selected_score: float | None, params_with_source: dict[str, dict], settings) -> bool` 判定是否四条件齐绿：
+
+1. `result.confidence_source == "llm_step1"`（LLM 主动选中模板，未走 `rag_fallback`/`keyword_supplement`/`intent_cache`）
+2. `settings.step1_verify_enabled == True` AND `verify_ok == True`（A8 二次验证通过；A8 disabled 时 `verify_ok=None` 视为不达标，保守不自动 render）
+3. `selected_score >= settings.reranker_min_score_threshold`（默认 0.30；`selected_score` 已在 Step 5a A9 gate 阶段无条件计算并向下游透传，与 A9 共用同一份值）
+4. `all(p["source"] in {"llm", "regex", "signal_list", "default"} for p in params_with_source.values())`（不含 `semantic_fallback` / `placeholder`，与 under_specified 闸的低置信源集合互补）
+
+四条件齐绿 → `PreviewResult.quick_render=True`，与 intent_cache 命中走的 `quick_render=True` 用同一面板旗标，前端 `GeneratePage.handlePreviewSuccess` 透明承接（已有逻辑：`if (res.quick_render) → callRender()`）。任一条件不达标即保留默认 `quick_render=False`（ConfirmationPanel 流程，无回归）。日志格式：`[Pipeline] high_confidence_rag: tid=<id> score=<x.xxxx> → quick_render=True`。本判定不引入新 env 关闸——直接受 `STEP1_VERIFY_ENABLED` 与 `STEP1_RERANKER_GATE_ENABLED` 控制（两者关闭时条件 2/3 自然不成立，行为退回 ConfirmationPanel）。
+
 #### 3.15.4 端点层变薄
 
 端点层仅负责：HTTP 请求解析 → 构造 `PipelineInput` / `RenderInput` → 调用 `pipeline_preview` / `pipeline_render`（或 legacy `run_pipeline`）→ HTTP 响应序列化，不含任何业务逻辑。批量任务（Celery）每行处理仍走 `run_pipeline`，与单条生成共享完全相同的代码路径。
@@ -1628,7 +1668,134 @@ backend/app/services/core/
 - **validation_error** → 红色错误条 + 错误原文（来自 expr_validator）
 - **候选模板切换**：`rag_candidates[]` 每项含 `parameters` 子段，用户切换候选时前端直接套用对应模板的参数预填，无需再调后端
 
-**quick_render 短路**：意图缓存命中时 preview 返回 `quick_render=true`，前端跳过确认面板直接调 `/render` 输出代码；其余情况一律展示确认面板，用户编辑后再调 `/render`。
+**quick_render 短路**（两条来源）：
+1. **意图缓存命中**（v2.13 起）：preview 返回 `quick_render=true`，前端跳过确认面板直接调 `/render` 输出代码
+2. **高置信 RAG 自动渲染**（v2.23 / FEAT-11 A）：preview 满足四条件齐绿（详 §3.15.3 Step 8a）时同样 `quick_render=true`；前端逻辑透明承接——`handlePreviewSuccess` 不区分来源，只看旗标。两种来源的差异仅在 `confidence_source` 字段（`intent_cache` vs `llm_step1`）与对应的置信徽标颜色
+
+其余情况一律展示确认面板，用户编辑后再调 `/render`。
+
+**LLM 直接生成兜底按钮（v2.23 / FEAT-11 B）**：result 阶段在代码卡片下方展示「对生成结果不满意？尝试 LLM 直接生成」secondary 按钮，**仅在 `state.result.generation_mode === 'rag'` 时显示**——已经是 `llm_direct` 的记录不再展示按钮（前端守门，禁止链式 fallback；后端再次防御于 §3.17）。点击 → 调 `generateApi.llmFallback(recordId)` → spinner → 收到新 record 后替换代码区 + `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>` + 反馈状态归零。详 §3.17。
+
+---
+
+### 3.17 LLM 直接生成兜底路径（FEAT-11 Stage 2）
+
+#### 3.17.1 设计动机
+
+§1.1 确定性契约把"系统总能产出代码"约束到 `rag` 路径——库内有可用模板时按确定性流水线产出 SVA / coverage 代码。但库覆盖度不可能 100%：意图通过五道闸（off-topic / code_type_mismatch / no_matching_template / under_specified / empty_retrieval）后仍可能因 RAG top-1 与意图实际语义偏差而产出"看似合理但用户不满意"的代码。v2.22 之前用户除了"重写意图 + 重新走流水线"没有自助路径，体验断裂。
+
+FEAT-11 Stage 2 引入 `llm_direct` 兜底路径：用户对 `rag` 结果不满意时一键触发 LLM 自由生成。该路径放弃确定性、放弃模板复用、放弃 Jinja2 渲染，**用 LLM 的语义理解能力换更贴合意图的代码**，代价是 (1) 同一输入可能产出不同代码 (2) 不参与模板库知识沉淀 (3) 无法做严格的语法 / 结构 校验。该取舍由用户在 result 阶段显式触发，前端 UI 与后端 record 双重打标提醒。
+
+#### 3.17.2 端点契约
+
+```
+POST /api/v1/generate/llm-fallback
+Authorization: Bearer <jwt>
+Content-Type: application/json
+{
+  "generation_record_id": "<source RAG record uuid>"
+}
+
+→ HTTP 200
+{
+  "code": "<完整 SystemVerilog 代码>",
+  "generation_record_id": "<新建的 llm_direct child record uuid>",
+  "generation_mode": "llm_direct",
+  "cache_hit": false | true
+}
+```
+
+**5 类错误响应**（由端点独立返回，不参与五道闸 except 链）：
+
+| HTTP | `detail.type` | 触发条件 |
+|---|---|---|
+| 404 | —（详 §3.17.2 注 1） | `generation_record_id` 在 DB 中不存在或不属于当前用户；`detail` 是纯字符串 `"源生成记录不存在"`，不带结构化 `type` 字段 |
+| 422 | `llm_direct_chained_not_allowed` | 源记录 `generation_mode == 'llm_direct'`——禁止 `llm_direct → llm_direct` 累积漂移 |
+| 422 | `llm_direct_no_code` | `LLMClient.generate_code_freeform` 抛 `ValueError("no_sv_code_block")`（LLM 返纯文字无 ` ```systemverilog/sv/verilog``` ` 围栏） |
+| 422 | `llm_direct_internal_error` | 非 `no_sv_code_block` 类 `ValueError`（LLM 返回结构异常 / Pydantic 校验失败等）；`detail.message` 是固定文案，**不**回写 `str(e)` / `type(e).__name__`，避免泄漏内部 repr |
+| 500 | `llm_direct_internal_error` | `except Exception` 兜底（非 ValueError：DB 写入失败 / 网络超时 / LLM SDK 内部错误等）；与 422 同名 `type`，靠 HTTP 状态区分语义——422 = LLM 输出可解析但内容异常（用户重试可能解决），500 = 平台基础设施失败（用户重试可能仍败，需 SRE 介入） |
+
+#### 3.17.3 端点流程
+
+```
+1. db.get(GenerationRecord, generation_record_id) → 不存在 → 404
+2. record.generation_mode == 'llm_direct' → 422 chained_not_allowed（前端已守门，本步是 API 直调防线）
+3. signature = canonical(record.original_intent + code_type + record.params_used.signals + clk + rst)
+4. cached_code = await get_llm_direct_cache(signature, llm_config_id)
+   命中 → 跳到 step 6 with cache_hit=True
+5. miss → code = await llm.generate_code_freeform(intent, code_type, signals, clk, rst)
+   ValueError("no_sv_code_block") → 422 llm_direct_no_code
+   其他 ValueError → 422 llm_direct_internal_error（结构化 detail，不泄漏 repr）
+   await set_llm_direct_cache(signature, llm_config_id, code, ttl=7d)
+6. 新建 GenerationRecord:
+     user_id = current_user.id
+     original_intent = source.original_intent
+     code_type = source.code_type
+     template_id = None
+     output_code = code
+     confidence = None
+     cache_hit = cache_hit_from_step4
+     intent_cache_hit = False
+     generation_mode = 'llm_direct'
+     parent_record_id = source.id
+     created_at = now()
+7. db.commit() → 返 200 {code, generation_record_id=new.id, generation_mode, cache_hit}
+```
+
+源 record 的 `clk` / `rst` 通过 `params_used` JSONB 字段反序列化获得（pipeline_render 写入时已固化，缺则回落到 `"clk"` / `"rst_n"` 默认值）。`signals` 不在 `GenerationRecord` 落盘——`generate_code_freeform` 不强依赖结构化信号列表，prompt 会从 intent 文本直接提取，所以端点向 LLM 调用恒传 `signals=[]`（让 `build_freeform_prompt` 走"未提供信号列表"分支）。`code_type` 唯一可信来源是 `source.template_id` → `templates.code_type`；模板缺失（理论上 RAG 路径不应发生）回落 `"assertion"` 并打 WARN 日志。
+
+#### 3.17.4 缓存与 invalidation
+
+- 键结构：`gen_llm:{llm_config_id}:{sha256(canonical(intent + code_type + signals_sorted_by_name + clk + rst))}`
+- TTL：7 天（详 §3.6 缓存层；理由：`llm_direct` 路径本身非确定性，缓存只是给"同一用户连续点几次 fallback 按钮"加速，长时间复用会让用户误以为得到了确定性输出）
+- canonical：`services/core/cache.py::_canonical_llm_direct_signature` 把 `signals` 列表按 `name` 字段排序后做 JSON dumps（`ensure_ascii=False, separators=(',', ':')`），保证 signal 顺序无关
+- invalidation：`invalidate_all_llm_caches()` 在 admin LLM 配置 CRUD / set-default 时 scan-delete `gen_llm:*` 与 `gen:*` / `intent_cache:*` 同步清空（详 §3.12.6）
+
+#### 3.17.5 DB schema 与回链契约
+
+`generation_records` 表（v2.22 起含 `generation_mode` 列）在 migration 007 追加 `parent_record_id` FK：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| parent_record_id | VARCHAR(36) NULLABLE FK → generation_records.id | `ondelete=SET NULL`；仅 `generation_mode='llm_direct'` 的记录会有非 None 值，`'rag'` 默认 NULL |
+
+`ondelete=SET NULL` 而非 `CASCADE` / `RESTRICT` 的设计：源 RAG 记录被 admin 删除时（如批量清理误测数据）保留 `llm_direct` 子记录与其反馈数据——子记录的 `feedback_rating` / `output_code` 仍是有意义的质量信号，不应级联消失；FK 清空后子记录 `parent_record_id IS NULL` 仅意味着"无法追溯触发源"，不影响 analytics 聚合（`feedback-summary` / `template-issues` 不依赖 FK）。
+
+#### 3.17.6 非确定性标签三处同步契约
+
+| 位置 | 写入 | 读出 |
+|---|---|---|
+| 后端记录层 | `GenerationRecord.generation_mode='llm_direct'` + `parent_record_id` FK | admin analytics 4 个端点的 `generation_mode` query filter |
+| API 响应层 | `POST /generate/llm-fallback` 响应 `generation_mode: "llm_direct"` 字段；`POST /generate/render`（RAG）响应 `generation_mode: "rag"` 字段 | 前端 `state.result.generation_mode` 初始化与切换 |
+| 前端 UI 层 | result 阶段代码卡片头部 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>` | 用户视觉感知；同时按 `generation_mode === 'rag'` 决定是否显示 LLM fallback 按钮 |
+
+三处任何一处缺打标签都是 bug——回归测试 `tests/test_llm_direct_generation.py` 与 `tests/test_pipeline_preview_render.py` 同时守护"`generation_mode` 字段在响应体存在 + 值正确"两条不变量。
+
+#### 3.17.7 服务层实现位置
+
+```
+backend/app/api/v1/generate.py                 # POST /generate/llm-fallback 端点 +
+                                                 5 道闸 catch 链（独立路径，不与五闸合并）
+backend/app/services/llm/base.py               # LLMClient.generate_code_freeform 抽象方法 +
+                                                 build_freeform_prompt / extract_sv_code_block helper
+backend/app/services/llm/anthropic_client.py   # native messages API 实现
+backend/app/services/llm/openai_compat_client.py # chat.completions + 围栏正则提取，
+                                                 硬编码 thinking=disabled / max_tokens=2048
+backend/app/services/core/cache.py             # get_llm_direct_cache / set_llm_direct_cache /
+                                                 _canonical_llm_direct_signature 三函数
+backend/app/models/generation_record.py        # parent_record_id Mapped 列声明
+backend/migrations/versions/007_llm_direct_parent_fk.py  # ALTER TABLE ADD COLUMN + FK
+backend/tests/test_llm_direct_generation.py    # 端点级集成测试（mock LLM/DB/Redis）
+backend/tests/test_llm_freeform_client.py      # 围栏 lang 兼容 + prose 拒绝单测（mock LLM 不依赖活基础设施）
+frontend/src/api/generate.ts                   # llmFallback API + GenerationMode 类型
+frontend/src/pages/Generate/GeneratePage.tsx   # result 阶段 fallback 按钮 + Tag 渲染
+```
+
+#### 3.17.8 与 5 道闸的关系
+
+5 道闸（OffTopic / CodeTypeMismatch / UnderSpecified / NoMatchingTemplate / EmptyRetrieval）仅守 `pipeline_preview` 路径（即 RAG 链路）。`POST /generate/llm-fallback` **绕过五闸**：它的输入是已经通过五闸的 `rag` record 的 `original_intent` / `code_type` / `signals` / `clk` / `rst`，意图本身一定是域内（否则源 record 不会存在）。这是 v2.15 引入 off-topic 闸时的隐含前提，本路径继续遵循。
+
+`llm_direct` 路径自身的失败（无围栏 / LLM 调不通 / DB 写不进）由 §3.17.2 的三类 422 错误处理，不复用五闸的 detail.type。
 
 ---
 
@@ -1808,8 +1975,9 @@ lib_manager.py import template_library/ --dry-run
 | **feedback_reason_tags** | JSONB NULL | 差评原因标签数组，元素来自 `ReasonTagEnum` 7 项枚举（`wrong_template` / `hallucinated_signal` / `syntax_error` / `semantic_error` / `style_bad` / `missing_disable_iff` / `other`）；rating=3 必填 |
 | **feedback_comment** | TEXT NULL | 反馈自由文本（≤ 2048 字符），所有评分档均可选填 |
 | **feedback_at** | TIMESTAMPTZ NULL | 反馈提交时间（UTC） |
-| **generation_mode** | VARCHAR(16) NULL DEFAULT 'rag' | 代码来源：`'rag'`（默认，走 RAG + 模板渲染）/ `'llm_direct'`（L2 直接 LLM 预留，本 PR 不产）；`cache_hit` 路径仍标 `'rag'`——含义为"代码来源"，与 `cache_hit` 的"是否命中"语义正交 |
+| **generation_mode** | VARCHAR(16) NULL DEFAULT 'rag' | 代码来源：`'rag'`（默认，走 RAG + 模板渲染）/ `'llm_direct'`（v2.23 / FEAT-11 启用，由 `POST /generate/llm-fallback` 端点写入，详 §3.17）；`cache_hit` 路径仍标 `'rag'`——含义为"代码来源"，与 `cache_hit` 的"是否命中"语义正交 |
 | **gate_error_type** | VARCHAR(32) NULL | 5 道闸触发记录标记：`'no_matching_template'` / `'off_topic'` / `'under_specified'` / `'code_type_mismatch'` / `'empty_retrieval'`；正常生成路径为 NULL；analytics `/no-match-rate` 端点的核心数据源 |
+| **parent_record_id** | VARCHAR(36) NULL FK → generation_records.id | `ondelete=SET NULL`（migration 007）；仅 `generation_mode='llm_direct'` 的记录有非 NULL 值，回链触发本次 fallback 的源 RAG 记录。源记录被 admin 删除时仅清空 FK，保留 `llm_direct` 子记录及其反馈数据，详 §3.17.5 |
 
 索引：`intent_hash`（历史意图库查询）、`user_id`（用户历史查询）
 
@@ -1830,12 +1998,16 @@ api/v1/feedback.py::submit_feedback
   ↓    rating=3 且 reason_tags 空 → 422 PydanticCustomError(type='reason_tags_required')
   ↓ 4. 写 4 列：feedback_rating / feedback_reason_tags（[t.value for t in tags]）/
   ↓    feedback_comment / feedback_at（datetime.now(timezone.utc)）
-  ↓ 5. 若原 record.generation_mode 为 NULL → 回填 'rag'（防 batch 老记录穿透）
+  ↓ 5. 若原 record.generation_mode 为 NULL → 回填 'rag'（防 batch 老记录穿透）；
+  ↓    显式 'rag' / 'llm_direct' 值**不**回写（FEAT-11 起 llm_direct 子记录由
+  ↓    /generate/llm-fallback 端点显式写入，feedback 端点无需也不应覆盖）
   ↓ 6. db.commit()
 返 HTTP 204 No Content
 ```
 
 **幂等性**：未做去重——同一 `record_id` 重复 POST 会覆盖先前值（前端按钮已置灰防误操作）。如需历史保留改 L4 议题。
+
+**适用范围**：自 v2.23 / FEAT-11 起，FeedbackBar 对 `rag` 与 `llm_direct` 两种 record 同等可用——前端按 `generation_record_id` 独立 lock，触发一次 `llm-fallback` 后产生新 record 即 `feedbackSubmitted` 归零，让用户分别为 `rag` 与 `llm_direct` 两条产出独立打分，分别进入 L4 analytics 桶。
 
 **测试位置**：`backend/tests/test_feedback_api.py` 覆盖 422（rating=3 无 reason_tags）/ 403（user_id 不匹配） / 204（合法）三分支，全部 mock DB。
 
@@ -1856,6 +2028,15 @@ api/v1/feedback.py::submit_feedback
 - `intent-confusion` 的 `expected_template` = `rag_top3[0].template_id`——视 RAG top-1 为"用户期望"的近似。语义弱于"用户补填期望模板"方案，但用户零负担、全自动，ROI 更高
 - `no-match-rate` 依赖 `gate_error_type` 列，**前提是 generate endpoint 422 catch 路径写 record**（见 §4.1.3）；否则该端点恒返 0
 - `rag_top3` 为空数组的边界（empty_retrieval 触发时）：Python 聚合 `if not isinstance(rag, list) or not rag: continue` 兜底
+
+**`generation_mode` filter（v2.23 / FEAT-11 起）**：4 个端点全部新增 optional `generation_mode: str | None = Query(None)` 参数，值域 `{"rag", "llm_direct"}`，omit = 全量。filter 作用 = 在 SQL where 子句追加 `GenerationRecord.generation_mode == :mode`。三类边界处理：
+
+| 端点 | filter 行为 |
+|---|---|
+| `/feedback-summary` | 直接 where 过滤；`total_*` 与 `*_rate` 按所选模式重新聚合 |
+| `/template-issues` | `generation_mode='llm_direct'` 时**移除默认的 `template_id IS NOT NULL` filter**，把 NULL 行归入 `__llm_direct__` 桶——LLM 直接生成的代码没有对应 template_id，这是设计内行为 |
+| `/intent-confusion` | `generation_mode='llm_direct'` 时 `expected_template = rag_top3[0]` 仍指向源 RAG 记录的 top-1（语义：用户期望 vs LLM 实际给的代码差距），桶 key 仍按 `(expected, actual_or_llm_direct_marker)` 聚合 |
+| `/no-match-rate` | 直接 where 过滤；`llm_direct` 模式下因 `gate_error_type` 恒为 NULL，端点恒返 `no_match_rate=0` 行——正常行为（`llm_direct` 路径绕过五闸） |
 
 **测试位置**：`backend/tests/test_admin_analytics.py` 覆盖 4 端点的空数据 + 有数据两分支，mock DB。
 
@@ -2042,7 +2223,8 @@ WHERE is_default = true;
 | GET | `/api/v1/generate/code-types` | 获取已注册代码类型列表（前端动态读取，无需硬编码） | 普通用户+ |
 | POST | `/api/v1/generate` | 单条代码生成（legacy 一步式，内部串行调 preview+render） | 普通用户+ |
 | POST | `/api/v1/generate/preview` | 两步式第一步：返回模板候选 + 参数预填（含 5 类源标识与 sanitized/validation_error） | 普通用户+ |
-| POST | `/api/v1/generate/render` | 两步式第二步：用户确认参数后渲染 + 写代码缓存（`intent_hash` 非空时也写 GenerationRecord） | 普通用户+ |
+| POST | `/api/v1/generate/render` | 两步式第二步：用户确认参数后渲染 + 写代码缓存（`intent_hash` 非空时也写 GenerationRecord）；响应体含 `generation_mode: "rag"` 字段（v2.23 / FEAT-11） | 普通用户+ |
+| POST | `/api/v1/generate/llm-fallback` | **v2.23 / FEAT-11 Stage 2**：用户对 `rag` 结果不满意时触发 LLM 自由生成兜底；入参 `{generation_record_id}`，写新 `GenerationRecord(generation_mode='llm_direct', parent_record_id=source.id)`；响应 `{code, generation_record_id, generation_mode: "llm_direct", cache_hit}`；5 类错误：404（detail 为纯字符串）/ 422 `llm_direct_chained_not_allowed` / 422 `llm_direct_no_code` / 422 `llm_direct_internal_error`（ValueError 分支）/ 500 `llm_direct_internal_error`（Exception 分支）（详 §3.17） | 普通用户+ |
 | POST | `/api/v1/batch/upload` | 上传 Excel 创建批量任务 | 普通用户+ |
 | POST | `/api/v1/batch/preflight` | 上传后前置信度预检（轻量，仅Stage1） | 普通用户+ |
 | GET | `/api/v1/batch/{job_id}` | 查询批量任务状态 | 普通用户+ |
@@ -2392,7 +2574,13 @@ DV_ACODE_GEN_PLATFORM/
 │   │   ├── env.py
 │   │   ├── script.py.mako
 │   │   └── versions/
-│   │       └── 001_initial_schema.py     # 初始全量建表（含所有表结构）
+│   │       ├── 001_initial_schema.py     # 初始全量建表（含所有表结构）
+│   │       ├── 002_step2_disable_thinking.py  # llm_configs.step2_disable_thinking BOOL 列
+│   │       ├── 003_align_sync_status_enum.py  # sync_status enum 值与 ORM 对齐（幂等）
+│   │       ├── 004_unique_default_llm.py      # llm_configs.is_default 部分唯一索引
+│   │       ├── 005_template_corpus_cases.py   # template_corpus_cases 表（FEAT-4 回归语料）
+│   │       ├── 006_feedback_columns.py        # generation_records 加 6 列（L3 反馈 / generation_mode / gate_error_type）
+│   │       └── 007_llm_direct_parent_fk.py    # generation_records.parent_record_id FK（FEAT-11 Stage 2）
 │   ├── tests/
 │   ├── Dockerfile
 │   └── requirements.txt
