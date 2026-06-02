@@ -706,4 +706,100 @@ cd backend && pytest tests/test_llm_direct_generation.py tests/test_llm_freeform
 
 ---
 
+## 15. FEAT-12 `improvement_reports` 测试 recipe
+
+FEAT-12 引入 `improvement_reports` 表（PRD §6.2 / ARCHITECTURE §3.18、§4.1.4）和 4+1 路由端点（详 ARCHITECTURE §5.1），由单一 pytest 文件 `backend/tests/test_improvement_reports.py` 守护。
+
+| 测试文件 | 用途 | 是否需要活基础设施 |
+|---|---|---|
+| `backend/tests/test_improvement_reports.py` | 端点级集成测试：POST happy path（含选填字段全空）/ 409 UNIQUE 冲突（含 `existing_report_id`）/ 422 FK 缺失（`invalid_record_ref`）/ 403 普通用户访问 admin 路由 / 状态机非法跳转 422（`illegal_status_transition`）/ 分页列表 status/category 过滤 / `GET /check` 单形态契约 / 详情页 PATCH `pending → in_review` 自动流转 | 否（mock DB 风格，与 `test_pipeline_preview_render.py` / `test_llm_direct_generation.py` 同档；**不**依赖 Redis / PG / Qdrant 容器在线，也**不**调真实 LLM——本路径全程纯 DB 写入） |
+
+### 15.1 跑法
+
+```bash
+# 在 backend 容器内（推荐，环境一致）
+docker compose exec backend pytest tests/test_improvement_reports.py -v
+
+# 跑单一用例（按 pytest -k 过滤）
+docker compose exec backend pytest tests/test_improvement_reports.py -k "duplicate_report" -v
+docker compose exec backend pytest tests/test_improvement_reports.py -k "illegal_status_transition" -v
+docker compose exec backend pytest tests/test_improvement_reports.py -k "all_fields_empty" -v
+
+# 主机原生（如果 venv 已激活并装好依赖）
+cd backend && pytest tests/test_improvement_reports.py -v
+```
+
+### 15.2 mock 风格说明（mock_db + factories）
+
+参照 `test_pipeline_preview_render.py` 的既有约定：
+
+- **`mock_db`**：通过 `pytest fixture` 注入 `AsyncSession` 桩，所有 `db.execute / db.add / db.get / db.commit` 都 patch 成 `AsyncMock`；`db.execute(...).scalars().first()` 与 `.unique().all()` 链按 `side_effect` 排队返回伪 row
+- **`factories`**：`make_generation_record(generation_mode='rag' or 'llm_direct', parent_record_id=...)` 与 `make_improvement_report(status=..., report_categories=[...])` 两个工厂——避免在每条用例里重复构造 ORM dummy
+- **鉴权 mock**：通过 `app.dependency_overrides[get_current_user]` 注入不同 `role` 的伪 `User`；测 403 时注入 `role='user'` 调 admin 端点，测 admin 路径时注入 `role='lib_admin'`
+- **不 mock**：Pydantic schema 校验（让 `ImprovementReportCreate` 真实跑 `model_validate`，覆盖"全选填字段空时仍能构造"这条契约）
+
+### 15.3 `ReportCategoryEnum` 4 slug ↔ 中文 label 对照
+
+测试断言 `report_categories` 列里只允许出现以下 4 个 slug 字符串；前端中文 label 不入 DB（中文映射仅前端用）：
+
+| slug（DB / API 入参） | 中文 label（前端显示） |
+|---|---|
+| `wrong_template` | 模板选错 |
+| `wrong_params` | 参数映射错 |
+| `poor_style` | 代码风格差 |
+| `other` | 其他 |
+
+新增 slug 时（如未来加 `inefficient_code`）：改 `backend/app/schemas/improvement_report.py::ReportCategoryEnum` + `frontend/src/api/improvementReports.ts` 中的标签映射 + ARCHITECTURE §4.1.4 对照表 + 本节表 + `test_improvement_reports.py` 的 happy path 用例。
+
+### 15.4 状态机非法跳转测试用例约定
+
+ARCHITECTURE §3.18.4 合法跳转链：`pending → in_review → resolved`。`test_improvement_reports.py` 至少覆盖以下 5 类非法跳转，每类一条独立用例（参数化也可，但务必断言 `detail.type == 'illegal_status_transition'` 与 422 状态码）：
+
+| 用例 ID | from | to | 期望 |
+|---|---|---|---|
+| `test_status_transition__pending_to_resolved_skip__422` | pending | resolved | 422 `illegal_status_transition`（跳过 in_review） |
+| `test_status_transition__resolved_to_pending_regress__422` | resolved | pending | 422（倒退） |
+| `test_status_transition__resolved_to_in_review_regress__422` | resolved | in_review | 422（倒退） |
+| `test_status_transition__in_review_to_pending_regress__422` | in_review | pending | 422（倒退） |
+| `test_status_transition__pending_to_in_review_legal__200` | pending | in_review | 200（合法 happy path 对照组） |
+
+**合法 no-op**（如 `pending → pending`）的行为约定：端点层接受，但不写 `reviewed_at`（避免空更新覆盖 admin 历史 timestamp）；本约定可酌情加用例验证。
+
+### 15.5 选填字段全空提交的 fixture 示例
+
+POST happy path 必须断言"`report_categories` 与 `reporter_note` **均为空**时仍 201 成功"（PRD §6.2 显式契约）。建议 fixture 形如：
+
+```python
+@pytest.fixture
+def empty_optional_payload(rag_record_id, llm_direct_record_id):
+    """全选填字段为空的最小 payload——PRD §6.2 显式契约：用户可不勾任何分类、
+    不写任何 note 直接点提交。"""
+    return {
+        "rag_record_id": rag_record_id,
+        "llm_direct_record_id": llm_direct_record_id,
+        # report_categories / reporter_note 故意不传，让 Pydantic 默认 None
+    }
+
+
+async def test_post_improvement_report__all_optional_empty__201(
+    client, empty_optional_payload, mock_db
+):
+    resp = await client.post("/api/v1/improvement-reports", json=empty_optional_payload)
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body.get("report_categories") in (None, [])  # 接受 NULL 或 []
+    assert body.get("reporter_note") is None
+```
+
+`report_categories` 在响应里允许返 `None` 或 `[]`（端点层一致即可）；前端 `improvementReports.ts` 类型声明应同时 narrow 两种形态。
+
+### 15.6 与其他测试套件的并发关系
+
+- 与 `test_feedback_api.py`（§3.9 L3 差评）：两者完全独立，可并行跑；测同一对 `(rag_record, llm_direct_record)` 时分别写 `generation_records.feedback_*` 与 `improvement_reports`，互不污染
+- 与 `test_admin_analytics.py`（§3.10 L4 仪表盘）：FEAT-12 不修改 4 个 KPI 端点，本套件不与之耦合；若未来 FEAT-13 把 `improvement_reports` 数据接入 analytics，需在 `test_admin_analytics.py` 加配套用例（不修改本套件）
+- 与 `test_llm_direct_generation.py`（§3.17）：本套件**依赖** §3.17 引入的 `parent_record_id` 列存在（migration 007）；新建 worktree 后跑 `alembic upgrade head` 时务必跑到 008，否则 `test_improvement_reports.py` 会 hard fail in fixture（DB schema 缺表）
+
+---
+
 > 如有流程疑问，请在 GitHub Issues 中提出，或联系项目维护者。

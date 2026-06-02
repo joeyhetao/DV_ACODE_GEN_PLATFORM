@@ -1,6 +1,6 @@
 # IC验证辅助代码生成平台 — 产品需求文档（PRD）
 
-**版本**：v3.3  
+**版本**：v3.4  
 **状态**：起草中  
 **日期**：2026-06-02  
 **变更**：
@@ -41,6 +41,7 @@
   - §3.10 管理员分析仪表盘 4 个 KPI 端点全部新增 optional `generation_mode` query 参数（值 `rag` / `llm_direct`，omit = 全量）：`feedback-summary` 按模式分桶；`template-issues` 在 `generation_mode=llm_direct` 时把 `template_id IS NULL` 行归入 `__llm_direct__` 桶不再被默认 `IS NOT NULL` filter 排除；`intent-confusion` 与 `no-match-rate` 同样支持 filter
   - 数据库：migration 007 `generation_records` 新增 `parent_record_id VARCHAR(36) NULLABLE FK→generation_records.id ondelete=SET NULL` 列，让 `llm_direct` 子记录回链触发本次 fallback 的源 RAG 记录；源记录被删除（admin 操作）仅清空 FK，保留 `llm_direct` 子记录与其反馈数据
   - Stage 范围（明确不做，留待 Stage 3）：批量任务（Celery）不支持 `llm_direct` 模式；L4 仪表盘除 `generation_mode` 过滤参数外暂不做"按模式拆分的图表/趋势"；用户不可在没有源 RAG 记录前提下"冷启动"直接 `llm_direct`；管理员不可从 Admin UI 重触发 `llm_direct`；贡献向导不支持 `llm_direct` 路径；不为 `llm_direct` 结果发邮件/Webhook 推送；不做 `llm_direct` analytics 的 CSV 导出
+- v3.3 → v3.4：**FEAT-12 用户对比报告系统**——新增 §6.2「用户对比报告（FEAT-12）」小节（原 §6.2 批量生成顺延为 §6.3），描述用户在 GeneratePage result 阶段对 LLM 直接生成记录一键提交对比报告的完整链路：独立按钮（仅 `generation_mode==='llm_direct' && parent_record_id!=null` 渲染，与 §3.9 L3 差评按钮互相独立）→ Modal（4 项分类 Checkbox.Group + 自由文本 TextArea，**全选填均允许空提交**）→ `POST /api/v1/improvement-reports` → 后端写入新建 `improvement_reports` 表（独立于 `generation_records.feedback_*` 列）。引入分类枚举 `ReportCategoryEnum`（4 项 slug ↔ 中文 label：`wrong_template`/模板选错、`wrong_params`/参数映射错、`poor_style`/代码风格差、`other`/其他），并定义 admin 三态状态机 `pending → in_review → resolved`（详见 ARCH §3.18 / §4.1.4）；已有报告时按钮 disabled 文案"已有人提交对比报告，admin 处理中"。§6.1 错误模式表新增 3 行 `duplicate_report` (409) / `invalid_record_ref` (422) / `illegal_status_transition` (422)，前两条用于 `POST /improvement-reports`，第三条用于 `PATCH /admin/improvement-reports/{id}` 非法状态跳转（如 pending→resolved 跳过 in_review、resolved→pending 倒退），三者均不带 `redirect_to`。§3.9 L3 差评机制与本对比报告系统在 result 阶段并存——前者按记录评质量分（写 `generation_records.feedback_*`），后者按 RAG/LLM 直接生成对比（写 `improvement_reports`），用户可同时使用。**Out of scope（留 FEAT-13）**：resolved 报告语料回流到 `template_corpus_cases`（半自动或自动）、admin CSV 导出、报告邮件/Webhook 推送、admin↔用户对话、跨 admin 认领锁、用户撤回、批量任务行级对比报告
 
 ---
 
@@ -600,6 +601,8 @@ Modal 内还有可选 `comment` 文本框（≤ 2048 字符），允许用户描
 - 不实现批量任务行级反馈（仅单条生成路径）
 - 不允许用户修改已提交的反馈（如需修改让 admin 走 PATCH）
 
+**与 §6.2 用户对比报告的边界（v3.4 / FEAT-12）**：L3 差评针对单条记录的质量打分，写入 `generation_records.feedback_*` 4 列；§6.2 用户对比报告针对成对（RAG 源 + LLM 直接生成子记录）的差异提交，写入独立的 `improvement_reports` 表（详见 §6.2 与 ARCH §4.1.4）。两者在 result 阶段并存（FeedbackBar + 「提交对比报告」按钮各自独立锁定），允许同一对记录同时存在差评与对比报告。L4 仪表盘（§3.10）暂不消费 `improvement_reports` 数据，仅依赖 L3 反馈。
+
 ---
 
 ### 3.10 管理员分析仪表盘（L4）
@@ -825,12 +828,74 @@ Modal 内还有可选 `comment` 文本框（≤ 2048 字符），允许用户描
 | **llm_direct_no_code**（v3.3） | 422 | `llm_direct_no_code` | 无 | `LLMClient.generate_code_freeform` 解析失败（LLM 返纯文字无 ` ```systemverilog/sv/verilog``` ` 围栏）；前端 `message.error` "LLM 未生成可用 SV 代码块，请稍后重试或换 LLM 配置"，停留 result 页 |
 | **llm_direct_internal_error · 422 分支**（v3.3） | 422 | `llm_direct_internal_error` | 无 | 非 `no_sv_code_block` 类 `ValueError`（LLM 输出可解析但内容异常 / Pydantic 校验失败等）；`detail.message` 是固定文案不泄漏内部 repr；前端 `message.error` "LLM 直接生成失败，请稍后重试"，停留 result 页 |
 | **llm_direct_internal_error · 500 分支**（v3.3） | 500 | `llm_direct_internal_error` | 无 | `except Exception` 兜底（DB 写入失败 / 网络超时 / LLM SDK 内部错误等基础设施失败）；与 422 同名 `type`，靠 HTTP 状态区分——422 用户重试可能解决，500 需 SRE 介入；前端 `message.error` 同 422 分支，但状态码会出现在 toast 文案的"HTTP 500"段 |
+| **duplicate_report**（v3.4 / FEAT-12） | 409 | `duplicate_report` | 无 | 同一 `(rag_record_id, llm_direct_record_id)` 对已存在 `improvement_reports` 行；`detail.existing_report_id` 为已有记录的 UUID。前端 `handleApiError` 将"提交对比报告"按钮置 disabled、文案改为"已有人提交对比报告，admin 处理中"，停留 result 页 |
+| **invalid_record_ref**（v3.4 / FEAT-12） | 422 | `invalid_record_ref` | 无 | `POST /improvement-reports` 中 `rag_record_id` 或 `llm_direct_record_id` 在 `generation_records` 中不存在（被 admin 删除 / ID 拼错）；前端 `message.error` "记录不存在，可能已被删除，请刷新页面"，停留 result 页 |
+| **illegal_status_transition**（v3.4 / FEAT-12） | 422 | `illegal_status_transition` | 无 | `PATCH /admin/improvement-reports/{id}` 试图非法跳转 admin 三态状态机（如 `pending → resolved` 跳过 `in_review`、`resolved → pending` 倒退、`resolved → in_review` 倒退）；`detail.message` 描述合法跳转链。前端 `message.error` 提示 admin"非法状态跳转"，停留 admin 详情页 |
 
-后端 except 链顺序固定（OffTopic → CodeTypeMismatch → UnderSpecified → EmptyRetrieval → 兜底 ValueError），不要泛化为 `except ValueError`。`llm_direct_*` 错误由 `POST /generate/llm-fallback` 端点独立返回，与上述 5 道闸的 except 链路无关。`llm_direct_internal_error` 同名 `type` 同时出现在 422 和 500，前端 `handleApiError` 据 HTTP 状态分流即可（不依赖 detail.type 区分）。
+后端 except 链顺序固定（OffTopic → CodeTypeMismatch → UnderSpecified → EmptyRetrieval → 兜底 ValueError），不要泛化为 `except ValueError`。`llm_direct_*` 错误由 `POST /generate/llm-fallback` 端点独立返回，与上述 5 道闸的 except 链路无关。`llm_direct_internal_error` 同名 `type` 同时出现在 422 和 500，前端 `handleApiError` 据 HTTP 状态分流即可（不依赖 detail.type 区分）。`duplicate_report` / `invalid_record_ref` / `illegal_status_transition`（FEAT-12）由 `improvement_reports` 路由独立返回，亦与上述 except 链无关，三者均不带 `redirect_to`。
 
 **IntentBuilder 处理后的回流**：用户在 IntentBuilder 中通过多轮对话产出标准化 intent 后，点击「用这条意图回去生成」，前端 `router.push("/generate?prefill=<refined_intent>")` 跳回生成页，自动填入 TextArea 并触发新一轮 /preview——若仍触发 under_specified，循环（用户可继续 IntentBuilder 精修或退到贡献流）。
 
-### 6.2 批量生成主流程
+### 6.2 用户对比报告（FEAT-12 / v3.4）
+
+**用户旅程**：result 阶段当且仅当 `state.result.generation_mode === 'llm_direct' && state.result.parent_record_id != null` 时，FeedbackBar 旁渲染独立 secondary 按钮「提交对比报告」（与 §3.9 L3 差评按钮并存，两个交互互相独立）。`rag` 路径记录与"冷启动 llm_direct"（parent_record_id 为空，本期实际不可达）均不渲染该按钮。
+
+**触发位置与既有差异**：
+- L3 差评（§3.9）：每条记录单独打分（1/2/3），回写 `generation_records.feedback_*` 4 列，关心"这条结果质量怎样"
+- 对比报告（§6.2 本节）：成对（RAG 源 + LLM 直接生成子记录）一次性提交，写入新表 `improvement_reports`，关心"RAG vs LLM 直接生成的差异是否值得 admin 关注、问题在哪类"
+- 二者可同时使用——用户既可对 LLM 直接生成结果打 3 分差评，也可同一对再提交对比报告，互不抑制
+
+**提交 Modal（4 项分类 + 自由文本）**：
+
+| 字段 | 控件 | 必填 | 说明 |
+|---|---|---|---|
+| `report_categories` | `Checkbox.Group`（4 选项可多选） | 否（可全不勾） | 见下方枚举表 |
+| `reporter_note` | `TextArea`（rows=4，无字数上限校验） | 否（可空） | 用户自由描述差异点 |
+
+`report_categories` 枚举（`ReportCategoryEnum`，slug ↔ 中文 label）：
+
+| slug | 中文 label | 含义 |
+|---|---|---|
+| `wrong_template` | 模板选错 | RAG 选中的模板与意图不符（语义错配） |
+| `wrong_params` | 参数映射错 | 模板正确但参数填充错误（信号名/状态列表/表达式映射错） |
+| `poor_style` | 代码风格差 | 模板正确、参数正确，但生成风格不符合团队规范（命名、缩进、注释） |
+| `other` | 其他 | 上述 3 类无法归纳的差异 |
+
+**"全选填均为空也允许提交"是显式契约**：用户可不勾任何分类、不写任何 note 直接点「提交」，HTTP 201 成功 → 后端写入 `status='pending'` + `report_categories=[]` + `reporter_note=NULL` 记录。设计原则：降低提交摩擦——用户观察到差异即可一键留痕，分类与详述可由 admin 在审阅时反向补充。
+
+**按钮 disabled 状态**：
+
+| 触发条件 | 按钮文案 | 触发机制 |
+|---|---|---|
+| 本次会话内已提交成功 | 「已提交」（gray） | 前端 state.reported 旗标 |
+| 同一对 `(rag_record_id, llm_direct_record_id)` 已有他人/历史报告 | 「已有人提交对比报告，admin 处理中」（gray） | `GET /api/v1/improvement-reports/check?rag_record_id=&llm_direct_record_id=` mount 时查询；或 `POST` 时捕获 409 `duplicate_report` 兜底刷新按钮态 |
+
+**admin 三态审阅工作流**：
+
+```
+pending ──admin 打开详情页（mount 自动 PATCH）──► in_review ──admin 写 note + 「标记已处理」──► resolved
+```
+
+合法跳转：`pending → in_review`、`in_review → resolved`。**所有其他跳转一律 422 `illegal_status_transition`**，包括但不限于 `pending → resolved`（跳过 in_review）、`resolved → pending`（倒退）、`resolved → in_review`（倒退）、`in_review → pending`（倒退）。多 admin 并发进入 `in_review` 不做认领锁（last-write-wins），FEAT-12 不解决该并发问题。
+
+admin 端入口：侧边栏「管理」分组新增「对比报告」菜单项 `/admin/improvement-reports`，仅 `lib_admin` / `super_admin` 可见。
+
+- **列表页**：分页 Table，含 ID / 状态 Tag（pending/in_review/resolved 三色）/ 提交用户名 / RAG 模板名 / 分类 Tag 组 / 提交时间 / 操作"查看"。Filter Bar 支持 `status` 单选 + `categories` 多选，默认 `created_at DESC`
+- **详情页**（`/admin/improvement-reports/:id`）：三列 Card 横向布局——左 RAG 记录（output_code / template_name / params_used / original_intent / generation_mode）/ 中 LLM Direct 记录（同字段）/ 右用户提交内容（categories / note）+ admin_note 编辑区 + 「标记已处理」按钮。mount 时若 `status === 'pending'`，前端**自动**调 `PATCH /api/v1/admin/improvement-reports/{id} { status: 'in_review' }`，无需 admin 主动点击
+
+**Out of scope（明确不做，留 FEAT-13 或后续票）**：
+- **语料回流**：resolved 报告自动 / 半自动写入 `template_corpus_cases` 闭环（留 FEAT-13）
+- admin 端报告 CSV 导出
+- 邮件 / Webhook 推送通知（admin 有新报告待审）
+- 报告评论 / 互相回复（admin ↔ 用户对话）；`admin_note` 为单向字段
+- 跨 admin 的认领锁（多 admin 同时进入 `in_review` 均允许，last-write-wins）
+- 删除 improvement_report
+- 用户撤回已提交的报告
+- 报告字段长度上限校验（`reporter_note` / `admin_note` 均不设 DB 层 CHECK 约束）
+- 批量任务（Celery）路径生成记录的对比报告（`parent_record_id` 在 batch 路径中不写入，故无源记录可对比）
+- 贡献向导路径生成记录的对比报告
+
+### 6.3 批量生成主流程
 
 1. 用户下载Excel模板
 2. 填写Excel（描述列 + 信号列）
