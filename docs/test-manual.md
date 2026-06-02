@@ -1,7 +1,7 @@
 # 平台功能测试手册
 
 > 面向：QA、产品验证、上线前回归。每个用例 = 操作步骤 + 期望效果。
-> 平台版本：PRD v3.3。后端基于 5 道闸契约（off-topic / code_type_mismatch / no_matching_template / under_specified / empty_retrieval）+ FEAT-11 Stage 2 双模生成（`generation_mode ∈ {rag, llm_direct}`，详 §2.9 高置信自动渲染、§4.8 LLM 直接生成兜底）。
+> 平台版本：PRD v3.4。后端基于 5 道闸契约（off-topic / code_type_mismatch / no_matching_template / under_specified / empty_retrieval）+ FEAT-11 Stage 2 双模生成（`generation_mode ∈ {rag, llm_direct}`，详 §2.9 高置信自动渲染、§4.8 LLM 直接生成兜底）+ FEAT-12 用户对比报告系统（§4.9 用户提交 + §14 管理员审阅，独立于 §12 L3 差评通道，详 ARCHITECTURE §3.18 / §4.1.4）。双模诊断说明：result 阶段 `generation_mode==='llm_direct' && parent_record_id!=null` 时同时出现两个独立按钮——FeedbackBar（§12 L3 评分）与「提交对比报告」按钮（§4.9 / §14 对比报告），分别走两条数据通道，互不阻塞、可同时使用。
 
 ---
 
@@ -26,6 +26,9 @@
 - [9. LLM 配置管理](#9-llm-配置管理)
 - [10. 通知机制](#10-通知机制)
 - [11. Step1 模板选择质量回归（混淆对语料 + reranker 阈值标定）](#11-step1-模板选择质量回归混淆对语料--reranker-阈值标定)
+- [12. L3 用户反馈机制验证](#12-l3-用户反馈机制验证)
+- [13. 管理员分析仪表盘使用说明](#13-管理员分析仪表盘使用说明)
+- [14. 管理员对比报告审阅（FEAT-12 / v3.4）](#14-管理员对比报告审阅feat-12--v34)
 - [附录 A：日志/缓存排查速查](#附录-a日志缓存排查速查)
 - [附录 B：5 道闸错误响应结构对照](#附录-b5-道闸错误响应结构对照)
 
@@ -664,6 +667,96 @@ curl -s -w "\nHTTP %{http_code}\n" \
   -H "Authorization: Bearer $ADMIN_TOKEN"
 # 期望：HTTP 422，detail 含 "literal_error"（Pydantic Literal['rag','llm_direct'] 校验）
 ```
+
+### §4.9 用户提交对比报告（FEAT-12 / v3.4）
+
+> 本节与 §4.8 同源（用户对 LLM 直接生成结果的后续动作），但目标不同：§4.8 是兜底救济（生成代码），本节是质量信号采集（让 admin 关注成对差异）。详 PRD §6.2 / ARCHITECTURE §3.18。
+
+`POST /api/v1/improvement-reports` 接收 `{rag_record_id, llm_direct_record_id, report_categories?, reporter_note?}`，后两个字段**均可全空**仍 201 成功。前端按钮在 result 阶段独立于 FeedbackBar 渲染，仅当 `generation_mode==='llm_direct' && parent_record_id != null` 时出现。
+
+#### §4.9.1 Happy path — RAG 高置信生成 → LLM 直接生成 → 提交对比报告
+
+**前置**：清三层缓存（§0.3 `gen:*` + `intent_cache:*` + `gen_llm:*`），让流程从冷启动跑完整路径。
+
+1. 跑 §1 任意成功生成，停在 result 阶段，确认代码卡片头部无橙色 Tag、按钮区只有 FeedbackBar（**不**应出现「提交对比报告」按钮，因为 `generation_mode==='rag'`）
+2. 点击代码卡片下方「对生成结果不满意？尝试 LLM 直接生成」（§4.8.1），等待替换为 `llm_direct` 代码
+3. 期望（FEAT-12 标识三处同步）：
+   - 代码卡片头部出现 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>`（§4.8.1 既有）
+   - **新增**：FeedbackBar 旁出现独立 secondary Button「提交对比报告」，按钮 **enabled**（mount 时调 `GET /improvement-reports/check?rag_record_id=&llm_direct_record_id=` 返 `{exists: false}`）
+   - 后端日志：`GET /api/v1/improvement-reports/check?rag_record_id=...&llm_direct_record_id=... HTTP/1.1" 200`
+4. 点击「提交对比报告」→ 弹出 Modal：
+   - 标题"提交对比报告"
+   - `Checkbox.Group` 4 项（无必填星号）：模板选错 / 参数映射错 / 代码风格差 / 其他
+   - `Input.TextArea` rows=4，placeholder "可描述 RAG 与 LLM 直接生成的差异（选填）"
+   - 「提交」按钮**始终 enabled**（与 §12 差评 Modal 不同——后者不选 reason_tags 拒绝提交）
+   - 「取消」按钮
+5. **不勾任何分类、不写任何 note**，直接点「提交」
+6. 期望：
+   - HTTP 201 响应体 `{id: <uuid>, status: 'pending', created_at: ..., report_categories: [] or null, reporter_note: null, ...}`
+   - Modal 自动关闭
+   - 「提交对比报告」按钮置灰、文案改为「已提交」
+   - 顶部 `message.success('已提交对比报告，admin 处理中')`
+7. 后端日志期望：
+   ```
+   POST /api/v1/improvement-reports HTTP/1.1" 201
+   ```
+8. SQL 验证：
+   ```bash
+   docker compose exec postgres psql -U dvuser -d dv_platform -c \
+     "SELECT id, status, report_categories, reporter_note IS NULL AS note_null, created_at \
+      FROM improvement_reports ORDER BY created_at DESC LIMIT 1;"
+   ```
+   期望：`status='pending'`, `report_categories` 为 `null` 或 `[]`, `note_null=t`
+
+#### §4.9.2 重复提交按钮 disabled（409 拦截）
+
+**前置**：完成 §4.9.1。
+
+1. 不刷新页面，**手动改 `state.reported = false`**（DevTools React 改 state）或刷新页面让前端 mount 重新调 `check` 端点
+2. 期望刷新后：
+   - `GET /improvement-reports/check?rag_record_id=&llm_direct_record_id=` 返 `200 {exists: true, report_id: <uuid>}`
+   - 「提交对比报告」按钮初始即 disabled、文案"已有人提交对比报告，admin 处理中"
+3. **直接调 API 验证 409 兜底**（前端守门失效时的最后防线）：
+   ```bash
+   TOKEN=<jwt>
+   RAG_ID=<上一步的 rag_record_id>
+   LLM_ID=<上一步的 llm_direct_record_id>
+   curl -s -X POST http://localhost/api/v1/improvement-reports \
+     -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+     -d "{\"rag_record_id\":\"$RAG_ID\",\"llm_direct_record_id\":\"$LLM_ID\"}" \
+     -w "\nHTTP %{http_code}\n"
+   ```
+   期望：HTTP 409，`detail.type="duplicate_report"`，`detail.existing_report_id` 为 §4.9.1 创建的 UUID
+
+#### §4.9.3 FK 缺失场景（422 invalid_record_ref）
+
+```bash
+TOKEN=<jwt>
+curl -s -X POST http://localhost/api/v1/improvement-reports \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"rag_record_id":"00000000-0000-0000-0000-000000000000","llm_direct_record_id":"00000000-0000-0000-0000-000000000001"}' \
+  -w "\nHTTP %{http_code}\n"
+```
+
+期望：HTTP 422，`detail.type="invalid_record_ref"`。
+
+#### §4.9.4 未登录 401
+
+```bash
+curl -s -X POST http://localhost/api/v1/improvement-reports \
+  -H "Content-Type: application/json" \
+  -d '{"rag_record_id":"<any>","llm_direct_record_id":"<any>"}' \
+  -w "\nHTTP %{http_code}\n"
+```
+
+期望：HTTP 401（无 Authorization header）。
+
+#### §4.9.5 按钮不渲染场景（`generation_mode === 'rag'`）
+
+**前置**：完成 §1 任意成功生成，停在 result 阶段（`generation_mode==='rag'`）。
+
+1. 检查代码卡片下方
+2. 期望：**仅** FeedbackBar 出现，不应出现「提交对比报告」按钮——前端守门 `state.result.generation_mode === 'llm_direct' && parent_record_id != null` 不满足
 
 ---
 
@@ -1558,3 +1651,119 @@ curl -s "http://localhost/api/v1/admin/analytics/feedback-summary" \
 - **`feedback_rate < 5%` 且持续 4 周** → 触发"反馈 UX 重设计"工单（用户根本不点反馈按钮，数据信号失效）
 
 阈值未硬编码到代码里——观察期决策由库管理员根据仪表盘手动判定，本表仅作参考起步值。
+
+---
+
+## 14. 管理员对比报告审阅（FEAT-12 / v3.4）
+
+> §4.9 用户提交对比报告后流入 `improvement_reports` 表（status='pending'）。本节验证管理员侧列表过滤、详情自动状态流转、admin_note 编辑、标记 resolved 与状态机非法跳转拦截。前置：完成 §4.9.1 至少一次成功提交。
+>
+> 路由：仅 `lib_admin` / `super_admin` 可见，侧边栏「管理」→「对比报告」（`/admin/improvement-reports`）。普通用户访问任一 admin 端点返 HTTP 403。
+
+### §14.1 列表页过滤（status / category）
+
+1. 登录 admin（§0.2），点侧边栏「管理」→「对比报告」
+2. 期望进入 `/admin/improvement-reports`：
+   - 顶部 Filter Bar：`status` 单选下拉（`全部` / `pending` / `in_review` / `resolved`）+ `categories` 多选下拉（4 项中文 label）
+   - Table 列：ID（uuid 缩写） / 状态 Tag（三色：橙=pending / 蓝=in_review / 绿=resolved） / 提交用户名 / RAG 模板名 / 分类 Tag 组 / 提交时间 / 操作"查看"
+   - 默认 `created_at DESC`
+3. 选 `status=pending`：期望只看到 §4.9.1 创建的那条
+4. 选 `categories=[模板选错]`：期望 §4.9.1（categories 为空）行**不**显示——空 categories 不匹配任何 category filter
+5. 清 filter → 仍能看到 §4.9.1 行
+
+### §14.2 详情页 mount 自动 PATCH `pending → in_review`
+
+1. 列表里点 §4.9.1 行的"查看" → 跳 `/admin/improvement-reports/<id>`
+2. 期望页面 mount 期间立即调 `PATCH /api/v1/admin/improvement-reports/{id} {status: 'in_review'}`，无需 admin 主动点击
+3. 后端日志期望：
+   ```
+   PATCH /api/v1/admin/improvement-reports/<id> HTTP/1.1" 200
+   ```
+4. 详情页 UI 期望：
+   - 顶部状态 Tag 由橙色 `pending` 变蓝色 `in_review`
+   - 三列 Card 横向布局：
+     - **左列（RAG 记录）**：`original_intent` / `template_id` + `template_name` / `params_used` JSON / `output_code`（Monaco 只读 SystemVerilog 高亮） / `generation_mode='rag'` / `cache_hit`
+     - **中列（LLM Direct 记录）**：同字段；`template_id` 为空 / `generation_mode='llm_direct'` / 头部橙色 Tag「非确定性」
+     - **右列（用户提交内容）**：`report_categories` 中文 label Tag 组 / `reporter_note`（若空显"用户未填写"）
+   - 右列下方："管理员处理"区：`admin_note` TextArea（无字数上限） + 「标记已处理」按钮（始终 enabled）
+5. SQL 验证：
+   ```bash
+   docker compose exec postgres psql -U dvuser -d dv_platform -c \
+     "SELECT status, reviewed_by, reviewed_at IS NOT NULL AS reviewed FROM improvement_reports WHERE id='<id>';"
+   ```
+   期望：`status=in_review`, `reviewed_by=<current admin id>`, `reviewed=t`
+
+### §14.3 admin 写 note 并标记 resolved
+
+1. 在 §14.2 详情页 admin_note TextArea 输入"已确认是模板选错，已加入 FEAT-13 语料回流队列"
+2. 点「标记已处理」
+3. 期望：
+   - 调 `PATCH /api/v1/admin/improvement-reports/{id} {status: 'resolved', admin_note: '<上述文本>'}`
+   - HTTP 200 响应
+   - 顶部状态 Tag 变绿色 `resolved`
+   - 「标记已处理」按钮变 disabled（终止态不允许再 PATCH）
+   - 顶部 `message.success('已标记为已处理')`
+4. 返回列表页 → §4.9.1 行状态 Tag 应同步刷新为绿色 `resolved`
+
+### §14.4 状态机非法跳转手测（API 直调）
+
+详情页 UI 已守门"标记已处理"按钮只在 `in_review` 时 enabled，但仍需 API 直调验证后端兜底拦截。
+
+```bash
+ADMIN_TOKEN=<jwt>
+REPORT_ID=<已 resolved 的 §14.3 报告 ID>
+
+# 1) resolved → pending（倒退）
+curl -s -X PATCH "http://localhost/api/v1/admin/improvement-reports/$REPORT_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"status":"pending"}' -w "\nHTTP %{http_code}\n"
+# 期望：HTTP 422，detail.type="illegal_status_transition"，message 含"resolved → pending"
+
+# 2) resolved → in_review（倒退）
+curl -s -X PATCH "http://localhost/api/v1/admin/improvement-reports/$REPORT_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"status":"in_review"}' -w "\nHTTP %{http_code}\n"
+# 期望：HTTP 422 illegal_status_transition
+
+# 3) 新建一份 pending 报告（§4.9.1 重新跑），然后直接 pending → resolved 跳过 in_review
+NEW_REPORT_ID=<新 pending 报告 ID>
+curl -s -X PATCH "http://localhost/api/v1/admin/improvement-reports/$NEW_REPORT_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"status":"resolved","admin_note":"试跳"}' -w "\nHTTP %{http_code}\n"
+# 期望：HTTP 422 illegal_status_transition，message 含"pending → resolved"（跳过 in_review）
+
+# 4) in_review → pending（倒退）—— 把 NEW_REPORT_ID 通过 §14.2 流程先 PATCH 到 in_review
+curl -s -X PATCH "http://localhost/api/v1/admin/improvement-reports/$NEW_REPORT_ID" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H "Content-Type: application/json" \
+  -d '{"status":"pending"}' -w "\nHTTP %{http_code}\n"
+# 期望：HTTP 422 illegal_status_transition
+
+# 5) 对照组：pending → in_review（合法），in_review → resolved（合法）
+# 期望：HTTP 200，对应状态正常推进；reviewed_by / reviewed_at 同步刷新
+```
+
+### §14.5 普通用户访问 admin 端点返 403
+
+```bash
+USER_TOKEN=<非 admin 用户 jwt>
+curl -s -w "\nHTTP %{http_code}\n" \
+  "http://localhost/api/v1/admin/improvement-reports?status=pending" \
+  -H "Authorization: Bearer $USER_TOKEN"
+# 期望：HTTP 403
+
+curl -s -w "\nHTTP %{http_code}\n" \
+  "http://localhost/api/v1/admin/improvement-reports/$REPORT_ID" \
+  -H "Authorization: Bearer $USER_TOKEN"
+# 期望：HTTP 403
+
+curl -s -X PATCH -w "\nHTTP %{http_code}\n" \
+  "http://localhost/api/v1/admin/improvement-reports/$REPORT_ID" \
+  -H "Authorization: Bearer $USER_TOKEN" -H "Content-Type: application/json" \
+  -d '{"status":"resolved"}'
+# 期望：HTTP 403
+```
+
+### §14.6 与 §12 L3 差评 / §13 L4 仪表盘的边界
+
+- **§12 L3 差评 vs §4.9 + §14 对比报告**：同一对 `(RAG record, llm_direct child record)` 可同时存在 L3 差评和对比报告。验证：完成 §4.9.1 提交报告后，对 `llm_direct` 子记录额外打一次 §12.1 三档评分（如 3 分差评） + 填 reason_tags + 提交 — 期望 `generation_records.feedback_rating=3` 与 `improvement_reports.status='pending'` 双写成功，两条数据通道互不影响
+- **§13 L4 仪表盘**：FEAT-12 **不修改** 4 个 KPI 端点；本次 PR 不在仪表盘看到 `improvement_reports` 数据（留 FEAT-13）。验证：进入 `/admin/analytics`，确认页面无变化，4 个 KPI 卡片含义与 §13.2 完全一致

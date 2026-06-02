@@ -1,6 +1,6 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.23  
+**版本**：v2.24  
 **状态**：已确认  
 **日期**：2026-06-02  
 **变更**：
@@ -71,6 +71,14 @@
   - §4.1.2 4 个 KPI 端点 SQL 聚合策略表新增 optional `generation_mode` query 参数：`feedback-summary` / `template-issues` / `intent-confusion` / `no-match-rate` 全部支持。`template-issues` 在 `generation_mode=llm_direct` 时把 `template_id IS NULL` 行归入 `__llm_direct__` 桶不再被默认 `IS NOT NULL` filter 排除
   - §7 项目目录结构：`migrations/versions/` 列举更新为 001 / 002 / 003 / 004 / 005 / 006 / 007 七个迁移文件（含简要功能注释），不再仅列 001
   - §5.1 端点表追加 1 条：`POST /generate/llm-fallback`（普通用户）
+- v2.23 → v2.24：**FEAT-12 用户对比报告系统落地**——
+  - 新增 §3.18 `improvement_reports` 路径完整文档：从 GeneratePage 「提交对比报告」按钮 → `GET /improvement-reports/check` 预查（驱动按钮 disabled 态）→ `POST /improvement-reports`（用户端，写 `status='pending'`）→ admin 列表 / 详情自动 PATCH `pending → in_review` → admin 写 `admin_note` + 「标记已处理」PATCH `in_review → resolved` 的完整链路；引用 §4.1.4 表结构、§5.1 端点表
+  - §4.1 `generation_records` 表追加备注：`parent_record_id`（v2.23 引入的 `llm_direct` 子记录 → RAG 源记录 FK）同时是 `improvement_reports.rag_record_id` / `improvement_reports.llm_direct_record_id` 配对的"语义锚点"——`POST /improvement-reports` 要求 `rag_record_id == llm_direct_record.parent_record_id`（端点层显式校验或前端守门，后端容忍 user 自行构造的合法对）；删除源 RAG 记录不级联删除 `improvement_reports`（FEAT-12 不解决该清理路径）
+  - §4.1.4 新增 `improvement_reports` 表结构（migration 008）：字段 / 类型 / 约束 / UNIQUE(rag_record_id, llm_direct_record_id) / 状态 ENUM `report_status_enum('pending','in_review','resolved')` 取值 / `report_categories JSONB` 列存 4 项 `ReportCategoryEnum` slug（`wrong_template` / `wrong_params` / `poor_style` / `other`）与中文 label 双向对照表
+  - §5.1 端点表追加 5 行：`POST /improvement-reports`（登录用户+）、`GET /improvement-reports/check`（登录用户+，鉴权与 POST 同级，不限 admin）、`GET /admin/improvement-reports`（库管理员+，支持 `status`/`categories` 过滤）、`GET /admin/improvement-reports/{id}`（库管理员+，返两条 generation_record 完整对比字段）、`PATCH /admin/improvement-reports/{id}`（库管理员+，三态状态机非法跳转返 422 `illegal_status_transition`）；3 类错误 `duplicate_report`(409) / `invalid_record_ref`(422) / `illegal_status_transition`(422) 详见 PRD §6.1 错误模式表
+  - §7 目录结构追加：`backend/app/api/v1/improvement_reports.py`（4+1 路由） / `backend/app/models/improvement_report.py`（ORM）/ `backend/app/schemas/improvement_report.py`（4 个 Pydantic）/ 前端 `frontend/src/api/improvementReports.ts` / `frontend/src/pages/Admin/AdminImprovementReportsPage.tsx` / `frontend/src/pages/Admin/AdminImprovementReportDetailPage.tsx`，外加 `frontend/src/pages/Generate/GeneratePage.tsx` 与 `frontend/src/components/MainLayout.tsx` / `frontend/src/App.tsx` 增量改动
+  - §7 migrations 列表追加 `008_improvement_reports.py`（建表 + `report_status_enum` 创建 + UNIQUE 约束 + FK → generation_records.id ondelete=RESTRICT）
+  - 与 §3.17 / §1.1 确定性契约的边界：`improvement_reports` 路径是**纯 DB 写入**，不调用 LLM、不参与 RAG 检索、不影响 `generation_records.output_code`；它消费 `generation_records` 现有 FK（`parent_record_id`）作为配对锚点。对 §1.1 确定性契约（`rag` / `llm_direct` 路径）**无影响**
 
 ---
 
@@ -1799,6 +1807,112 @@ frontend/src/pages/Generate/GeneratePage.tsx   # result 阶段 fallback 按钮 +
 
 ---
 
+### 3.18 用户对比报告路径（FEAT-12）
+
+#### 3.18.1 设计动机
+
+§3.17 引入 `llm_direct` 兜底后，用户能在 `rag` 不满意时一键拿到 LLM 自由生成的代码。但平台缺少一条**结构化采集"哪些 RAG vs LLM 直接生成的差异值得 admin 关注"**的通道：§3.9 L3 差评（`generation_records.feedback_*`）按记录评质量分，颗粒度是单条结果；模板库改进需要的颗粒度是"成对（RAG 源 + LLM 直接生成子记录）"。FEAT-12 新建独立的 `improvement_reports` 表（§4.1.4）+ 用户一键提交按钮 + admin 三态审阅工作流，作为质量信号采集链路的新一环（上游：用户观察成对差异；下游：FEAT-13 把 resolved 报告语料回流到 `template_corpus_cases`，**本票不做**）。
+
+设计原则：
+- **不与 §3.9 L3 差评互斥**：FeedbackBar 与「提交对比报告」按钮在 result 阶段并存（互相独立锁定），允许同一对记录同时存在差评 + 对比报告
+- **不接入 §1.1 确定性契约**：`improvement_reports` 是纯 DB 写入，不调用 LLM、不读 Qdrant、不影响 `generation_records.output_code`
+- **不接入 §3.10 L4 仪表盘**：FEAT-12 不修改 4 个 KPI 端点，`improvement_reports` 数据消费留 FEAT-13
+
+#### 3.18.2 完整链路
+
+```
+GeneratePage result 阶段（generation_mode === 'llm_direct' && parent_record_id != null）
+  ├─ FeedbackBar（§3.9 L3 差评，独立通道）
+  └─ [提交对比报告] 按钮（§3.18 本路径）
+       │
+       │ mount/聚焦时：GET /api/v1/improvement-reports/check?rag_record_id=&llm_direct_record_id=
+       │   ↓ 200 {exists:true, report_id} → 按钮 disabled「已有人提交对比报告，admin 处理中」
+       │   ↓ 200 {exists:false} 或 404      → 按钮 enabled
+       │
+       │ 用户点击 → Modal（Checkbox.Group + TextArea，全选填均允许空）
+       │
+       ↓ POST /api/v1/improvement-reports
+          body: {rag_record_id, llm_direct_record_id, report_categories?, reporter_note?}
+       │
+       ├─ rag_record_id / llm_direct_record_id 不在 generation_records → 422 invalid_record_ref
+       ├─ UNIQUE(rag_record_id, llm_direct_record_id) 冲突 → 409 duplicate_report
+       │   detail.existing_report_id = <已存在记录 UUID>
+       └─ 成功 → 201 {id, status: 'pending', created_at, ...}
+          按钮置灰文案改「已提交」
+
+admin 侧边栏「管理」→「对比报告」（仅 lib_admin / super_admin 可见）
+  ├─ /admin/improvement-reports（列表页）
+  │   ↓ GET /api/v1/admin/improvement-reports?status=&categories=&page=&page_size=
+  │   ↓ 返回分页 + status Tag + 提交用户名 + RAG 模板名 + 分类 Tag 组 + 提交时间
+  │
+  └─ /admin/improvement-reports/:id（详情页）
+      ↓ mount: GET /api/v1/admin/improvement-reports/{id}
+      ↓        → 三列对比字段：[RAG record / LLM Direct record / 用户提交]
+      ↓ if status === 'pending'
+      ↓    自动 PATCH /api/v1/admin/improvement-reports/{id} {status: 'in_review'}
+      ↓ admin 填 admin_note + 点「标记已处理」
+      ↓    PATCH /api/v1/admin/improvement-reports/{id} {status: 'resolved', admin_note}
+      ↓ 非法跳转（pending→resolved 跳过 in_review、resolved→pending 倒退等）
+      ↓    → 422 illegal_status_transition
+```
+
+#### 3.18.3 端点契约总览
+
+| 方法 | 路径 | 鉴权 | 关键行为 |
+|---|---|---|---|
+| `POST` | `/api/v1/improvement-reports` | 登录用户+ | 写 `status='pending'`；categories/note 全空合法；FK 缺失 422 `invalid_record_ref`；UNIQUE 冲突 409 `duplicate_report` |
+| `GET` | `/api/v1/improvement-reports/check` | 登录用户+（与 POST 同级，不限 admin） | 查询 `(rag_record_id, llm_direct_record_id)` 对是否已有报告；契约 200 `{exists, report_id?}` 单形态（前端只需判 `exists` bool；详 §5.1） |
+| `GET` | `/api/v1/admin/improvement-reports` | 库管理员+ | 分页列表，支持 `status` 单选 + `categories` 多选过滤，默认 `created_at DESC`；普通用户 403 |
+| `GET` | `/api/v1/admin/improvement-reports/{id}` | 库管理员+ | 详情，返两条 `generation_record` 完整对比字段（`output_code` / `template_id` / `template_name`（join templates 取 name）/ `params_used` / `original_intent` / `generation_mode` / `cache_hit`） + 用户提交字段；普通用户 403 |
+| `PATCH` | `/api/v1/admin/improvement-reports/{id}` | 库管理员+ | 更新 `status` 与 `admin_note`；三态状态机校验在端点层做（不依赖 DB CHECK）；非法跳转 422 `illegal_status_transition` |
+
+`check` 端点契约选 **200 `{exists, report_id?}` 单形态**（spec §5 Open Question 中的方案 B）：前端只看 `exists` bool 即可分支按钮 disabled 态，不依赖 HTTP 状态码做控制流（404 会污染浏览器 devtools 红条）。
+
+#### 3.18.4 三态状态机（合法跳转表）
+
+```
+pending ──admin 打开详情页（mount 自动 PATCH）──► in_review ──admin 「标记已处理」──► resolved
+```
+
+| from / to | pending | in_review | resolved |
+|---|---|---|---|
+| **pending** | ✗（no-op）| ✓ | **✗（跳过 in_review）→ 422 `illegal_status_transition`** |
+| **in_review** | ✗ 倒退 → 422 | ✗（no-op）| ✓ |
+| **resolved** | **✗ 倒退 → 422** | **✗ 倒退 → 422** | ✗（no-op）|
+
+`detail.message` 在非法跳转时返"非法状态跳转：{current} → {target}；合法跳转链：pending → in_review → resolved"，前端 `message.error` 透传文案。
+
+**并发**：多 admin 并发进入 `in_review` 不做认领锁（last-write-wins），FEAT-12 不解决该并发问题。
+
+#### 3.18.5 服务层实现位置
+
+```
+backend/app/api/v1/improvement_reports.py    # 4+1 路由（POST 用户端 + check + GET 列表/详情 + PATCH admin）
+                                              # router.py 注册 prefix /improvement-reports + /admin/improvement-reports
+backend/app/models/improvement_report.py     # ImprovementReport ORM（含 report_categories JSONB + status PG ENUM）
+backend/app/schemas/improvement_report.py    # ImprovementReportCreate / ImprovementReportAdminListItem /
+                                              # ImprovementReportDetail / ImprovementReportPatch / ReportCategoryEnum
+backend/migrations/versions/008_improvement_reports.py
+                                              # report_status_enum 创建 + improvement_reports 表 +
+                                              # UNIQUE(rag_record_id, llm_direct_record_id) + FK → generation_records.id
+backend/tests/test_improvement_reports.py    # 端点级集成测试（mock DB；POST happy / 409 / 422 / 403 / 状态机非法跳转 / 分页过滤）
+frontend/src/api/improvementReports.ts       # 4 条 axios 封装 + 类型定义
+frontend/src/pages/Generate/GeneratePage.tsx  # result 阶段「提交对比报告」按钮 + Modal +
+                                              # check 端点 mount 调用驱动按钮态
+frontend/src/pages/Admin/AdminImprovementReportsPage.tsx        # 列表页（Table + Filter Bar）
+frontend/src/pages/Admin/AdminImprovementReportDetailPage.tsx   # 详情页（三列 Card + mount 自动 PATCH in_review）
+frontend/src/components/MainLayout.tsx        # 侧边栏 admin children 新增「对比报告」菜单项
+frontend/src/App.tsx                          # 新增两条 RequireAdmin 路由（列表 + 详情）
+```
+
+#### 3.18.6 与 §3.17 / §3.9 / §3.10 的关系
+
+- **§3.17（`llm_direct`）**：`improvement_reports` 路径**依赖** `parent_record_id` FK（v2.23 / FEAT-11 引入）作为成对锚点；本路径不修改 §3.17 任何端点
+- **§3.9（L3 差评）**：两条独立通道，写入互不耦合（一条写 `generation_records.feedback_*` 4 列，一条写 `improvement_reports` 新表）
+- **§3.10（L4 仪表盘）**：FEAT-12 不修改 4 个 KPI 端点；`improvement_reports` 数据消费 / 趋势图 / CSV 导出留 FEAT-13
+
+---
+
 ### 3.13 数据备份与恢复机制
 
 #### 3.13.1 数据分层与备份优先级
@@ -1977,7 +2091,7 @@ lib_manager.py import template_library/ --dry-run
 | **feedback_at** | TIMESTAMPTZ NULL | 反馈提交时间（UTC） |
 | **generation_mode** | VARCHAR(16) NULL DEFAULT 'rag' | 代码来源：`'rag'`（默认，走 RAG + 模板渲染）/ `'llm_direct'`（v2.23 / FEAT-11 启用，由 `POST /generate/llm-fallback` 端点写入，详 §3.17）；`cache_hit` 路径仍标 `'rag'`——含义为"代码来源"，与 `cache_hit` 的"是否命中"语义正交 |
 | **gate_error_type** | VARCHAR(32) NULL | 5 道闸触发记录标记：`'no_matching_template'` / `'off_topic'` / `'under_specified'` / `'code_type_mismatch'` / `'empty_retrieval'`；正常生成路径为 NULL；analytics `/no-match-rate` 端点的核心数据源 |
-| **parent_record_id** | VARCHAR(36) NULL FK → generation_records.id | `ondelete=SET NULL`（migration 007）；仅 `generation_mode='llm_direct'` 的记录有非 NULL 值，回链触发本次 fallback 的源 RAG 记录。源记录被 admin 删除时仅清空 FK，保留 `llm_direct` 子记录及其反馈数据，详 §3.17.5 |
+| **parent_record_id** | VARCHAR(36) NULL FK → generation_records.id | `ondelete=SET NULL`（migration 007）；仅 `generation_mode='llm_direct'` 的记录有非 NULL 值，回链触发本次 fallback 的源 RAG 记录。源记录被 admin 删除时仅清空 FK，保留 `llm_direct` 子记录及其反馈数据，详 §3.17.5。**FEAT-12 / v2.24 起，本列同时是 `improvement_reports` 的配对锚点**——`POST /improvement-reports` 要求 `rag_record_id == llm_direct_record.parent_record_id`（端点层校验，DB 不加 CHECK）；详 §3.18.2 / §4.1.4。注意：`improvement_reports` 表对 `generation_records.id` 的两个 FK 是 `ondelete=RESTRICT`，与本列 `SET NULL` 行为相反——存在 `improvement_reports` 引用时禁止删除 source / child record |
 
 索引：`intent_hash`（历史意图库查询）、`user_id`（用户历史查询）
 
@@ -2069,6 +2183,55 @@ async def _record_gate_event(db, user_id, original_intent, gate_error_type):
 **只在 `/generate` 与 `/generate/preview` 端点做**，`/generate/render` 不参与（renderer 自身不抛闸异常，且 record 在 preview 阶段已写）。**不改 pipeline 闸判断本身**——本 PR 是闸事件持久化的基础设施扩展，对确定性契约（§1.1）无影响。
 
 **与正常路径 record 的区分**：`gate_error_type IS NOT NULL` 即闸触发记录；`template_id` / `output_code` / `confidence` 均 NULL。`/template-issues` 端点 SQL where 加 `template_id IS NOT NULL` 自然排除这些行。
+
+#### 4.1.4 improvement_reports（用户对比报告表，FEAT-12 / v2.24）
+
+migration 008 新建独立表 + `report_status_enum` PG ENUM 类型；与 `generation_records.feedback_*` 4 列**互相独立**——L3 差评和对比报告是两条不同颗粒度的质量信号采集通道（详 §3.18.6）。
+
+**报告分类枚举（`ReportCategoryEnum`，slug ↔ 中文 label 双向对照）**：
+
+| slug | 中文 label | 含义 |
+|---|---|---|
+| `wrong_template` | 模板选错 | RAG 选中的模板与意图不符（语义错配） |
+| `wrong_params` | 参数映射错 | 模板正确但参数填充错误（信号名 / 状态列表 / 表达式映射错） |
+| `poor_style` | 代码风格差 | 模板正确、参数正确，但生成风格不符合团队规范（命名 / 缩进 / 注释） |
+| `other` | 其他 | 上述 3 类无法归纳的差异 |
+
+**状态枚举（PG ENUM `report_status_enum`，与 `ReportStatusEnum` Python 枚举一一对应）**：
+
+| 值 | 含义 | 合法跳转（详 §3.18.4） |
+|---|---|---|
+| `pending` | 用户提交后默认状态，等待 admin 处理 | → `in_review`（admin 打开详情页时前端自动 PATCH） |
+| `in_review` | admin 已查阅，处理中 | → `resolved`（admin 写完 admin_note 后「标记已处理」） |
+| `resolved` | admin 已处理完毕（无论是否产生模板库改进） | 终止态（不允许倒退） |
+
+**`improvement_reports` 表结构**：
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | UUID | PK | 报告主键 |
+| reporter_id | UUID | NOT NULL, FK → users.id ondelete=RESTRICT | 提交用户 ID（提交后用户被删除时禁止级联——保留报告作为审计） |
+| rag_record_id | VARCHAR(36) | NOT NULL, FK → generation_records.id ondelete=RESTRICT | RAG 源记录 ID；与 `llm_direct_record.parent_record_id` 配对 |
+| llm_direct_record_id | VARCHAR(36) | NOT NULL, FK → generation_records.id ondelete=RESTRICT | LLM 直接生成子记录 ID（该记录 `generation_mode='llm_direct'`） |
+| report_categories | JSONB | NULL | 用户勾选的 `ReportCategoryEnum` slug 数组；全空合法（前端可不勾任何分类） |
+| reporter_note | TEXT | NULL | 用户自由文本描述差异；全空合法；无 DB 层长度 CHECK |
+| status | report_status_enum | NOT NULL DEFAULT 'pending' | 三态状态机；非法跳转校验在端点层（详 §3.18.4） |
+| admin_note | TEXT | NULL | admin 审阅时填写的处理说明；状态变 `resolved` 时建议填写但不强制 |
+| reviewed_by | UUID | NULL, FK → users.id ondelete=SET NULL | 最后一次 PATCH 该报告的 admin id（多 admin 进入 in_review 时按 last-write-wins 覆盖） |
+| reviewed_at | TIMESTAMPTZ | NULL | 最后一次 PATCH 时间（UTC） |
+| created_at | TIMESTAMPTZ | NOT NULL DEFAULT now() | 提交时间 |
+
+**约束**：
+- `UNIQUE(rag_record_id, llm_direct_record_id)`：同一对生成记录只允许一份报告；冲突时 `POST` 端点返 409 `duplicate_report` + `detail.existing_report_id`
+- **不**强制要求 `llm_direct_record.parent_record_id == rag_record_id`（端点层校验，DB 层不加 CHECK）；理由：DB CHECK 跨行依赖性能差且部署期 migration 风险高
+
+**索引**：
+- `idx_improvement_reports_status_created`（status, created_at DESC）：列表页过滤 + 默认排序
+- `idx_improvement_reports_reporter_created`（reporter_id, created_at DESC）：用户视角"我提交的报告"（FEAT-12 不实现该端点，但索引提前布好留 FEAT-13）
+
+**与 `generation_records` 的关系**：
+- 上游：消费 `parent_record_id`（v2.23 / FEAT-11 引入）作为成对锚点；如 RAG 源记录被 admin 删除，由于 FK `ondelete=RESTRICT`，DB 层拒绝删除并报错——admin 需先删除对应 `improvement_reports` 才能删 source record（FEAT-12 不在 UI 暴露该清理路径，admin 走 SQL 直执）。`llm_direct` 子记录侧同样 RESTRICT
+- 与 `feedback_*` 4 列正交：同一对 (RAG, llm_direct) 既可有 L3 差评（写 `generation_records.feedback_*`）也可有对比报告（写 `improvement_reports`），两条数据互不影响
 
 **users（用户表）**
 
@@ -2269,6 +2432,11 @@ WHERE is_default = true;
 | GET | `/api/v1/admin/analytics/template-issues` | L4 差评模板 top-N：`[{template_id, total_count, bad_count, bad_rate}]`，按 `bad_rate DESC, bad_count DESC` 排序；`limit` ∈ [1, 100] 默认 10 | 库管理员+ |
 | GET | `/api/v1/admin/analytics/intent-confusion` | L4 意图-模板混淆：`[{intent, expected_template, actual_template, code_type, count}]`；数据源仅 `feedback_rating=3 AND template_id != rag_top3[0].template_id`；`code_type` 由后端 join `templates` 表填好供前端复制 corpus 条目 | 库管理员+ |
 | GET | `/api/v1/admin/analytics/no-match-rate` | L4 按 UTC 日界聚合：`[{date, total, no_match_count, no_match_rate}]`；不补零行；依赖 `gate_error_type='no_matching_template'` 数据源 | 库管理员+ |
+| POST | `/api/v1/improvement-reports` | **FEAT-12 / v2.24** 用户对比报告提交：入参 `{rag_record_id, llm_direct_record_id, report_categories?, reporter_note?}`；categories/note 全空合法；写 `improvement_reports.status='pending'`；FK 缺失 422 `invalid_record_ref`；UNIQUE 冲突 409 `duplicate_report` + `detail.existing_report_id`；未登录 401（详 §3.18） | 登录用户+ |
+| GET | `/api/v1/improvement-reports/check` | **FEAT-12** 轻查询端点：查询 `(rag_record_id, llm_direct_record_id)` 对是否已有报告；契约 200 `{exists: bool, report_id?: UUID}` 单形态（前端按 `exists` bool 分支按钮 disabled 态）；鉴权与 POST 同级，不限 admin | 登录用户+ |
+| GET | `/api/v1/admin/improvement-reports` | **FEAT-12** admin 列表：分页 + 支持 `status`（单选）+ `categories`（多选）过滤，默认 `created_at DESC`；返回 join 摘要（reporter username / RAG template_name / categories Tag / created_at）；非 admin 403 | 库管理员+ |
+| GET | `/api/v1/admin/improvement-reports/{id}` | **FEAT-12** admin 详情：返两条 `generation_record` 完整对比字段（`output_code` / `template_id` / `template_name`（join templates 取 name）/ `params_used` / `original_intent` / `generation_mode` / `cache_hit`）+ 用户提交字段（categories / reporter_note）+ 当前 status / admin_note / reviewed_by / reviewed_at；非 admin 403 | 库管理员+ |
+| PATCH | `/api/v1/admin/improvement-reports/{id}` | **FEAT-12** admin 状态机更新：可单独或同时更新 `status` 与 `admin_note`；三态状态机（pending → in_review → resolved）校验在端点层；非法跳转返 422 `illegal_status_transition`（`pending → resolved` 跳过 in_review、`resolved → pending` / `resolved → in_review` / `in_review → pending` 倒退均拒绝）；同时写 `reviewed_by = current_user.id` + `reviewed_at = now()`；非 admin 403 | 库管理员+ |
 
 ### 5.2 生成接口请求/响应示例
 
@@ -2475,6 +2643,7 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │       ├── contributions.py             # 贡献者端点 + 管理员审核端点（合并单文件）
 │   │   │       ├── notifications.py             # 站内通知端点
 │   │   │       ├── intent_builder.py            # 场景构建器端点
+│   │   │       ├── improvement_reports.py      # FEAT-12 用户对比报告 4+1 路由（POST + check + GET 列表/详情 + PATCH）
 │   │   │       └── auth.py                      # 认证端点
 │   │   ├── core/
 │   │   │   ├── config.py                 # 环境配置（从环境变量读取）
@@ -2490,6 +2659,7 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   ├── llm_config.py             # LLM 配置模型
 │   │   │   ├── contribution.py           # 模板贡献模型
 │   │   │   ├── notification.py           # 站内通知模型
+│   │   │   ├── improvement_report.py     # FEAT-12 用户对比报告 ORM（report_categories JSONB + status PG ENUM）
 │   │   │   └── audit_log.py              # 管理员操作审计日志模型
 │   │   ├── schemas/
 │   │   │   ├── generate.py               # 生成请求/响应 Schema
@@ -2498,6 +2668,7 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   ├── user.py                   # 用户 Schema
 │   │   │   ├── llm_config.py             # LLM 配置请求/响应 Schema（新增）
 │   │   │   ├── contribution.py           # 贡献请求/响应 Schema
+│   │   │   ├── improvement_report.py     # FEAT-12 ImprovementReportCreate / AdminListItem / Detail / Patch + ReportCategoryEnum
 │   │   │   └── notification.py           # 通知响应 Schema
 │   │   ├── services/
 │   │   │   │                             # ── 三层服务子包结构 ──
@@ -2580,7 +2751,8 @@ DV_ACODE_GEN_PLATFORM/
 │   │       ├── 004_unique_default_llm.py      # llm_configs.is_default 部分唯一索引
 │   │       ├── 005_template_corpus_cases.py   # template_corpus_cases 表（FEAT-4 回归语料）
 │   │       ├── 006_feedback_columns.py        # generation_records 加 6 列（L3 反馈 / generation_mode / gate_error_type）
-│   │       └── 007_llm_direct_parent_fk.py    # generation_records.parent_record_id FK（FEAT-11 Stage 2）
+│   │       ├── 007_llm_direct_parent_fk.py    # generation_records.parent_record_id FK（FEAT-11 Stage 2）
+│   │       └── 008_improvement_reports.py     # FEAT-12：report_status_enum 创建 + improvement_reports 表 + UNIQUE(rag_record_id, llm_direct_record_id) + FK → generation_records.id ondelete=RESTRICT
 │   ├── tests/
 │   ├── Dockerfile
 │   └── requirements.txt
@@ -2607,6 +2779,8 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   └── Admin/
 │   │   │       ├── Templates/            # 管理员模板管理
 │   │   │       ├── ContributionReview/   # 贡献审核队列
+│   │   │       ├── AdminImprovementReportsPage.tsx       # FEAT-12 admin 列表页（Table + Filter Bar）
+│   │   │       ├── AdminImprovementReportDetailPage.tsx  # FEAT-12 admin 详情页（三列 Card + mount 自动 PATCH in_review）
 │   │   │       └── LLMConfig/            # LLM 模型配置管理（新增）
 │   │   │           ├── index.tsx         # 模型列表（卡片形式）
 │   │   │           └── TestPanel.tsx     # 三类模型测试面板
@@ -2614,6 +2788,7 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   ├── client.ts                 # Axios API 调用封装
 │   │   │   ├── contributionApi.ts        # 贡献 API 封装
 │   │   │   ├── intentBuilderApi.ts       # 场景构建器 API 封装
+│   │   │   ├── improvementReports.ts     # FEAT-12 对比报告 4 条 axios 封装（user POST + check + admin 列表/详情/PATCH）
 │   │   │   └── llmConfigApi.ts           # LLM 配置管理 API 封装（新增）
 │   │   ├── utils/
 │   │   │   ├── validateParam.ts          # 参数表单基础校验（前端）
