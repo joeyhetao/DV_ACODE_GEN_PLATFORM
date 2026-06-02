@@ -7,7 +7,6 @@ import {
   improvementReportsApi,
   ImprovementReportDetail,
   ReportCategory,
-  ReportStatus,
   STATUS_COLORS,
   STATUS_LABELS,
   CATEGORY_LABELS,
