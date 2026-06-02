@@ -1,7 +1,7 @@
 # 平台功能测试手册
 
 > 面向：QA、产品验证、上线前回归。每个用例 = 操作步骤 + 期望效果。
-> 平台版本：PRD v3.0。后端基于 5 道闸契约（off-topic / code_type_mismatch / no_matching_template / under_specified / empty_retrieval）。
+> 平台版本：PRD v3.3。后端基于 5 道闸契约（off-topic / code_type_mismatch / no_matching_template / under_specified / empty_retrieval）+ FEAT-11 Stage 2 双模生成（`generation_mode ∈ {rag, llm_direct}`，详 §2.9 高置信自动渲染、§4.8 LLM 直接生成兜底）。
 
 ---
 
@@ -374,6 +374,55 @@ docker compose exec backend python -c "from app.core.config import get_settings;
 
 **关闸单测**：`backend/tests/test_pipeline_preview_render.py` 中以 `step1_reranker_gate_enabled` 开关 + `selected_score < threshold` / `selected_score > threshold` 三组用例覆盖三档行为。
 
+### §2.9 高置信 RAG 自动渲染（FEAT-11 A，正向路径）
+
+> 本节是 §2 中**唯一的非闸场景**——它不是错误路径，而是 FEAT-11 Stage 2 A 子项落地的"高置信免确认"短路。把它放在 §2 是因为触发条件与 A8 / A9 强相关；走的不是闸路径，而是 `quick_render=True` 旗标。
+
+**背景**：当 `pipeline_preview` 同时满足以下四条件时，`PreviewResult.quick_render=True`，前端 `GeneratePage` 跳过 ConfirmationPanel 直接调 `/render` 一步出代码。任一条件不达标即保留默认 ConfirmationPanel 流程（无回归）。
+
+| # | 条件 | 来源 / 控制 |
+|---|---|---|
+| 1 | `confidence_source == "llm_step1"` | pipeline.py Step 5a，LLM 主动选中（未走 rag_fallback/keyword_supplement/intent_cache） |
+| 2 | `step1_verify_enabled == True` AND A8 二次验证 `verify_ok=True` | `STEP1_VERIFY_ENABLED` env，A8 disabled 时不达标 |
+| 3 | `selected_score >= reranker_min_score_threshold`（默认 0.30） | A9 共用同一份 selected_score |
+| 4 | 所有 required param sources ∈ `{llm, regex, signal_list, default}` | `_map_params_with_source` 输出，不含 `semantic_fallback` / `placeholder` |
+
+**正向验证步骤**：
+
+1. **前置**：开启 A8（`STEP1_VERIFY_ENABLED=true`），重启 backend：
+   ```bash
+   docker compose restart backend
+   ```
+2. 跑一条已知能高置信命中模板的意图，例如 §1.3 **握手数据稳定断言**：
+   - 输入：`AXI 写通道 awvalid 拉高后 awaddr 必须保持稳定到 awready`
+   - 信号表：awvalid(role=valid)、awready(role=ready)、awaddr(role=data)
+   - code_type：SVA 断言
+3. 点「分析意图」 → **预期前端不显示 ConfirmationPanel**，直接跳到 result 阶段展示代码
+4. 后端日志期望（§0.5）连续两段：
+   ```
+   [Timing] stage=step1_verify ms=<n> ok=True
+   [Pipeline] high_confidence_rag: tid=sva_handshake_stable_v1 score=<x.xxxx> → quick_render=True
+   ```
+5. SQL 验证写入：
+   ```sql
+   SELECT generation_mode, cache_hit, template_id, confidence
+     FROM generation_records ORDER BY created_at DESC LIMIT 1;
+   ```
+   期望：`generation_mode='rag'`, `template_id='sva_handshake_stable_v1'`, `confidence` ≥ 阈值
+
+**反向验证（任一条件失败应回到 ConfirmationPanel）**：
+
+| 故意失败的条件 | 复测方法 | 期望 |
+|---|---|---|
+| 条件 1（confidence_source != llm_step1） | 让 LLM step1 返 `none`（用一条无库内匹配的"边界场景"意图） | 走 rag_fallback，前端展示 ConfirmationPanel + 顶部低置信提示条 |
+| 条件 2（A8 verify 失败） | 用 §11 confusion corpus 任一条样本（注入 confusion_template 到 RAG top-1，A8 应答 no） | `confidence_source` 降级 rag_fallback，前端展示 ConfirmationPanel；日志含 `[Pipeline] step1 verify=no` |
+| 条件 3（selected_score < 阈值） | 把 `RERANKER_MIN_SCORE_THRESHOLD` 临时调高（如 0.95），重启 backend，跑同一条意图 | 日志 `[Pipeline] high_confidence_rag: ... → quick_render=False`，前端展示 ConfirmationPanel |
+| 条件 4（含 semantic_fallback / placeholder 源） | 跑一条少填一个 required 参数的意图（如 §1.9 转换覆盖率不填 state_list） | 通常 under_specified 闸已先触发；若 gate 关闭则保留 ConfirmationPanel + 红色占位徽标 |
+
+**关闸单测**：`backend/tests/test_pipeline_preview_render.py` 中以"四条件齐绿 → quick_render=True"以及四条件各自单独 disqualify（保持其余三条件齐绿、单独翻转一条）的回归用例覆盖。
+
+**与 §3.1 intent_cache 命中的区别**：两者都让 `quick_render=True`，前端代码路径完全一致；差异仅在 `confidence_source` 字段（`intent_cache` vs `llm_step1`）与对应的置信徽标颜色。intent_cache 命中是"历史已生成过"的二次复用，A 子项是"首次但高置信"的免确认。
+
 ---
 
 ## 3. 缓存层验证
@@ -487,6 +536,134 @@ curl -s -w "HTTP %{http_code}\n" \
 ```
 
 期望：HTTP **410 Gone** + `detail.type="endpoint_deprecated"`。
+
+### §4.8 LLM 直接生成兜底（FEAT-11 Stage 2 B 子项）
+
+> 本节是 §4 中**唯一与 IntentBuilder 无关**的子节——它放在 §4 是因为同属"用户对 RAG 结果不满意时的自助救济"主题（IntentBuilder 走 RAG 精修，LLM 直接生成走非确定性 bypass）。详 ARCHITECTURE §3.17。
+
+`POST /api/v1/generate/llm-fallback` 接收 `{generation_record_id}`，载入源记录的 `original_intent + code_type + signals + clk + rst`，调 `LLMClient.generate_code_freeform` 自由生成 SystemVerilog 代码（**不经 Jinja2 模板渲染**），写新 `GenerationRecord(generation_mode='llm_direct', parent_record_id=source.id)` 返回。
+
+#### §4.8.1 Happy path（前端按钮触发）
+
+**前置**：跑一次 §1 任意成功生成 → 停在 result 阶段；后端日志（§0.5）已显示 `generation_mode="rag"` 写入。
+
+1. 代码卡片下方应出现 secondary Button「对生成结果不满意？尝试 LLM 直接生成」（紧邻 FeedbackBar）
+2. 点击按钮 → 按钮进入 loading 状态（spinner），上方文案"RAG 结果不符合预期？可以让 LLM 直接生成（结果是非确定性的，每次可能不同）。"
+3. 期望（5-30s 取决于 LLM 配置）：
+   - 代码区被替换为新代码（可能与原 `rag` 结果不同）
+   - 代码卡片头部出现橙色标签 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>`
+   - **fallback 按钮消失**（因为 `state.result.generation_mode === 'llm_direct'` 不再展示按钮）
+   - FeedbackBar 重新激活（`feedbackSubmitted` 归零）允许独立评分 `llm_direct` 结果
+   - 顶部 `message.success('已切换为 LLM 直接生成')`
+4. 后端日志期望：
+   ```
+   POST /api/v1/generate/llm-fallback HTTP/1.1" 200
+   [Timing] llm=<name> ms=<n> reasoning_tokens=0 thinking=off  (generate_code_freeform)
+   ```
+5. SQL 验证：
+   ```sql
+   SELECT id, generation_mode, parent_record_id, template_id, output_code IS NULL AS empty_code
+     FROM generation_records ORDER BY created_at DESC LIMIT 2;
+   ```
+   期望：最新一行 `generation_mode='llm_direct'`, `parent_record_id` = 上一条 `rag` 记录的 id, `template_id IS NULL`, `empty_code = false`
+
+#### §4.8.2 cache hit（同一输入二次触发）
+
+1. 完成 §4.8.1 后停在 result 页（已是 `llm_direct`）
+2. 重新跑一次 §1 同一意图（必须**清 intent_cache** 让 preview 跑完整流程，避免短路）：
+   ```bash
+   docker compose exec redis redis-cli --scan --pattern 'intent_cache:*' \
+     | xargs -r docker compose exec -T redis redis-cli DEL
+   ```
+3. 到 result 阶段（新的 `rag` 记录）→ 点 fallback 按钮
+4. 期望（< 200ms）：响应中 `cache_hit: true`，代码与第一次完全一致（gen_llm 缓存命中）
+5. 后端日志期望：**不**出现 `[Timing] llm=...` 段（因为 cache hit 跳过 LLM 调用）
+6. Redis 验证 cache key 存在：
+   ```bash
+   docker compose exec redis redis-cli --scan --pattern 'gen_llm:*' | head -5
+   docker compose exec redis redis-cli TTL <key>
+   ```
+   期望：TTL 接近 604800（7d）
+
+#### §4.8.3 错误场景（API 直接验证）
+
+```bash
+TOKEN=<jwt>
+# 1) record 不存在 → 404
+curl -s -X POST http://localhost/api/v1/generate/llm-fallback \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"generation_record_id":"00000000-0000-0000-0000-000000000000"}' -w "\nHTTP %{http_code}\n"
+# 期望：HTTP 404，detail 是纯字符串 "源生成记录不存在"（不带 type 字段；
+#       这是 FastAPI 默认 HTTPException(detail=str) 形态，与 422/500 的结构化
+#       detail dict 不同——前端只看 HTTP 状态码即可识别 404）
+
+# 2) 源 record 已是 llm_direct → 422 chained_not_allowed
+LLM_DIRECT_ID=$(docker compose exec -T postgres psql -U postgres -d ic_codegen -t -c \
+  "SELECT id FROM generation_records WHERE generation_mode='llm_direct' ORDER BY created_at DESC LIMIT 1" | tr -d ' ')
+curl -s -X POST http://localhost/api/v1/generate/llm-fallback \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d "{\"generation_record_id\":\"$LLM_DIRECT_ID\"}" -w "\nHTTP %{http_code}\n"
+# 期望：HTTP 422，detail.type="llm_direct_chained_not_allowed"，
+#       message 含"已是 LLM 直接生成结果，不支持链式兜底"
+
+# 3) llm_direct_no_code（HTTP 422）+ llm_direct_internal_error（HTTP 422 或 500）
+#    无法在生产环境稳定复现（依赖 LLM 输出形态 / 基础设施故障），由
+#    backend/tests/test_llm_direct_generation.py 与 test_llm_freeform_client.py
+#    的 mock 单测覆盖：
+#    - test_llm_freeform_client.py::test_prose_only_raises_no_sv_code_block
+#    - test_llm_direct_generation.py::test_endpoint_llm_no_code_returns_422
+#      （ValueError("no_sv_code_block") → 422 llm_direct_no_code）
+#    - test_llm_direct_generation.py::test_endpoint_llm_value_error_returns_422
+#      （非 no_sv_code_block 的 ValueError → 422 llm_direct_internal_error，
+#       前端可建议用户重试）
+#    - test_llm_direct_generation.py::test_endpoint_llm_exception_returns_500
+#      （非 ValueError 的 Exception → 500 llm_direct_internal_error，前端
+#       toast 含 HTTP 500，需 SRE 排查；同 type 但 HTTP 状态不同）
+#    本地跑：docker compose exec backend pytest tests/test_llm_direct_generation.py tests/test_llm_freeform_client.py -v
+```
+
+#### §4.8.4 analytics filter 手测
+
+`/admin/analytics/*` 4 个端点全部新增 optional `generation_mode` 参数。完成 §4.8.1 + §12（提交 L3 反馈给两个 record）后：
+
+```bash
+ADMIN_TOKEN=$(curl -s -X POST http://localhost/api/v1/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"username":"admin","password":"<pw>"}' | jq -r .access_token)
+
+# 1) 仅 rag 桶
+curl -s "http://localhost/api/v1/admin/analytics/feedback-summary?days=7&generation_mode=rag" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq
+
+# 2) 仅 llm_direct 桶
+curl -s "http://localhost/api/v1/admin/analytics/feedback-summary?days=7&generation_mode=llm_direct" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq
+# 期望：total_generations / total_feedbacks 都 ≥ 1，仅包含 llm_direct 路径
+
+# 3) llm_direct 桶 + template-issues（template_id 全为 NULL，归入 __llm_direct__ 桶）
+curl -s "http://localhost/api/v1/admin/analytics/template-issues?days=7&generation_mode=llm_direct&limit=10" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq
+# 期望：返回数组每行 template_id == "__llm_direct__"（FEAT-11 约定的桶 key）
+
+# 4) llm_direct 桶 + no-match-rate（恒返 no_match_rate=0 行）
+curl -s "http://localhost/api/v1/admin/analytics/no-match-rate?days=7&generation_mode=llm_direct" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq
+# 期望：每行 no_match_count=0, no_match_rate=0.0；这是设计内行为
+# （llm_direct 路径绕过五闸，gate_error_type 恒 NULL）
+
+# 5) omit 参数 → 全量（rag + llm_direct 都进桶）
+curl -s "http://localhost/api/v1/admin/analytics/feedback-summary?days=7" \
+  -H "Authorization: Bearer $ADMIN_TOKEN" | jq
+# 期望：total_generations 是 rag + llm_direct 之和
+```
+
+**非法参数验证**：
+```bash
+curl -s -w "\nHTTP %{http_code}\n" \
+  "http://localhost/api/v1/admin/analytics/feedback-summary?days=7&generation_mode=invalid" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+# 期望：HTTP 422，detail 含 "literal_error"（Pydantic Literal['rag','llm_direct'] 校验）
+```
 
 ---
 

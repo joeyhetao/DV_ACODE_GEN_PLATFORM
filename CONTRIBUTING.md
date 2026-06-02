@@ -664,4 +664,46 @@ docker compose exec frontend npm run lint
 
 ---
 
+## 14. FEAT-11 `llm_direct` 兜底路径测试 recipe
+
+FEAT-11 Stage 2 引入 `POST /api/v1/generate/llm-fallback` 兜底端点（详 ARCHITECTURE §3.17），让用户对 `rag` 结果不满意时一键触发 LLM 自由生成。该路径由两套 pytest 守护：
+
+| 测试文件 | 用途 | 是否需要活基础设施 |
+|---|---|---|
+| `backend/tests/test_llm_direct_generation.py` | 端点级集成测试：覆盖 404 / 422 链式拒绝 / 422 无围栏 / 422 internal error / cache hit / cache miss / `parent_record_id` FK 正确写入 / `generation_mode='llm_direct'` 写入 / `/admin/analytics/*` 4 端点的 `generation_mode` filter 边界 | 否（mock DB / Redis / LLM；mock LLM 用 `AsyncMock` 桩 `generate_code_freeform`） |
+| `backend/tests/test_llm_freeform_client.py` | LLM 客户端单测：围栏 lang 兼容（` ```systemverilog ` / ` ```sv ` / ` ```verilog ` / 裸 ` ``` `）+ prose-only 响应抛 `ValueError("no_sv_code_block")` + Anthropic 与 OpenAI-compat 两实现并行 + thinking-disable 参数正确传递 | 否（mock OpenAI SDK / Anthropic SDK 响应；**不调真实 LLM**，无需 `llm_configs` 表） |
+
+### 14.1 跑法
+
+```bash
+# 在 backend 容器内（推荐，环境一致）
+docker compose exec backend pytest tests/test_llm_direct_generation.py -v
+docker compose exec backend pytest tests/test_llm_freeform_client.py -v
+
+# 一次跑两个文件
+docker compose exec backend pytest tests/test_llm_direct_generation.py tests/test_llm_freeform_client.py -v
+
+# 跑单一用例（按 pytest -k 过滤）
+docker compose exec backend pytest tests/test_llm_direct_generation.py -k "chained_not_allowed" -v
+docker compose exec backend pytest tests/test_llm_freeform_client.py -k "sv_lang_fence" -v
+
+# 主机原生（如果 venv 已激活并装好依赖）
+cd backend && pytest tests/test_llm_direct_generation.py tests/test_llm_freeform_client.py -v
+```
+
+### 14.2 不依赖 `llm_configs` 表的原因
+
+`test_llm_freeform_client.py` 不调真实 LLM——它把 `AsyncOpenAI.chat.completions.create` 与 `Anthropic.messages.create` 都 patch 成桩响应，直接测客户端代码对响应的解析逻辑。因此**无需** seed `llm_configs` 表也**无需** GPU/CPU embedding_service 在线。这让该套件可以在 CI 的最小环境（仅 Python + pytest）下运行，与 `test_offtopic_corpus_mocked.py` / `test_template_confusion_corpus_mocked.py` 处于同一档。
+
+`test_llm_direct_generation.py` 同样 mock 了 LLM、DB session 与 Redis，仅依赖 Pydantic 与 SQLAlchemy 的内存行为，不需要 PG / Redis / Qdrant 容器在线。
+
+### 14.3 新增用例的约定
+
+- 围栏 lang 新增（如未来想接受 ` ```sva ` 或 ` ```sva-system ` 等变体）→ 改 `services/llm/base.py::extract_sv_code_block` 的正则 + 同步在 `test_llm_freeform_client.py` 加正向用例 + 反向用例（不在允许列表的 lang 应仍被拒）
+- 新增 422 错误类型（未来如增 `llm_direct_token_quota_exceeded`）→ 在 `api/v1/generate.py::generate_llm_fallback` 的 try/except 追加分支 + 在 `test_llm_direct_generation.py` 加端点测 + 在 ARCHITECTURE.md §3.17.2 错误表追加一行
+- cache key canonical 字段变化（如未来要把 `protocol` 也纳入 hash）→ 改 `services/core/cache.py::_canonical_llm_direct_signature` + 在 `test_llm_direct_generation.py` 加"signal 顺序无关 / protocol 变化时 key 不同"两条用例
+- analytics filter 新增枚举值（如未来加 `generation_mode='hybrid'`）→ 改 `api/v1/admin.py` 的 `Query` Literal 类型 + 4 个端点的 SQL 分支 + `test_llm_direct_generation.py` 的 analytics filter 用例补充
+
+---
+
 > 如有流程疑问，请在 GitHub Issues 中提出，或联系项目维护者。

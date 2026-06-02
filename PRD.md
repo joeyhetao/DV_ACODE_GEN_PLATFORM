@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 产品需求文档（PRD）
 
-**版本**：v3.2  
+**版本**：v3.3  
 **状态**：起草中  
-**日期**：2026-05-29  
+**日期**：2026-06-02  
 **变更**：
 - v1.0 → v2.0：输入方式由"自然语言+Excel信号表"调整为"双表格结构化输入"（SVA需求表 + 功能覆盖率需求表）
 - v2.0 → v2.1：新增模板贡献与审核机制，处理 RAG 置信度 < 50% 时模板缺口的知识沉淀闭环
@@ -32,6 +32,15 @@
   - §3.10 新增 4 个 KPI 端点（`/admin/analytics/{feedback-summary, template-issues, intent-confusion, no-match-rate}`），全部要求 `lib_admin` / `super_admin`，`days` 窗 ∈ [1, 90] 默认 7；`intent-confusion` 仅从 `feedback_rating=3 AND template_id != rag_top3[0].template_id` 聚合（视 RAG top-1 为期望模板），`no-match-rate` 按 UTC 日界统计 `gate_error_type='no_matching_template'`
   - §3.10 新建 `AdminAnalyticsPage`（`/admin/analytics`）：KPI 卡片行 + 7 天 NoMatch 趋势折线图（`@ant-design/charts` Line） + 差评模板 top-10 表 + intent confusion 表（每行含「复制为 corpus 条目」按钮，生成 `template_selection_corpus.yaml` 兼容 YAML 块写入剪贴板，闭环回归测试语料）
   - Stage 范围（明确不做）：不发送邮件/Webhook 推送、不实现批量任务行级反馈、不允许用户修改已提交反馈、不实现 CSV 导出、不做 Redis 缓存、不做差评率突增告警（留待 L5）
+- v3.2 → v3.3：**FEAT-11 Stage 2 双模生成（rag 默认 + llm_direct 兜底）落地为 in-scope 功能**——
+  - §6.1 单条生成主流程新增 **A 子项：高置信 RAG 自动渲染**——当 preview 同时满足 `confidence_source==llm_step1` + `step1_verify_enabled` 且 verify 通过 + `selected_score >= reranker_min_score_threshold` + 所有 required 参数源 ∈ `{llm, regex, signal_list, default}` 四条件时，`pipeline_preview` 把 `quick_render=True` 与 intent_cache 命中路径走同一旗标，前端 `GeneratePage` 跳过 ConfirmationPanel 直接调 `/render` 并展示代码。任一条件未达标仍走原确认面板（无回归）
+  - §6.1 result 阶段新增 **B 子项：LLM 直接生成兜底按钮**——`generation_mode === 'rag'` 时显示「对生成结果不满意？尝试 LLM 直接生成」按钮（已为 `llm_direct` 的记录不再展示，禁止链式 fallback）。点击 → `POST /api/v1/generate/llm-fallback {generation_record_id}` → 后端载入源记录的 intent / code_type / signals / clk / rst → 调 `LLMClient.generate_code_freeform` → 返回 `{code, generation_record_id, generation_mode: "llm_direct"}` → 前端替换代码区 + `feedbackSubmitted` 归零，让用户对 `llm_direct` 结果独立评分
+  - §6.1 新增 **非确定性标签契约**：`llm_direct` 记录的代码卡片头部强制渲染 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>`；同一输入再次触发 `llm-fallback` 可能产出不同代码——这是设计内行为，与 `rag` 路径的"字节级确定性"形成对照。原"系统决定产出代码时必为确定"契约（§4.1）**收窄为仅对 `rag` 路径**；`llm_direct` 路径仅在 `gen_llm:*` Redis 7d TTL 缓存命中时呈现"伪确定性"，TTL 过期或切换 LLM 默认配置后即重新生成
+  - §6.1 错误模式表新增 `llm_direct_*` 三类错误：`llm_direct_chained_not_allowed`（源记录已是 `llm_direct`→422）/ `llm_direct_no_code`（LLM 返回无围栏代码→422）/ `llm_direct_internal_error`（LLM 调用 / DB 写入失败→422，detail 不泄漏内部 repr）。三类均不带 `redirect_to`——前端显示 `message.error` 文案后停留在 result 页让用户重试或换 LLM
+  - §3.9 用户反馈机制扩展：FeedbackBar 现在对 `rag` 与 `llm_direct` 两种 record 都可用，后端写 4 个 feedback 列不再回填 `generation_mode`（因为 `llm_direct` 子记录在写入时已经显式标 `'llm_direct'`，回填只发生在 v3.2 前的老 `'rag' or NULL` 行为，本版本保留 NULL→`'rag'` 防穿透但不再触碰显式值）
+  - §3.10 管理员分析仪表盘 4 个 KPI 端点全部新增 optional `generation_mode` query 参数（值 `rag` / `llm_direct`，omit = 全量）：`feedback-summary` 按模式分桶；`template-issues` 在 `generation_mode=llm_direct` 时把 `template_id IS NULL` 行归入 `__llm_direct__` 桶不再被默认 `IS NOT NULL` filter 排除；`intent-confusion` 与 `no-match-rate` 同样支持 filter
+  - 数据库：migration 007 `generation_records` 新增 `parent_record_id VARCHAR(36) NULLABLE FK→generation_records.id ondelete=SET NULL` 列，让 `llm_direct` 子记录回链触发本次 fallback 的源 RAG 记录；源记录被删除（admin 操作）仅清空 FK，保留 `llm_direct` 子记录与其反馈数据
+  - Stage 范围（明确不做，留待 Stage 3）：批量任务（Celery）不支持 `llm_direct` 模式；L4 仪表盘除 `generation_mode` 过滤参数外暂不做"按模式拆分的图表/趋势"；用户不可在没有源 RAG 记录前提下"冷启动"直接 `llm_direct`；管理员不可从 Admin UI 重触发 `llm_direct`；贡献向导不支持 `llm_direct` 路径；不为 `llm_direct` 结果发邮件/Webhook 推送；不做 `llm_direct` analytics 的 CSV 导出
 
 ---
 
@@ -583,7 +592,7 @@ Modal 内还有可选 `comment` 文本框（≤ 2048 字符），允许用户描
 | 权限 | JWT 登录用户；普通用户只能给**自己**的 `generation_record` 评分；`lib_admin` / `super_admin` 可补评他人记录（兜底审核场景） |
 | 成功响应 | HTTP 204 No Content |
 | 失败响应 | 422（rating 非 1/2/3、rating=3 但 reason_tags 空）/ 403（user_id 不匹配且非 admin）/ 404（generation_record 不存在） |
-| 写入字段 | `generation_records.feedback_rating` / `feedback_reason_tags`（JSONB 数组）/ `feedback_comment` / `feedback_at`（UTC 时间）；若原记录 `generation_mode` 为空则回填 `'rag'` |
+| 写入字段 | `generation_records.feedback_rating` / `feedback_reason_tags`（JSONB 数组）/ `feedback_comment` / `feedback_at`（UTC 时间）；若原记录 `generation_mode` 为 NULL 则回填 `'rag'`（防 batch 老记录穿透）；显式 `'rag'` / `'llm_direct'` 值**不**回写。**适用范围（v3.3 / FEAT-11 起）**：FeedbackBar 对 `rag` 与 `llm_direct` 两种 record 都可用——前端按 `generation_record_id` 独立 lock，触发一次 `llm-fallback` 后产生新 record，`feedbackSubmitted` 归零让用户重新评分 `llm_direct` 结果 |
 
 **Stage 范围（明确不做）**：
 - 不做反馈数据的邮件 / Webhook 推送（仅入库）
@@ -600,6 +609,8 @@ Modal 内还有可选 `comment` 文本框（≤ 2048 字符），允许用户描
 #### 3.10.1 4 个 KPI 端点
 
 全部要求 `lib_admin` / `super_admin`；时间窗 `days` 默认 7、上限 90（防全表扫）。
+
+**v3.3 / FEAT-11 起**：4 个端点全部新增 optional `generation_mode` query 参数（值 `rag` / `llm_direct`，omit = 全量），用于在双模架构下隔离统计两条路径的质量信号。`template-issues` 端点在 `generation_mode=llm_direct` 时把 `template_id IS NULL` 行归入 `__llm_direct__` 桶不再被默认 `IS NOT NULL` filter 排除——LLM 直接生成的代码没有对应 template_id，这是设计内行为。
 
 | 端点 | 返回字段 | 数据源 / 聚合逻辑 |
 |---|---|---|
@@ -765,8 +776,23 @@ Modal 内还有可选 `comment` 文本框（≤ 2048 字符），允许用户描
 
 **Step C · 渲染（render）**：系统按确认后的参数渲染最终代码，存入生成历史。
 
-**短路路径（意图缓存命中）**：
+**短路路径 1（意图缓存命中）**：
 - 历史上相同意图已生成过同一模板与同一参数 → 系统直接返回缓存代码，跳过确认面板，对用户呈现为一步式
+
+**短路路径 2（高置信 RAG 自动渲染，v3.3 / FEAT-11 起）**：
+- 当 preview 同时满足以下四条件时，`pipeline_preview` 同样把 `quick_render=True` 设为 True，前端跳过确认面板直接调 `/render`：
+  1. `confidence_source == "llm_step1"`（LLM 主动选中模板，未走 rag_fallback）
+  2. `STEP1_VERIFY_ENABLED=true` 且 A8 二次验证通过（LLM 自审 yes）
+  3. 选中模板的 stage3 reranker score ≥ `RERANKER_MIN_SCORE_THRESHOLD`（默认 0.30）
+  4. 所有 required 参数的源都属于高置信源集合 `{llm, regex, signal_list, default}`（不含 `semantic_fallback` / `placeholder`）
+- 任一条件不满足即保留原 ConfirmationPanel 流程，用户可手工编辑参数后再 render（无回归）
+- 前端 `handlePreviewSuccess` 的 `quick_render` 旗标处理对"意图缓存命中"与"高置信 RAG"两种来源完全一致——前者 `confidence_source==intent_cache`、后者 `confidence_source==llm_step1`，差异仅在置信徽标颜色
+
+**LLM 直接生成兜底（result 阶段，v3.3 / FEAT-11 起）**：
+- result 阶段在代码卡片下方展示「对生成结果不满意？尝试 LLM 直接生成」secondary 按钮，**仅在 `state.result.generation_mode === 'rag'` 时显示**——已经是 `llm_direct` 的记录不再展示该按钮，禁止链式 fallback
+- 点击 → spinner → `POST /api/v1/generate/llm-fallback {generation_record_id}` → 后端载入源记录的 intent / code_type / signals / clk / rst → 调 `LLMClient.generate_code_freeform`（围栏接受 `systemverilog` / `sv` / `verilog` 三种 lang 或裸 ` ``` `）→ 返回 `{code, generation_record_id, generation_mode: "llm_direct", cache_hit}` → 前端替换代码区 + 反馈状态归零
+- 代码卡片头部强制渲染 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>` 提示用户当前结果不在确定性契约保护范围内
+- 同一输入命中 `gen_llm:{llm_config_id}:{sha256(canonical(intent+code_type+signals+clk+rst))}` 7d TTL Redis 缓存时返缓存代码（cache_hit=True）；切换默认 LLM 配置即 flush 该前缀（与 `gen:*` / `intent_cache:*` 同步清空）
 
 **软提示路径（低置信度，**非硬闸**）**：
 - 当 `confidence_source == "rag_fallback"`（LLM Step1 没主动选中、由 RAG top-1 兜底）时，确认面板顶部展示提示条与「去意图构建器精修」「贡献新模板」两个入口
@@ -795,8 +821,12 @@ Modal 内还有可选 `comment` 文本框（≤ 2048 字符），允许用户描
 | **code_type 错配** | 422 | `code_type_mismatch` | 无 | 弹"代码类型选错了"Modal 引导切换，停留生成页 |
 | **under_specified** | 422 | `under_specified` | `/intent-builder?prefill=<intent>&missing=<param_names>&template_id=<id>` | 前端读 `redirect_to` 自动 `router.push`，进入 IntentBuilder 多轮对话补足信息 |
 | **empty_retrieval** | 503 | `empty_retrieval` | 无 | 弹"系统暂不可用，请稍后或联系管理员"，停留生成页（基础设施问题，跳哪里都救不了） |
+| **llm_direct_chained_not_allowed**（v3.3） | 422 | `llm_direct_chained_not_allowed` | 无 | 用户对已是 `llm_direct` 的记录再次点 fallback 按钮（理论上前端按 `generation_mode==='rag'` 守门已阻止；保留作 API 直调防线）；前端 `message.error` 文案"已是 LLM 直接生成结果，不支持链式兜底"，停留 result 页 |
+| **llm_direct_no_code**（v3.3） | 422 | `llm_direct_no_code` | 无 | `LLMClient.generate_code_freeform` 解析失败（LLM 返纯文字无 ` ```systemverilog/sv/verilog``` ` 围栏）；前端 `message.error` "LLM 未生成可用 SV 代码块，请稍后重试或换 LLM 配置"，停留 result 页 |
+| **llm_direct_internal_error · 422 分支**（v3.3） | 422 | `llm_direct_internal_error` | 无 | 非 `no_sv_code_block` 类 `ValueError`（LLM 输出可解析但内容异常 / Pydantic 校验失败等）；`detail.message` 是固定文案不泄漏内部 repr；前端 `message.error` "LLM 直接生成失败，请稍后重试"，停留 result 页 |
+| **llm_direct_internal_error · 500 分支**（v3.3） | 500 | `llm_direct_internal_error` | 无 | `except Exception` 兜底（DB 写入失败 / 网络超时 / LLM SDK 内部错误等基础设施失败）；与 422 同名 `type`，靠 HTTP 状态区分——422 用户重试可能解决，500 需 SRE 介入；前端 `message.error` 同 422 分支，但状态码会出现在 toast 文案的"HTTP 500"段 |
 
-后端 except 链顺序固定（OffTopic → CodeTypeMismatch → UnderSpecified → EmptyRetrieval → 兜底 ValueError），不要泛化为 `except ValueError`。
+后端 except 链顺序固定（OffTopic → CodeTypeMismatch → UnderSpecified → EmptyRetrieval → 兜底 ValueError），不要泛化为 `except ValueError`。`llm_direct_*` 错误由 `POST /generate/llm-fallback` 端点独立返回，与上述 5 道闸的 except 链路无关。`llm_direct_internal_error` 同名 `type` 同时出现在 422 和 500，前端 `handleApiError` 据 HTTP 状态分流即可（不依赖 detail.type 区分）。
 
 **IntentBuilder 处理后的回流**：用户在 IntentBuilder 中通过多轮对话产出标准化 intent 后，点击「用这条意图回去生成」，前端 `router.push("/generate?prefill=<refined_intent>")` 跳回生成页，自动填入 TextArea 并触发新一轮 /preview——若仍触发 under_specified，循环（用户可继续 IntentBuilder 精修或退到贡献流）。
 
