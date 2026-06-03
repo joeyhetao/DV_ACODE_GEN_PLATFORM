@@ -1,9 +1,17 @@
 import { useState, useEffect } from 'react'
 import { Card, Table, Tag, Button, Space, Popconfirm, Select, Input, message, Modal, Form } from 'antd'
-import { SearchOutlined, EditOutlined, DeleteOutlined } from '@ant-design/icons'
+import { SearchOutlined, EditOutlined, DeleteOutlined, ArrowUpOutlined, ArrowDownOutlined } from '@ant-design/icons'
 import { templatesApi, TemplateListItem } from '../../api/templates'
+import { useAuthStore } from '../../store/authStore'
 
 const maturityColors: Record<string, string> = { draft: 'blue', stable: 'green', deprecated: 'gray' }
+
+// FEAT-13：生产门控等级配色与"开发成熟度"（maturity）配色独立，避免视觉混淆。
+const maturityLevelColors: Record<string, string> = {
+  production: 'green',
+  experimental: 'orange',
+  draft: 'blue',
+}
 
 export default function AdminTemplatesPage() {
   const [templates, setTemplates] = useState<TemplateListItem[]>([])
@@ -13,6 +21,8 @@ export default function AdminTemplatesPage() {
   const [editVisible, setEditVisible] = useState(false)
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editForm] = Form.useForm()
+  const currentUserRole = useAuthStore((s) => s.user?.role)
+  const isSuperAdmin = currentUserRole === 'super_admin'
 
   const load = async () => {
     setLoading(true)
@@ -47,18 +57,67 @@ export default function AdminTemplatesPage() {
     load()
   }
 
+  const handlePromote = async (id: string) => {
+    try {
+      await templatesApi.update(id, { maturity_level: 'production', change_note: '升级到 production' })
+      message.success('已升级到 production')
+      load()
+    } catch (e: unknown) {
+      const err = e as { response?: { data?: { detail?: string } } }
+      message.error(err?.response?.data?.detail || '升级失败')
+    }
+  }
+
+  const handleDemote = async (id: string) => {
+    try {
+      await templatesApi.update(id, { maturity_level: 'experimental', change_note: '降级到 experimental' })
+      message.success('已降级到 experimental')
+      load()
+    } catch (e: unknown) {
+      const err = e as { response?: { data?: { detail?: string } } }
+      message.error(err?.response?.data?.detail || '降级失败')
+    }
+  }
+
   const columns = [
     { title: '名称', dataIndex: 'name', ellipsis: true },
     { title: '类型', dataIndex: 'code_type', width: 100, render: (v: string) => <Tag>{v}</Tag> },
     { title: '子类', dataIndex: 'subcategory', width: 120, render: (v: string) => v || '—' },
     { title: '成熟度', dataIndex: 'maturity', width: 90, render: (v: string) => <Tag color={maturityColors[v]}>{v}</Tag> },
+    {
+      title: '生产门控',
+      dataIndex: 'maturity_level',
+      width: 110,
+      render: (v: string) => <Tag color={maturityLevelColors[v] || 'default'}>{v}</Tag>,
+    },
     { title: '激活', dataIndex: 'is_active', width: 70, render: (v: boolean) => <Tag color={v ? 'green' : 'red'}>{v ? '是' : '否'}</Tag> },
     { title: '更新时间', dataIndex: 'updated_at', width: 160, render: (v: string) => new Date(v).toLocaleString('zh-CN') },
     {
-      title: '操作', width: 100,
+      title: '操作',
+      width: isSuperAdmin ? 220 : 100,
       render: (_: unknown, r: TemplateListItem) => (
         <Space size="small">
           <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(r.id)} />
+          {isSuperAdmin && r.maturity_level !== 'production' && (
+            <Popconfirm
+              title="升级到 production？将进入 RAG 召回主库"
+              onConfirm={() => handlePromote(r.id)}
+            >
+              <Button size="small" icon={<ArrowUpOutlined />} type="primary" ghost>
+                升 prod
+              </Button>
+            </Popconfirm>
+          )}
+          {isSuperAdmin && r.maturity_level === 'production' && (
+            <Popconfirm
+              title="降级到 experimental？将退出 RAG 召回主库"
+              onConfirm={() => handleDemote(r.id)}
+            >
+              <Button size="small" icon={<ArrowDownOutlined />} danger>
+                降 exp
+              </Button>
+            </Popconfirm>
+          )}
           <Popconfirm title="确认停用？" onConfirm={() => handleDelete(r.id)}>
             <Button size="small" icon={<DeleteOutlined />} danger />
           </Popconfirm>

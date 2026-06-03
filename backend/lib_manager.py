@@ -124,6 +124,11 @@ async def _import(lib_dir: Path, force: bool):
                     parameters=data.get("parameters", []),
                     template_body=data["template_body"],
                     maturity=data.get("maturity", "draft"),
+                    # FEAT-13：YAML 显式声明 maturity_level（官方模板写 'production'），
+                    # 缺省时回落到 ORM default 'experimental'。这与 migration 009 backfill
+                    # 的 sva_/cov_ 规则相互独立——CLI import 只信 YAML 字面值，避免 YAML
+                    # 与 backfill 分支双向漂移。
+                    maturity_level=data.get("maturity_level", "experimental"),
                     related_ids=data.get("related_ids"),
                     created_by=None,
                     sync_status="syncing",
@@ -215,22 +220,37 @@ def cmd_validate(lib_dir: str):
 
 @cli.command("rebuild")
 @click.option("--collection", default=None, help="Qdrant collection 名称")
-def cmd_rebuild(collection: str | None):
-    """重建 Qdrant 向量索引（同步所有 sync_status=syncing 的模板）"""
-    asyncio.run(_rebuild(collection))
+@click.option(
+    "--all",
+    "force_all",
+    is_flag=True,
+    help="不限 sync_status，全量 upsert（用于刷新 Qdrant payload，如 FEAT-13 migration 009 后）",
+)
+def cmd_rebuild(collection: str | None, force_all: bool):
+    """重建 Qdrant 向量索引。
+
+    默认仅同步 sync_status=syncing 的模板。FEAT-13 引入 --all：列新增/payload schema 改动
+    后存量行 sync_status 仍为 'ok'，按默认条件只能同步到 0 条；--all 跳过 sync_status 过滤，
+    把所有 active 模板全量 upsert 一遍，刷新 Qdrant payload。
+    """
+    asyncio.run(_rebuild(collection, force_all))
 
 
-async def _rebuild(collection: str | None):
+async def _rebuild(collection: str | None, force_all: bool = False):
     from app.core.database import AsyncSessionLocal
     from app.models.template import Template
     from sqlalchemy import select
 
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Template).where(Template.is_active == True, Template.sync_status == "syncing")
-        )
+        where_clauses = [Template.is_active == True]
+        if not force_all:
+            where_clauses.append(Template.sync_status == "syncing")
+        result = await db.execute(select(Template).where(*where_clauses))
         templates = result.scalars().all()
-        click.echo(f"待同步模板: {len(templates)}")
+        click.echo(
+            f"待同步模板: {len(templates)}"
+            + ("（--all：全量刷新 Qdrant payload）" if force_all else "")
+        )
 
         for tmpl in templates:
             try:
@@ -276,6 +296,9 @@ async def _export(out_dir: Path):
                 "parameters": tmpl.parameters or [],
                 "template_body": tmpl.template_body,
                 "maturity": tmpl.maturity,
+                # FEAT-13：必须导出，否则 export → import round-trip 会把 production 模板
+                # 静默降级为 experimental（ORM 缺省值），下次 import 后退出 RAG 召回主库。
+                "maturity_level": tmpl.maturity_level,
                 "related_ids": tmpl.related_ids or [],
             }
             sub = out_dir / tmpl.code_type
@@ -460,6 +483,9 @@ async def _sync_to_qdrant(db, template, collection: str | None = None):
                     "template_id": template.id,
                     "name": template.name,
                     "code_type": template.code_type,
+                    # FEAT-13 maturity 门控：stage1 Filter 依赖此字段，必须随 upsert 写入。
+                    # getattr 兜底兼容旧 ORM 对象（不该出现，但防御性）。
+                    "maturity_level": getattr(template, "maturity_level", "experimental"),
                 },
             )
         ],
