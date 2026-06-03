@@ -18,6 +18,10 @@
 10. [常用命令速查](#10-常用命令速查)
 11. [无关意图回归语料维护](#11-无关意图回归语料维护)
 12. [近邻模板混淆对回归语料维护](#12-近邻模板混淆对回归语料维护)
+13. [L3 反馈 `reason_tags` 维护流程](#13-l3-反馈-reason_tags-维护流程)
+14. [FEAT-11 `llm_direct` 兜底路径测试 recipe](#14-feat-11-llm_direct-兜底路径测试-recipe)
+15. [FEAT-12 `improvement_reports` 测试 recipe](#15-feat-12-improvement_reports-测试-recipe)
+16. [FEAT-13 模板成熟度门控测试 recipe](#16-feat-13-模板成熟度门控测试-recipe)
 
 ---
 
@@ -799,6 +803,74 @@ async def test_post_improvement_report__all_optional_empty__201(
 - 与 `test_feedback_api.py`（§3.9 L3 差评）：两者完全独立，可并行跑；测同一对 `(rag_record, llm_direct_record)` 时分别写 `generation_records.feedback_*` 与 `improvement_reports`，互不污染
 - 与 `test_admin_analytics.py`（§3.10 L4 仪表盘）：FEAT-12 不修改 4 个 KPI 端点，本套件不与之耦合；若未来 FEAT-13 把 `improvement_reports` 数据接入 analytics，需在 `test_admin_analytics.py` 加配套用例（不修改本套件）
 - 与 `test_llm_direct_generation.py`（§3.17）：本套件**依赖** §3.17 引入的 `parent_record_id` 列存在（migration 007）；新建 worktree 后跑 `alembic upgrade head` 时务必跑到 008，否则 `test_improvement_reports.py` 会 hard fail in fixture（DB schema 缺表）
+
+---
+
+## 16. FEAT-13 模板成熟度门控测试 recipe
+
+FEAT-13 引入 `templates.maturity_level` 列（PostgreSQL ENUM `template_maturity_enum`，值 `production / experimental / draft`）+ RAG 三阶段全部仅消费 production 模板 + Admin UI super_admin 升降级按钮，详 PRD §3.4/§3.7 / ARCHITECTURE §3.2/§3.4/§4.1/§5.1。本节给出**贡献流生命周期回顾 + 单测跑法 + 关键不变量**。
+
+### 16.1 贡献流生命周期（开发者视角）
+
+```
+用户在前端「我的贡献」提交         POST /api/v1/contributions
+       ↓
+admin 在「贡献审核」批准           PUT /api/v1/admin/contributions/{id}/approve
+       ↓
+模板入库（_create_template_from_contribution）  ← 此处固定写 maturity_level='experimental'
+       ↓
+（此时模板已可在「模板库」浏览，但 RAG 三阶段 Filter `maturity_level='production'` 把它过滤掉，不参与召回）
+       ↓
+super_admin 在「模板库管理」点「升级到 production」
+       ↓
+PATCH /api/v1/admin/templates/{id} { maturity_level: 'production' }
+       ↓
+模板正式进入 RAG 召回主库
+```
+
+修改贡献流代码时务必保留"通过 admin review 默认 experimental"的契约——`_create_template_from_contribution` 不要把 contribution 的 `maturity` 字段值写到 `Template.maturity_level`（两列语义独立），固定写 `'experimental'`。
+
+### 16.2 测试文件清单与跑法
+
+| 测试文件 | 用途 | 是否需要活基础设施 |
+|---|---|---|
+| `backend/tests/test_template_maturity_gating.py` | 4 场景覆盖：stage1 hybrid 召回时 Qdrant Filter 中包含 `maturity_level='production'` 条件；engine.py DB 层二次过滤正确拦截非 production 模板；PATCH maturity_level 的 super_admin 200 / lib_admin 403 / 非法值 422；migration 009 backfill 条件函数单元测试 | 否（mock Qdrant + PG，与 `test_pipeline_preview_render.py` 同档；**不**依赖 Redis / PG / Qdrant 容器在线，也**不**调真实 LLM） |
+
+```bash
+# 在 backend 容器内（推荐，环境一致）
+docker compose exec backend pytest tests/test_template_maturity_gating.py -v
+
+# 跑单一用例（按 pytest -k 过滤）
+docker compose exec backend pytest tests/test_template_maturity_gating.py -k "stage1_filter" -v
+docker compose exec backend pytest tests/test_template_maturity_gating.py -k "patch_maturity_403" -v
+docker compose exec backend pytest tests/test_template_maturity_gating.py -k "migration_009_backfill" -v
+
+# 主机原生（如果 venv 已激活并装好依赖）
+cd backend && pytest tests/test_template_maturity_gating.py -v
+```
+
+### 16.3 mock 风格说明
+
+参照 `test_pipeline_preview_render.py` / `test_improvement_reports.py` 的约定：
+
+- **Qdrant mock**：通过 `MagicMock(spec=AsyncQdrantClient)`（或 `unittest.mock.patch` 注入）截获 `client.query_points(...)` 调用，断言传入的 `query_filter.must` 列表中**至少**含一项 `FieldCondition(key='maturity_level', match=MatchValue(value='production'))`。不必断言其他 must 项的顺序，code_type Filter 与 maturity Filter 并列即可
+- **DB mock**：`mock_db.execute(...)` 拦截 `select(Template).where(...)` 语句，断言 SQL 编译后含 `maturity_level == 'production'` 谓词（或对返回 row 列表做选择性 stub，让"含一条 experimental 行 + 一条 production 行" → 只剩 production 行能被消费）
+- **PATCH 权限测试**：通过 `app.dependency_overrides[get_current_user]` 注入不同 `role` 的伪 `User`；测 403 时注入 `role='lib_admin'`，期望端点抛 `HTTPException(403, detail="仅 super_admin 可修改 maturity_level")`；测 200 时注入 `role='super_admin'`
+- **backfill 条件函数单测**：把 migration 009 中的 ID 匹配条件抽到一个纯函数（如 `is_production_seed_template(template_id: str) -> bool` 或直接用 SQL 表达式字符串比对），单测覆盖 `sva_handshake_stable_v1 → True` / `cov_value_v1 → True` / `L6_E2E_1778770719 → False` / `experimental_template → False` 四档
+
+### 16.4 关键不变量（防回归）
+
+- **L1 — 默认门控**：贡献流入库的模板恒为 `maturity_level='experimental'`；`_create_template_from_contribution` 单测必须断言 `template.maturity_level == 'experimental'`，无论 contribution.maturity 取何值
+- **L2 — RAG 召回纯净**：stage1 hybrid 召回任何场景下都**不能**返回 `maturity_level != 'production'` 的模板。单测 stub Qdrant 返回 1 条 production + 1 条 experimental 时，断言最终 candidates 仅含 production
+- **L3 — `dense_top1_score` maturity 感知**：off-topic gate 与 code_type_mismatch gate 两处调用 `dense_top1_score` 时，Qdrant 查询 Filter 都必须含 `maturity_level='production'`；单测可通过 mock_qdrant.query_points.call_args 反查
+- **L4 — PATCH 权限闸**：lib_admin PATCH 含 `maturity_level` 字段时必须 403；super_admin 同请求必须 200；非法 enum 值（如 `'released'`）必须 422
+- **L5 — 双列不混用**：修改 `maturity_level` 不能联动修改 `maturity`；反之亦然。单测可断言 `template.maturity` 在 PATCH `{maturity_level: 'production'}` 后保持原值
+
+### 16.5 与其他测试套件的关系
+
+- 与 `test_pipeline_preview_render.py`：本套件断言 stage1 Filter 含 maturity 条件，pipeline 套件已 mock 整条 RAG 链；二者并行不耦合
+- 与 `test_offtopic_corpus_mocked.py` / `test_template_selection_corpus_mocked.py`：上线后这两份套件的 mock 不需要修改（它们 mock 的是 RAG 返回结果，不关心底层 Filter），但**真实回归套件** `--real-llm` / `--real-embedding` 跑法在 `OFFTOPIC_DENSE_THRESHOLD` 重新校准前可能出现边界样本误差，注意区分"模型问题"与"阈值需重校"
+- 与 `lib_manager.py` 手测：本套件不覆盖 Qdrant payload 写入（`_sync_to_qdrant` 的真实行为），需手测确认 `docker compose exec backend python lib_manager.py rebuild` 后 Qdrant points 的 payload 含 `maturity_level` 字段（详 docs/test-manual.md §7.5）
 
 ---
 

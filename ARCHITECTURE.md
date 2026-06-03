@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.24  
+**版本**：v2.25  
 **状态**：已确认  
-**日期**：2026-06-02  
+**日期**：2026-06-03  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -79,6 +79,17 @@
   - §7 目录结构追加：`backend/app/api/v1/improvement_reports.py`（4+1 路由） / `backend/app/models/improvement_report.py`（ORM）/ `backend/app/schemas/improvement_report.py`（4 个 Pydantic）/ 前端 `frontend/src/api/improvementReports.ts` / `frontend/src/pages/Admin/AdminImprovementReportsPage.tsx` / `frontend/src/pages/Admin/AdminImprovementReportDetailPage.tsx`，外加 `frontend/src/pages/Generate/GeneratePage.tsx` 与 `frontend/src/components/MainLayout.tsx` / `frontend/src/App.tsx` 增量改动
   - §7 migrations 列表追加 `008_improvement_reports.py`（建表 + `report_status_enum` 创建 + UNIQUE 约束 + FK → generation_records.id ondelete=RESTRICT）
   - 与 §3.17 / §1.1 确定性契约的边界：`improvement_reports` 路径是**纯 DB 写入**，不调用 LLM、不参与 RAG 检索、不影响 `generation_records.output_code`；它消费 `generation_records` 现有 FK（`parent_record_id`）作为配对锚点。对 §1.1 确定性契约（`rag` / `llm_direct` 路径）**无影响**
+- v2.24 → v2.25：**FEAT-13 模板成熟度门控（maturity_level 三档 + RAG 默认仅召回 production + admin 提升降级 UI）**——
+  - §4.1 `templates` 表新增 `maturity_level` 列（PostgreSQL ENUM `template_maturity_enum`，值 `production / experimental / draft`，NOT NULL，server_default `'experimental'`），与既有 `maturity` 列（值 `draft / validated / production`，"开发成熟度"）**并存且语义独立**——`maturity_level` 专责"生产门控"（是否进入 RAG 召回主库），`maturity` 描述"开发成熟度"（模板设计者标注的迭代位）；两列共用部分 enum 值（`draft` / `production`）纯属语义重合无关联，**不得混用**
+  - 新增 §3.2 RAG 三阶段 maturity 过滤说明：stage1 `stage1_hybrid_search` Qdrant `Filter.must` 在 `code_type` 之外追加 `FieldCondition(key='maturity_level', match=MatchValue(value='production'))`；`engine.py::rag_retrieve` 的 DB 查询 `select Template where id in template_ids and is_active==True` 追加 `and Template.maturity_level=='production'` 作为**双重防御**（应对 Qdrant payload 缺失字段的边角场景）；`dense_top1_score` 同样追加 `maturity_level='production'` Filter，影响 off-topic gate 与 code_type mismatch gate 两处调用点（两个 gate 的阈值校准基线随之变化，**spec §5 风险记录**：上线后可能需重跑 `calibrate_offtopic_threshold.py` 验证 `OFFTOPIC_DENSE_THRESHOLD` 仍合理）
+  - §3.15.3 Step 5a LLM step1 候选生成路径说明：由于 RAG 三阶段（stage1 Qdrant Filter + engine.py DB Filter）已保证返回候选列表**仅含 production 模板**，`pipeline_preview` 组装 `candidate_dicts` 之前**无需**在 pipeline 层再单独过滤 `maturity_level`，依赖链 = Qdrant payload → stage1 Filter → engine.py DB Filter → `rag_candidates` → `candidate_dicts`
+  - §3.4 Qdrant Collection payload 字段表新增 `maturity_level`（用于 stage1 Filter）；`lib_manager.py::_sync_to_qdrant` 在 `PointStruct.payload` 中加 `"maturity_level": template.maturity_level`（兼容性 `getattr(template, 'maturity_level', 'experimental')`）；**Qdrant payload 冷启动注意事项**：现有 Qdrant collection 中的 points 没有 `maturity_level` payload 字段，stage1 Filter 会把它们全部过滤掉。上线流程**必须先 `alembic upgrade head` 再 `lib_manager.py rebuild`**（或 `lib_manager.py import --force`）让所有 points 带上正确 `maturity_level` payload，否则 RAG 召回为空 → `EmptyRetrievalError` → 全量 HTTP 503
+  - §3.10 贡献流：`_create_template_from_contribution`（`templates.py`）新建模板时 `maturity_level` 固定写 `'experimental'`（无论 contribution 的 `maturity` 字段取值），admin 通过 review 后该模板仍保持 `experimental`；须 super_admin 在「模板库管理」页（`AdminTemplatesPage.tsx`）显式点「升级到 production」走 `PATCH /api/v1/admin/templates/{id} {maturity_level: 'production'}` 才进入 RAG 召回主库
+  - §3.4 Admin 模板管理页 UI：表格新增 `maturity_level` 列（带颜色 Tag：`production=green` / `experimental=orange` / `draft=blue`）；行内操作区追加「升级到 production」「降级到 experimental」两个按钮，**仅 `current_user.role=='super_admin'` 时渲染**（`lib_admin` 隐藏，不可见亦不可点）；编辑 Modal 中保留原 `maturity` 字段不变，**不得**将 `maturity_level` 与 `maturity` 合并到同一 Form.Item（避免审核员误改）
+  - §5.1 端点契约：`PATCH /api/v1/admin/templates/{id}` 在 payload 含 `maturity_level` 时新增权限校验——`current_user.role != 'super_admin'` 返 HTTP 403 `detail="仅 super_admin 可修改 maturity_level"`；非法 enum 值（非 `production/experimental/draft`）由 Pydantic schema 返 HTTP 422
+  - §7 项目目录结构 + migrations 列表追加 `009_template_maturity_level.py`（创建 `template_maturity_enum` PG ENUM + `templates.maturity_level` 列 + 全表 backfill：`id ~ '^(sva|cov)_.+_v[0-9]+$'` 命名规范的官方种子模板 UPDATE 为 `production`，其余行（含 `is_active=false`、含历史 `L6_E2E_*` 测试模板）由 `server_default='experimental'` 自动得到 `experimental` 或显式 UPDATE 兜底）；migration 009 `upgrade()` 末尾打印 `[WARN]` 提示部署方"必须紧接 `lib_manager.py rebuild` 同步 Qdrant payload"
+  - §7 新增测试文件 `backend/tests/test_template_maturity_gating.py`（mock Qdrant / PG，覆盖 4 场景：stage1 Filter 包含 `maturity_level='production'` 条件；engine.py DB 二次过滤正确拦截非 production 模板；PATCH maturity_level 的 super_admin 200 / lib_admin 403 / 非法值 422；migration 009 backfill 条件函数单元测试）
+  - **不在范围内**：FEAT-14 范畴的自动语料质量评分（`draft → experimental` 自动升级）、跨语料库 maturity 同步、`production → 退役` 流程、batch / contribution / IntentBuilder 路径的 maturity 显式 override 参数（RAG 默认生效，不开 explicit override API）、stage2 ColBERT 独立 maturity Filter（stage1 已保证输入是 production，stage2 透传即可）、修改既有 `maturity` 列 enum 值或列名（两列并存）、前端 Library 页 / Generate 页的 `maturity_level` 展示
 
 ---
 
@@ -483,13 +494,16 @@ client.create_collection(
 # 每条模板的 Payload（轻量，仅存索引用字段）
 # 完整模板内容存 PostgreSQL，通过 template_id 回查
 payload = {
-    "template_id": "SVA-HAND-001",
-    "code_type":   "assertion",
-    "subcategory": "handshake",
-    "protocol":    ["AXI4", "AXI4-Lite"],
-    "maturity":    "production"
+    "template_id":     "SVA-HAND-001",
+    "code_type":       "assertion",
+    "subcategory":     "handshake",
+    "protocol":        ["AXI4", "AXI4-Lite"],
+    "maturity":        "production",      # 开发成熟度，纯元数据
+    "maturity_level":  "production"       # 生产门控（FEAT-13 / v2.25，stage1 Filter 必读）
 }
 ```
+
+**stage1 Qdrant Filter（v2.25 / FEAT-13）**：`stage1_hybrid_search` 构造 `Filter.must` 时在 `code_type` 条件之外追加 `FieldCondition(key='maturity_level', match=MatchValue(value='production'))`，stage1 召回**仅返回 production 模板**；`engine.py::dense_top1_score` 同样追加此 Filter，使 off-topic / code_type_mismatch gate 的 top-1 计算也只在 production 子集上进行。`lib_manager.py::_sync_to_qdrant` 在 `payload` dict 中加 `"maturity_level": getattr(template, 'maturity_level', 'experimental')`；**冷启动**必须先 `alembic upgrade head` 再 `lib_manager.py rebuild` 让所有 points 带上 payload 字段，否则 stage1 Filter 会把缺字段的旧 points 全部过滤掉。
 
 **模板入库时的编码文本**（拼接多个字段，提升召回覆盖）：
 
@@ -1498,23 +1512,30 @@ Step 2: IntentCacheLookup
 Step 0a (preview 前置)：off-topic dense 闸（详见 §1.1）
   dense_top1_score(original_intent, code_type) < OFFTOPIC_DENSE_THRESHOLD
     → 抛 OffTopicIntentError → 端点映射 HTTP 422（redirect_to=None）
+  注（v2.25 / FEAT-13）：dense_top1_score 内部 Qdrant 查询 Filter 已带上
+    maturity_level='production'，top-1 只在 production 子集计算；过滤后子集
+    与全量分布若有显著差异，OFFTOPIC_DENSE_THRESHOLD 可能需重新校准
+    （`backend/scripts/calibrate_offtopic_threshold.py`）。
 
 Step 0b (preview 前置, off-topic 通过后)：code_type_mismatch 闸
   当 OFFTOPIC_GATE_ENABLED && CODE_TYPE_MISMATCH_GATE_ENABLED 时启用。
   _detect_code_type_mismatch(original_intent, current_code_type, current_score,
                               margin=CODE_TYPE_MISMATCH_MARGIN)：
-    对所有 registry 注册的 code_type 逐一算 dense top-1，
-    若某非当前 code_type 的得分 - 当前得分 ≥ margin（默认 0.10）→ 抛
-    CodeTypeMismatchError → 端点映射 HTTP 422（redirect_to=None，
-    前端在原页面 Modal 引导切换 code_type）
+    对所有 registry 注册的 code_type 逐一算 dense top-1（同样仅在 production
+    模板上计算，v2.25 / FEAT-13），若某非当前 code_type 的得分 - 当前得分
+    ≥ margin（默认 0.10）→ 抛 CodeTypeMismatchError → 端点映射 HTTP 422
+    （redirect_to=None，前端在原页面 Modal 引导切换 code_type）
   无显著更优 code_type → 进入 Step 3
 
 Step 3+4: Embed + RAGRetrieve
   rag_retrieve(normalized_intent, db, code_type)
-  Stage1 Qdrant 混合检索（dense+sparse RRF，code_type 过滤）
+  Stage1 Qdrant 混合检索（dense+sparse RRF，code_type 过滤 + maturity_level='production' 过滤，v2.25 / FEAT-13）
   Stage2 ColBERT MaxSim 精排（注：当前实际 bypass——main.py:_init_qdrant_collection 只 provisions
-    dense+sparse 命名向量，stage1 读 r.vector.get("colbert") 永远为 None，stage2 见 None 透传 RRF 分数）
+    dense+sparse 命名向量，stage1 读 r.vector.get("colbert") 永远为 None，stage2 见 None 透传 RRF 分数；
+    v2.25 / FEAT-13 起 stage1 已保证输入仅含 production 模板，stage2 无需独立 maturity Filter）
   Stage3 bge-reranker 精排
+  engine.py DB 二次过滤：select Template where id in template_ids and is_active==True
+    AND Template.maturity_level=='production'（v2.25 / FEAT-13，双重防御）
   对返回结果按 template_id 去重（Qdrant 可能返回同一模板的多个 point）
   进入 Step 4b（关键词补充召回）
 
@@ -2044,7 +2065,8 @@ lib_manager.py import template_library/ --dry-run
 | description | TEXT | 详细描述 |
 | parameters | JSONB | 参数定义列表 |
 | template_body | TEXT | Jinja2 模板代码 |
-| maturity | ENUM | `draft` / `validated` / `production` |
+| maturity | ENUM | `draft` / `validated` / `production`（**开发成熟度**——模板设计者标注的迭代位，纯元数据，不参与 RAG 召回判定。与 `maturity_level` 列独立） |
+| **maturity_level** | ENUM `template_maturity_enum` | `production` / `experimental` / `draft`；**NOT NULL，server_default `'experimental'`**（migration 009 / FEAT-13 / v2.25）；**生产门控**——RAG stage1 Qdrant Filter + engine.py DB 二次过滤 + `dense_top1_score` 三处均**仅消费 `production`** 档；贡献流入库默认 `experimental`，须 super_admin 显式 PATCH 升至 `production` 才进入 RAG 召回主库；与 `maturity` 列**语义独立、不得混用**（详 §3.2 / §3.4 / §3.10 / §5.1） |
 | is_active | BOOLEAN | 是否启用 |
 | related_ids | VARCHAR[] | 关联模板 ID 列表 |
 | qdrant_point_id | UUID | 对应 Qdrant 中的 point ID（用于向量更新/删除） |
@@ -2053,7 +2075,7 @@ lib_manager.py import template_library/ --dry-run
 | updated_at | TIMESTAMP | 最后更新时间 |
 | created_by | UUID | 创建者用户 ID |
 
-> **注**：不再有 `embedding VECTOR` 字段，向量数据存于 Qdrant，通过 `qdrant_point_id` 关联。`sync_status` 用于检测 PostgreSQL 与 Qdrant 之间的数据一致性异常。
+> **注**：不再有 `embedding VECTOR` 字段，向量数据存于 Qdrant，通过 `qdrant_point_id` 关联。`sync_status` 用于检测 PostgreSQL 与 Qdrant 之间的数据一致性异常。`maturity` 与 `maturity_level` 两列并存且语义独立——前者描述"开发成熟度"，后者承担"生产门控"职责；migration 009 backfill 仅写 `maturity_level`，不触碰 `maturity`。
 
 **template_versions（模板版本历史表）**
 
@@ -2373,7 +2395,7 @@ WHERE is_default = true;
 - **id**：UUID（与 PostgreSQL `templates.qdrant_point_id` 对应）
 - **vectors**：dense（1024维）+ colbert（N×1024维）
 - **sparse_vectors**：sparse（词汇权重字典）
-- **payload**：template_id、code_type、subcategory、protocol、maturity（用于过滤；原 `category` 字段已重命名为 `code_type` 与 CodeTypeRegistry 对齐）
+- **payload**：template_id、code_type、subcategory、protocol、maturity（开发成熟度，纯元数据）、**maturity_level（生产门控，v2.25 / FEAT-13，stage1 Filter 必读字段）**；原 `category` 字段已重命名为 `code_type` 与 CodeTypeRegistry 对齐
 
 ---
 
@@ -2398,7 +2420,7 @@ WHERE is_default = true;
 | GET | `/api/v1/templates` | 模板列表（支持搜索/筛选/分页） | 普通用户+ |
 | GET | `/api/v1/templates/{id}` | 模板详情 | 普通用户+ |
 | POST | `/api/v1/admin/templates` | 新建模板（同步写 PG + Qdrant）；先执行查重，相似度 ≥ 阈值返回 `duplicate_warning`；附加 `?force=true` 跳过语义查重 | 库管理员+ |
-| PUT | `/api/v1/admin/templates/{id}` | 更新模板（同步更新 PG + Qdrant） | 库管理员+ |
+| PATCH | `/api/v1/admin/templates/{id}` | 更新模板（同步更新 PG + Qdrant）；**v2.25 / FEAT-13** 起 payload 含 `maturity_level` 时新增权限闸：`current_user.role != 'super_admin'` 返 HTTP 403 `detail="仅 super_admin 可修改 maturity_level"`；非法 enum 值（非 `production`/`experimental`/`draft`）由 Pydantic schema 返 HTTP 422 | 库管理员+（修改 `maturity_level` 字段仅 super_admin） |
 | DELETE | `/api/v1/admin/templates/{id}` | 停用模板（软删除，Qdrant 同步删除向量） | 库管理员+ |
 | POST | `/api/v1/admin/templates/import` | 批量导入 YAML（批量写 PG + Qdrant） | 库管理员+ |
 | GET | `/api/v1/admin/users` | 用户列表 | 超管 |
@@ -2752,8 +2774,11 @@ DV_ACODE_GEN_PLATFORM/
 │   │       ├── 005_template_corpus_cases.py   # template_corpus_cases 表（FEAT-4 回归语料）
 │   │       ├── 006_feedback_columns.py        # generation_records 加 6 列（L3 反馈 / generation_mode / gate_error_type）
 │   │       ├── 007_llm_direct_parent_fk.py    # generation_records.parent_record_id FK（FEAT-11 Stage 2）
-│   │       └── 008_improvement_reports.py     # FEAT-12：report_status_enum 创建 + improvement_reports 表 + UNIQUE(rag_record_id, llm_direct_record_id) + FK → generation_records.id ondelete=RESTRICT
+│   │       ├── 008_improvement_reports.py     # FEAT-12：report_status_enum 创建 + improvement_reports 表 + UNIQUE(rag_record_id, llm_direct_record_id) + FK → generation_records.id ondelete=RESTRICT
+│   │       └── 009_template_maturity_level.py # FEAT-13：template_maturity_enum 创建 + templates.maturity_level 列（NOT NULL，server_default 'experimental'） + 全表 backfill（sva_*_v* / cov_*_v* → production，其余 → experimental）；upgrade() 末尾打印 WARN 提示部署方紧接 lib_manager rebuild 同步 Qdrant payload
 │   ├── tests/
+│   │   ├── test_template_maturity_gating.py   # FEAT-13：stage1 Filter 包含 maturity_level='production' / engine.py DB 二次过滤拦截非 production / PATCH maturity_level 的 super_admin 200·lib_admin 403·非法值 422 / migration 009 backfill 条件函数单测（全程 mock Qdrant + PG，无活基础设施依赖）
+│   │   └── ...                                  # 其他既有测试文件（test_pipeline_preview_render / test_offtopic_corpus_mocked / test_feedback_api / test_admin_analytics / test_llm_direct_generation / test_llm_freeform_client / test_improvement_reports 等）
 │   ├── Dockerfile
 │   └── requirements.txt
 │
