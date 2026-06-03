@@ -29,6 +29,8 @@ async def _create_template_from_contribution(
     db: AsyncSession,
 ) -> str:
     template_id = name  # template_name already validated unique (^(sva|cov)_..._v\d+$)
+    # FEAT-13：贡献流通过 review 后固定 maturity_level='experimental'，须 super_admin
+    # 显式 PATCH 才能进入 RAG 召回主库。`maturity` 字段是旧"开发成熟度"，与门控无关。
     template = Template(
         id=template_id,
         version="1.0.0",
@@ -41,6 +43,7 @@ async def _create_template_from_contribution(
         parameters=parameter_defs,
         template_body=template_body,
         maturity="draft",
+        maturity_level="experimental",
         created_by=created_by,
         sync_status="syncing",
     )
@@ -111,6 +114,15 @@ async def create_template(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role("lib_admin", "super_admin")),
 ):
+    # FEAT-13：CREATE 路径同样收口 maturity_level 的特权门控——lib_admin 创建模板
+    # 只能落到默认 'experimental'；显式指定为 production / draft 都要 super_admin。
+    # 否则 PATCH 的 super_admin 校验会被 POST 绕过。
+    if payload.maturity_level != "experimental" and current_user.role != "super_admin":
+        raise HTTPException(
+            status_code=403,
+            detail="仅 super_admin 可在创建时设置 maturity_level 为非 experimental",
+        )
+
     if await check_name_duplicate(db, payload.name):
         raise HTTPException(status_code=409, detail="模板名称已存在")
 
@@ -140,6 +152,7 @@ async def create_template(
         parameters=payload.parameters,
         template_body=payload.template_body,
         maturity=payload.maturity,
+        maturity_level=payload.maturity_level,
         related_ids=payload.related_ids,
         created_by=current_user.id,
         sync_status="syncing",
@@ -157,6 +170,11 @@ async def update_template(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(require_role("lib_admin", "super_admin")),
 ):
+    # FEAT-13：maturity_level 升降级仅 super_admin 可调。lib_admin 可改其他字段，
+    # 但触碰 maturity_level 直接 403。Pydantic Literal 校验已在解析阶段拦掉非法值（422）。
+    if payload.maturity_level is not None and current_user.role != "super_admin":
+        raise HTTPException(status_code=403, detail="仅 super_admin 可修改 maturity_level")
+
     template = await db.get(Template, template_id)
     if not template:
         raise HTTPException(status_code=404, detail="模板不存在")

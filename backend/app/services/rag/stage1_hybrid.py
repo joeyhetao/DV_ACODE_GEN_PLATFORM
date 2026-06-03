@@ -10,6 +10,7 @@ from qdrant_client.models import (
 )
 from app.core.config import get_settings
 from app.core.vector_store import get_qdrant
+from app.schemas.template import MaturityLevel
 
 
 async def stage1_hybrid_search(
@@ -17,6 +18,7 @@ async def stage1_hybrid_search(
     sparse_vec: dict[str, float],
     top_k: int | None = None,
     code_type: str | None = None,
+    maturity_level: MaturityLevel = "production",
 ) -> list[dict]:
     settings = get_settings()
     qdrant = get_qdrant()
@@ -27,11 +29,19 @@ async def stage1_hybrid_search(
         values=list(sparse_vec.values()),
     )
 
-    query_filter = None
+    # FEAT-13 maturity 门控：默认仅召回 production 模板。Qdrant payload 中
+    # 没有 maturity_level 字段的旧 point 会被过滤掉——上线前必须 lib_manager
+    # rebuild 让所有 point payload 带上 maturity_level。
+    must_conditions: list[FieldCondition] = []
     if code_type:
-        query_filter = Filter(
-            must=[FieldCondition(key="code_type", match=MatchValue(value=code_type))]
+        must_conditions.append(
+            FieldCondition(key="code_type", match=MatchValue(value=code_type))
         )
+    if maturity_level:
+        must_conditions.append(
+            FieldCondition(key="maturity_level", match=MatchValue(value=maturity_level))
+        )
+    query_filter = Filter(must=must_conditions) if must_conditions else None
 
     results = await qdrant.query_points(
         collection_name=settings.qdrant_collection,

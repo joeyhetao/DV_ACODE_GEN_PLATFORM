@@ -16,6 +16,10 @@ async def dense_top1_score(query_text: str, code_type: str | None = None) -> flo
 
     返回的是 bge-m3 dense L2 归一化点积（绝对相似度），跨语料稳定，可固定阈值。
     与 stage1_hybrid 的 RRF 融合分数不同——RRF 是 rank 融合产物，不可校准。
+
+    FEAT-13：仅在 maturity_level='production' 子集上打分。代码类型 mismatch gate
+    也会调到这里，自动生效。注意 off-topic 阈值原先基于全量语料校准，过滤后分布若有
+    显著差异需重跑 calibrate_offtopic_threshold.py。
     """
     embed_client = get_embedding_client()
     qdrant = get_qdrant()
@@ -24,11 +28,14 @@ async def dense_top1_score(query_text: str, code_type: str | None = None) -> flo
     embed_result = await embed_client.embed([query_text], modes=["dense"])
     dense_vec = embed_result["dense"][0]
 
-    query_filter = None
+    must_conditions: list[FieldCondition] = [
+        FieldCondition(key="maturity_level", match=MatchValue(value="production"))
+    ]
     if code_type:
-        query_filter = Filter(
-            must=[FieldCondition(key="code_type", match=MatchValue(value=code_type))]
+        must_conditions.append(
+            FieldCondition(key="code_type", match=MatchValue(value=code_type))
         )
+    query_filter = Filter(must=must_conditions)
 
     res = await qdrant.query_points(
         collection_name=settings.qdrant_collection,
@@ -63,6 +70,7 @@ async def rag_retrieve(
         sparse_vec=sparse_vec,
         top_k=settings.rag_stage1_top_k,
         code_type=code_type,
+        maturity_level="production",
     )
 
     stage2 = stage2_colbert_rerank(
@@ -75,9 +83,13 @@ async def rag_retrieve(
     if not template_ids:
         return []
 
+    # FEAT-13 双重防御：stage1 Qdrant Filter 已按 maturity_level='production' 过滤；
+    # 此处 DB 层再加一道，即便 Qdrant payload 因冷启动 / 漂移漏入了非 production 模板，
+    # 也能在 DB 层兜底拦截。
     stmt = select(Template).where(
         Template.id.in_(template_ids),
         Template.is_active == True,
+        Template.maturity_level == "production",
     )
     result = await db.execute(stmt)
     templates_by_id = {t.id: t for t in result.scalars().all()}

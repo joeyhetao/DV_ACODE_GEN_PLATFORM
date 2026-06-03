@@ -1,8 +1,11 @@
 import { apiClient } from './client'
 
+export type MaturityLevel = 'production' | 'experimental' | 'draft'
+
 export interface TemplateListItem {
   id: string; name: string; code_type: string; subcategory?: string
   protocol?: string[]; description: string; maturity: string
+  maturity_level: MaturityLevel
   is_active: boolean; updated_at: string
 }
 export interface Template extends TemplateListItem {
