@@ -1,7 +1,7 @@
 # 平台功能测试手册
 
 > 面向：QA、产品验证、上线前回归。每个用例 = 操作步骤 + 期望效果。
-> 平台版本：PRD v3.4。后端基于 5 道闸契约（off-topic / code_type_mismatch / no_matching_template / under_specified / empty_retrieval）+ FEAT-11 Stage 2 双模生成（`generation_mode ∈ {rag, llm_direct}`，详 §2.9 高置信自动渲染、§4.8 LLM 直接生成兜底）+ FEAT-12 用户对比报告系统（§4.9 用户提交 + §14 管理员审阅，独立于 §12 L3 差评通道，详 ARCHITECTURE §3.18 / §4.1.4）。双模诊断说明：result 阶段 `generation_mode==='llm_direct' && parent_record_id!=null` 时同时出现两个独立按钮——FeedbackBar（§12 L3 评分）与「提交对比报告」按钮（§4.9 / §14 对比报告），分别走两条数据通道，互不阻塞、可同时使用。
+> 平台版本：PRD v3.5。后端基于 5 道闸契约（off-topic / code_type_mismatch / no_matching_template / under_specified / empty_retrieval）+ FEAT-11 Stage 2 双模生成（`generation_mode ∈ {rag, llm_direct}`，详 §2.9 高置信自动渲染、§4.8 LLM 直接生成兜底）+ FEAT-12 用户对比报告系统（§4.9 用户提交 + §14 管理员审阅，独立于 §12 L3 差评通道，详 ARCHITECTURE §3.18 / §4.1.4）+ **FEAT-13 模板成熟度门控**（§7.4 admin 升降级 / §7.5 experimental 不召回 / §7.6 migration 009 backfill，RAG 三阶段默认仅消费 `maturity_level='production'`，贡献流入库默认 `experimental` 须 super_admin 显式提升，详 ARCHITECTURE §3.2/§4.1）。双模诊断说明：result 阶段 `generation_mode==='llm_direct' && parent_record_id!=null` 时同时出现两个独立按钮——FeedbackBar（§12 L3 评分）与「提交对比报告」按钮（§4.9 / §14 对比报告），分别走两条数据通道，互不阻塞、可同时使用。
 
 ---
 
@@ -22,6 +22,9 @@
   - [§5.6 管理员三层防冲突面板](#56-管理员三层防冲突分析面板feat-4)
 - [6. 批量生成](#6-批量生成)
 - [7. 模板库浏览与管理](#7-模板库浏览与管理)
+  - [§7.4 admin 端模板成熟度切换（FEAT-13）](#74-admin-端模板成熟度切换feat-13--v35)
+  - [§7.5 experimental 模板不参与 RAG 召回手测（FEAT-13）](#75-experimental-模板不参与-rag-召回手测feat-13--v35)
+  - [§7.6 migration 009 backfill 验证手测（FEAT-13）](#76-migration-009-backfill-验证手测feat-13--v35)
 - [8. 用户与权限](#8-用户与权限)
 - [9. LLM 配置管理](#9-llm-配置管理)
 - [10. 通知机制](#10-通知机制)
@@ -1255,6 +1258,190 @@ docker compose exec backend python lib_manager.py dedup-check --threshold 0.85
 # 重建 Qdrant 索引（sync_status=syncing 的行）
 docker compose exec backend python lib_manager.py rebuild
 ```
+
+### §7.4 admin 端模板成熟度切换（FEAT-13 / v3.5）
+
+> 「升级到 production」/「降级到 experimental」按钮仅 `super_admin` 可见可点。lib_admin 即使在 DOM 中手工渲染、绕过前端权限校验直接点击，后端 PATCH 也会返 HTTP 403。本节按"前端 UI 可视手测 + API 直调防御性测试"两个层级覆盖。
+
+**前置**：
+
+- 已跑 `alembic upgrade head` 升到 migration 009，`maturity_level` 列存在
+- 已跑 `docker compose exec backend python lib_manager.py rebuild` 让 Qdrant payload 含 `maturity_level` 字段（否则 §7.5 会失败）
+- 准备三类账号：`super_user`（role=super_admin）、`lib_admin_user`（role=lib_admin）、`normal_user`（role=user）
+
+#### §7.4.1 super_admin 升级 / 降级（happy path）
+
+1. 用 `super_user` 登录 → 进入「模板库管理」（`/admin/templates`）
+2. 表格期望可见**新列 `maturity_level`**，每行带颜色 Tag：
+   - `production` → 绿色
+   - `experimental` → 橙色
+   - `draft` → 蓝色
+3. 找到任一 `maturity_level='experimental'` 行（如 backfill 后的 `L6_E2E_1778770719`，若不存在可任选一行先降级再升级）→ 操作区可见**两个新按钮**「升级到 production」「降级到 experimental」
+4. 点「升级到 production」→ Popconfirm 确认 → 期望：
+   - 表格内该行 `maturity_level` Tag 实时变 `production`（绿色）
+   - 后端日志（`docker compose logs backend --tail 30`）应出现 `PATCH /api/v1/admin/templates/<id>` `200 OK`
+   - DB 验证：`docker compose exec postgres psql -U postgres -d dvacode -c "SELECT id, maturity, maturity_level FROM templates WHERE id='<id>'"` → 期望 `maturity_level=production`，`maturity` 列**保持原值不变**（两列独立）
+5. 点同行「降级到 experimental」→ Popconfirm 确认 → 期望 Tag 实时变橙色，DB 中 `maturity_level=experimental`
+
+#### §7.4.2 lib_admin 看不到升降级按钮（前端守门）
+
+1. 用 `lib_admin_user` 登录 → 进入「模板库管理」
+2. 期望：
+   - `maturity_level` 列仍可见（lib_admin 可查看）
+   - 操作区**不渲染**「升级到 production」「降级到 experimental」两个按钮（仅 super_admin 可见）
+   - 现有「编辑」「停用」等既有按钮不受影响
+
+#### §7.4.3 lib_admin API 直调 PATCH maturity_level → 403（后端兜底）
+
+```bash
+# 取 lib_admin token
+LIB_ADMIN_TOKEN=$(curl -s -X POST http://localhost/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"lib_admin_user","password":"<password>"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# 尝试 PATCH 一个真实模板的 maturity_level
+curl -s -i -X PATCH http://localhost/api/v1/admin/templates/sva_handshake_stable_v1 \
+  -H "Authorization: Bearer $LIB_ADMIN_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"maturity_level": "experimental"}'
+```
+
+期望响应：
+
+- HTTP `403 Forbidden`
+- 响应体 `detail` 字段为字符串 `"仅 super_admin 可修改 maturity_level"`
+- DB 中该模板 `maturity_level` 列**未改动**（验证：`SELECT maturity_level FROM templates WHERE id='sva_handshake_stable_v1'` 仍为 `production`）
+
+#### §7.4.4 super_admin 传入非法 enum 值 → 422
+
+```bash
+SUPER_TOKEN=$(curl -s -X POST http://localhost/api/v1/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"super_user","password":"<password>"}' \
+  | python3 -c "import sys,json; print(json.load(sys.stdin)['access_token'])")
+
+# 传一个不在 enum 范围的值
+curl -s -i -X PATCH http://localhost/api/v1/admin/templates/sva_handshake_stable_v1 \
+  -H "Authorization: Bearer $SUPER_TOKEN" \
+  -H 'Content-Type: application/json' \
+  -d '{"maturity_level": "released"}'
+```
+
+期望响应：
+
+- HTTP `422 Unprocessable Entity`
+- `detail` 是 Pydantic 标准错误数组，含 `"loc": ["body", "maturity_level"]` 与提示非法 enum 值
+- DB 中该模板 `maturity_level` 列**未改动**
+
+### §7.5 experimental 模板不参与 RAG 召回手测（FEAT-13 / v3.5）
+
+> 验证 RAG stage1 Qdrant Filter + engine.py DB 二次过滤双层防御生效，experimental / draft 模板不会出现在 `rag_candidates`。
+
+**前置**：
+
+- 至少有一条 `maturity_level='experimental'` 的模板（backfill 后 `L6_E2E_1778770719` 即是；若数据集不含该 ID，用 §7.4.1 把任一已知模板临时降级为 experimental 后再回升）
+- 选一条意图能命中该 experimental 模板的查询（可参考 spec / `L6_E2E_*` 的原始用例）
+
+#### §7.5.1 通过 /preview 端点验证 rag_candidates 不含 experimental 模板
+
+```bash
+TOKEN=<jwt of normal_user>
+curl -s -X POST http://localhost/api/v1/generate/preview \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{
+    "text": "<选定的能命中 experimental 模板的意图>",
+    "code_type": "assertion",
+    "clk": "clk",
+    "rst": "rst_n",
+    "rst_polarity": "低有效",
+    "signals": []
+  }' | python3 -m json.tool > /tmp/preview.json
+```
+
+期望响应中：
+
+- `rag_candidates` 数组的每一项 `template_id` 都**应是 `maturity_level='production'`** 的模板 ID（运行 `SELECT id, maturity_level FROM templates WHERE id = ANY(ARRAY[<rag_top3 ids>]::varchar[])` 逐一比对）
+- 即被定向降级的 experimental 模板 ID **不**出现在 `rag_candidates` 中
+- 即使该 experimental 模板在语义上更贴近用户意图，召回流水线也会走 RAG fallback / 关键词补充召回 / no_matching_template 闸而不是命中它
+
+#### §7.5.2 实时降级一个 production 模板 → 立即从召回中消失
+
+1. 用 super_admin 在 Admin UI 把当前能命中某意图的 production 模板降级为 experimental
+2. **不**手动 invalidate 缓存（验证 Filter 即时生效，不依赖缓存清理）
+3. 用一个**新**意图（防 intent_cache 命中）触发 `/preview`，意图措辞替换 1-2 个词避免 hash 重叠
+4. 期望：原 production 模板**不出现**在 `rag_candidates`；若库内有近邻 production 模板，命中它（fallback）；若无 → no_matching_template 闸 → 422
+5. 再用 super_admin 把模板升回 production，跑同一新意图 → 期望该模板**重新出现**在 `rag_candidates`
+
+#### §7.5.3 后端日志辅助（Qdrant 查询 Filter 结构）
+
+排查 RAG 召回为空时，可在 backend 日志确认 Qdrant 查询确实带了 maturity Filter：
+
+```bash
+docker compose logs backend --tail 100 | grep -E 'stage1_hybrid|maturity_level|query_filter'
+```
+
+期望日志含类似 `Filter(must=[FieldCondition(key='code_type', ...), FieldCondition(key='maturity_level', match=MatchValue(value='production'))])` 结构。
+
+### §7.6 migration 009 backfill 验证手测（FEAT-13 / v3.5）
+
+> 验证 `alembic upgrade head` 之后 `templates.maturity_level` 列被正确 backfill：官方种子模板 → `production`，其余（含 `is_active=false`、含历史 `L6_E2E_*`）→ `experimental`。
+
+**前置**：
+
+- 已在测试栈跑过 migration 001-008（无 maturity_level 列状态）
+- 数据集含至少 1 条 `sva_*_v*` 行 + 1 条 `cov_*_v*` 行 + 1 条 `L6_E2E_*` 行
+- 若是全新环境，先 `docker compose exec backend python lib_manager.py import` 让模板入库再升
+
+**步骤**：
+
+1. 跑迁移：
+   ```bash
+   docker compose exec backend alembic upgrade head
+   ```
+   期望日志末尾出现 `[WARN]` 字样的提示 "必须紧接 `lib_manager rebuild` 同步 Qdrant payload"（migration 009 `upgrade()` 末尾打印）
+
+2. 三类模板的 maturity_level 分别确认（SVA 官方种子）：
+   ```bash
+   docker compose exec postgres psql -U postgres -d dvacode -c \
+     "SELECT id, maturity_level FROM templates WHERE id ~ '^sva_.+_v[0-9]+$' ORDER BY id LIMIT 10"
+   ```
+   期望：所有行 `maturity_level=production`
+
+3. 覆盖率官方种子：
+   ```bash
+   docker compose exec postgres psql -U postgres -d dvacode -c \
+     "SELECT id, maturity_level FROM templates WHERE id ~ '^cov_.+_v[0-9]+$' ORDER BY id LIMIT 10"
+   ```
+   期望：所有行 `maturity_level=production`
+
+4. 历史 / 测试模板：
+   ```bash
+   docker compose exec postgres psql -U postgres -d dvacode -c \
+     "SELECT id, maturity_level, is_active FROM templates WHERE id !~ '^(sva|cov)_.+_v[0-9]+$' ORDER BY id LIMIT 20"
+   ```
+   期望：所有行 `maturity_level=experimental`（包括 `is_active=false` 的行；`L6_E2E_1778770719` 必须 `experimental`）
+
+5. enum 完整性验证：
+   ```bash
+   docker compose exec postgres psql -U postgres -d dvacode -c \
+     "SELECT enum_range(NULL::template_maturity_enum)"
+   ```
+   期望返回 `{production,experimental,draft}`（顺序不重要，三档必须齐）
+
+6. **回滚验证（可选）**：
+   ```bash
+   docker compose exec backend alembic downgrade -1
+   docker compose exec postgres psql -U postgres -d dvacode -c \
+     "\d templates"
+   ```
+   期望 `maturity_level` 列消失、`template_maturity_enum` 类型也被 DROP；再 `alembic upgrade head` 应可重新 backfill 至相同结果（幂等）
+
+7. **Qdrant payload 同步**（与 §7.5 联动）：
+   ```bash
+   docker compose exec backend python lib_manager.py rebuild
+   ```
+   完成后跑 §7.5.1 验证 RAG 召回正常（若漏跑 rebuild，**所有** `/preview` 请求会因 Qdrant Filter 找不到 `maturity_level=production` 的 points 而返 503 `empty_retrieval`——这是上线最容易踩的坑，必须明确告诉运维"先 upgrade 再 rebuild"）
 
 ---
 
