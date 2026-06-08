@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.25  
+**版本**：v2.26  
 **状态**：已确认  
-**日期**：2026-06-03  
+**日期**：2026-06-08  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -90,6 +90,12 @@
   - §7 项目目录结构 + migrations 列表追加 `009_template_maturity_level.py`（创建 `template_maturity_enum` PG ENUM + `templates.maturity_level` 列 + 全表 backfill：`id ~ '^(sva|cov)_.+_v[0-9]+$'` 命名规范的官方种子模板 UPDATE 为 `production`，其余行（含 `is_active=false`、含历史 `L6_E2E_*` 测试模板）由 `server_default='experimental'` 自动得到 `experimental` 或显式 UPDATE 兜底）；migration 009 `upgrade()` 末尾打印 `[WARN]` 提示部署方"必须紧接 `lib_manager.py rebuild` 同步 Qdrant payload"
   - §7 新增测试文件 `backend/tests/test_template_maturity_gating.py`（mock Qdrant / PG，覆盖 4 场景：stage1 Filter 包含 `maturity_level='production'` 条件；engine.py DB 二次过滤正确拦截非 production 模板；PATCH maturity_level 的 super_admin 200 / lib_admin 403 / 非法值 422；migration 009 backfill 条件函数单元测试）
   - **不在范围内**：FEAT-14 范畴的自动语料质量评分（`draft → experimental` 自动升级）、跨语料库 maturity 同步、`production → 退役` 流程、batch / contribution / IntentBuilder 路径的 maturity 显式 override 参数（RAG 默认生效，不开 explicit override API）、stage2 ColBERT 独立 maturity Filter（stage1 已保证输入是 production，stage2 透传即可）、修改既有 `maturity` 列 enum 值或列名（两列并存）、前端 Library 页 / Generate 页的 `maturity_level` 展示
+- v2.25 → v2.26：**FEAT-14 step1 LLM 返编号兼容 + prompt XML 化消除编号心智**——
+  - §3.12.2 `_step1_select_id` 行说明追加：候选输入由 Markdown 编号块（`### N. <id>  <name>`）改为 XML `<candidate id="..." name="...">` 块；系统提示"返回 template_id 或 none"措辞同步为"返回 `<candidate>` 标签的 id 属性值，或 none"；解析层在精确 id 匹配失败后兼容数字序号兜底——若 LLM raw 响应是纯数字 N（允许前后空白 / 尾部句号 / 引号包裹）且 `1 ≤ N ≤ len(candidates)`，将 `raw='N'` 映射到 `candidates[N-1]['template_id']` 并打印日志 `[GLM Step1] raw was integer N → resolved to <template_id>`，`confidence_source` 保持 `llm_step1`（不退化为 `rag_fallback`），下游 `no_matching_template` 闸不触发；`N=0` 或 `N > len(candidates)` 按无效处理沿原 fallback 路径返 `""`
+  - §3.15.3 Step 5a "候选渲染（v2.21，A4）"段刷新为 XML 示例（`<candidate id="sva_handshake_timeout_v1" name="握手超时">\n描述：……\n</candidate>`），并补一句"解析层在精确 id 匹配失败后检查 raw 是否为合法序号 N，兜底映射 `candidates[N-1]`，保持 `confidence_source='llm_step1'`"；description 1000 char 截断 / `max_tokens=64` / 系统提示中"区别要点 / 不适用场景"提示语均不变
+  - `anthropic_client.py::select_template` 在 tool calling 返回的 `template_id` 不在候选列表时同步追加数字兜底（安全网，tool schema 不改）
+  - 新增测试文件 `backend/tests/test_step1_numeric_fallback.py`（覆盖 raw=`'3'` / `'3.'` / `' 3 '` / `'"3"'` / `'none'` / 完整 id / 非法文字 id / `N=0` / `N=len+1` 边界 + AnthropicClient 同等兜底路径）与 `backend/tests/test_step1_prompt_xml.py`（mock LLM 调用断言 user message 含 `<candidate id="`、不含 `"### "` 编号前缀）
+  - **不在范围内**：`verify_step1_selection` yes/no 协议、`_step2_fill_params` 与 `normalize_intent` prompt、AnthropicClient `_TOOL_DEF` schema、pipeline.py 的 RAG fallback 链与 gate 顺序、`OFFTOPIC_DENSE_THRESHOLD` real-LLM 重校准、长候选列表（>5）prompt 截断策略
 
 ---
 
@@ -1224,7 +1230,7 @@ services/llm/
 | 调用 | `extra_body` | `max_tokens` | 说明 |
 |------|--------------|--------------|------|
 | `normalize_intent` | `{"thinking":{"type":"disabled"}}`（硬编码） | 512 | 句式改写，无需 chain-of-thought |
-| `_step1_select_id` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 仅返回候选列表中的 template_id 或字符串 `"none"`；系统提示含负向选择准则（FIX-8）——核心验证语义不匹配时禁止信号名重映射强行适配，必须返 `"none"` 让 pipeline 走 rag_fallback → 第五道闸（详见 §3.15.3 Step 5a） |
+| `_step1_select_id` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 仅返回候选列表中的 template_id 或字符串 `"none"`；系统提示含负向选择准则（FIX-8）——核心验证语义不匹配时禁止信号名重映射强行适配，必须返 `"none"` 让 pipeline 走 rag_fallback → 第五道闸（详见 §3.15.3 Step 5a）。**输入候选采用 XML `<candidate id="..." name="...">` 标签（v2.26 / FEAT-14）**；系统提示措辞为"返回 `<candidate>` 标签的 id 属性值，或 none"。解析层在精确 id 匹配失败后兼容数字序号兜底：raw 响应是纯数字 N（允许前后空白 / 尾部句号 / 引号包裹）且 `1 ≤ N ≤ len(candidates)` 时，映射到 `candidates[N-1]['template_id']`，`confidence_source` 保持 `llm_step1`，下游 `no_matching_template` 闸不触发；`N=0` 或 `N > len(candidates)` 走原 fallback |
 | `_step2_fill_params` | 由 `llm_configs.step2_disable_thinking` 运行时切换 | 2048（off）/ 1024（on） | 仅针对所选模板的 required 参数生成 JSON；prompt 注入示例输出，正则提取响应中第一个 JSON 对象（兼容 ` ```json``` ` 围栏） |
 | `generate_code_freeform`（v2.23 / FEAT-11） | `{"thinking":{"type":"disabled"}}`（硬编码） | 2048 | `llm_direct` 兜底完整代码生成；prompt 注入 `intent + code_type + signals + clk + rst` 并强制单 ` ```systemverilog/sv/verilog``` ` 围栏，正则提取首块。**理由**：自由生成已经够大不再额外开 thinking，且与 normalize / step1 一致禁 thinking 保稳定延迟；输出 token 较多（一段完整 SVA / coverage 代码），`max_tokens=2048` 与 step2 off-thinking 同档 |
 | `test_basic` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 连通性自检 |
@@ -1557,15 +1563,41 @@ Step 5a: TemplateSelect（LLM Step1）
   若 template_id 为空 / "none" / 不在候选 → 退化为 rag_candidates[0]
     （此时 confidence 重写为该候选的 RAG 分数，confidence_source = "rag_fallback"）
 
-  【候选渲染（v2.21，A4）】_step1_select_id 的 candidates_text 由单行串接改为
-  Markdown 多行块（`### {i}. {template_id}  {name}\n描述：...`），description 截断
-  60 → 1000 char（lib_manager.py import 时已把 differentiators / non_use_cases 拼到
-  description 末尾形成"区别要点："/"不适用场景："两段，合成总长实测最长 812 char，
-  截断设到 1000 留余量避免 non_use_cases 末项被切；review NEW-1 后由 spec 中的 300
-  改为当前值）。`max_tokens=64` **保持不变**（输出仅 ~10 token 的 template_id，仅
-  input 侧扩容；GLM-4.7 实测 step1 延迟增幅 < 1s）。系统提示新增提示语
-  "候选描述末尾可能附『区别要点』/『不适用场景』段，请优先用于区分判断"。
-  此项仅影响 openai_compat_client；anthropic_client 的 select_template 候选渲染保持不变。
+  【候选渲染（v2.21 A4 → v2.26 FEAT-14 XML 化）】_step1_select_id 的 candidates_text
+  由单行串接改为多行块；description 截断 60 → 1000 char（lib_manager.py import 时已把
+  differentiators / non_use_cases 拼到 description 末尾形成"区别要点："/"不适用场景："
+  两段，合成总长实测最长 812 char，截断设到 1000 留余量避免 non_use_cases 末项被切；
+  review NEW-1 后由 spec 中的 300 改为当前值）。`max_tokens=64` **保持不变**（输出仅
+  ~10 token 的 template_id，仅 input 侧扩容；GLM-4.7 实测 step1 延迟增幅 < 1s）。
+  系统提示新增提示语"候选描述末尾可能附『区别要点』/『不适用场景』段，请优先用于
+  区分判断"。此项仅影响 openai_compat_client；anthropic_client 的 select_template
+  候选渲染保持不变。
+
+  **v2.26 / FEAT-14 候选渲染由 Markdown 编号块改为 XML `<candidate>` 标签**——示例：
+
+  ```
+  <candidate id="sva_handshake_timeout_v1" name="握手超时检测">
+  描述：valid 拉高后 N 周期内 ready 必须响应，否则触发超时断言。区别要点：……
+  </candidate>
+  <candidate id="sva_stability_v1" name="信号稳定性">
+  描述：信号在使能窗口内保持稳定……
+  </candidate>
+  ```
+
+  目的：从视觉上**消除序号**（Markdown 块的 `### N.` 前缀会让 LLM 学到"返序号也行"
+  的习惯，使其偶发返回 `'3'` 而非 `template_id`，pipeline 解析层不认导致正确候选被丢弃
+  → `rag_fallback` → `no_matching_template` 闸误触发）。系统提示中"只返回 template_id
+  或 none"措辞同步为"返回 `<candidate>` 标签的 id 属性值，或 none"。
+
+  **解析层数字序号兜底（v2.26 / FEAT-14 安全网）**：尽管 XML 化已从视觉上消除编号
+  心智，`_step1_select_id` 解析层仍在精确 id 匹配失败后检查 raw 是否为合法序号 N
+  （允许前后空白 / 尾部句号 / 引号包裹）。若 `1 ≤ N ≤ len(candidates)`，
+  兜底映射 `candidates[N-1]['template_id']` 并打印日志
+  `[GLM Step1] raw was integer N → resolved to <template_id>`，`confidence_source`
+  保持 `llm_step1`（不退化为 `rag_fallback`），下游 `no_matching_template` 闸不触发；
+  `N=0` 或 `N > len(candidates)` 沿原 fallback 路径返 `""`。`anthropic_client.py::
+  select_template` 在 tool calling 返回的 `template_id` 不在候选列表时同步追加同一
+  数字兜底，tool schema 不改。
 
   【负向选择准则（FIX-8）】_step1_select_id 与 anthropic_client.select_template 的系统提示
   显式约束：当候选模板的**核心验证语义**与用户意图不匹配（例如意图是"两信号互斥 /

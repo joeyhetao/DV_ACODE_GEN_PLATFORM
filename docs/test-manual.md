@@ -294,6 +294,63 @@ curl -s -X POST http://localhost/api/v1/generate/preview \
 
 期望：`detail.type="no_matching_template"` + `detail.redirect_to` 以 `/contribute/new?` 开头。
 
+#### §2.5.1 手测验证 step1 数字解析修复（v2.26 / FEAT-14）
+
+**背景**：`_step1_select_id`（`openai_compat_client.py`）偶发把候选序号字符串（如 `'3'`）当 `template_id` 返回，原解析层只做精确 id 匹配，导致 `selected=""` → `confidence_source=rag_fallback` → `no_matching_template` 闸误触发，正确候选被丢弃。v2.26 / FEAT-14 双管齐下修复：(A) 解析层数字兜底——raw 是纯数字 N（`1 ≤ N ≤ len(candidates)`，允许前后空白 / 尾部句号 / 引号包裹）时映射到 `candidates[N-1]['template_id']`；(B) `_render_step1_candidate` 候选块从 Markdown `### {N}.` 改为 XML `<candidate id="...">`，从视觉上消除序号心智。本子节验证两条都生效。
+
+**前置准备**：
+
+1. 库内必须已 import `sva_handshake_timeout_v1` 模板（默认种子库已含；可通过 `docker compose exec backend python lib_manager.py list --code-type assertion` 确认）
+2. 该模板 `maturity_level='production'`（默认 backfill；非 production 会被 RAG 三阶段过滤掉）
+3. 清意图缓存（避免 cache hit 跳过 step1）：
+
+   ```bash
+   docker compose exec redis redis-cli --raw EVAL "local keys = redis.call('KEYS', ARGV[1]); for i=1,#keys do redis.call('DEL', keys[i]); end; return #keys" 0 'intent_cache:*'
+   ```
+
+   期望输出：被删除的 key 数（≥ 0 均可）
+
+**手测步骤**：
+
+1. 打开 `/generate`，code_type 选「SVA 断言」
+2. 输入意图：`AXI valid-ready 握手超时检测：awvalid 拉高后 16 周期内 awready 必须响应`
+3. 提交 preview
+4. **期望前端**：进入 ConfirmationPanel 或 quick_render（视 high-confidence-rag 条件而定），`template_id` 显示为 `sva_handshake_timeout_v1`，**不**跳转 `/contribute/new`
+5. **期望后端日志**（任选一种均算修复生效）：
+
+   - **理想态（B 完全消除编号心智）**：
+
+     ```
+     [GLM Step1] raw='sva_handshake_timeout_v1'
+     ```
+
+     表明 XML 化后 LLM 直接返完整 template_id，根本没机会返编号
+
+   - **次优态（A 兜底生效）**：
+
+     ```
+     [GLM Step1] raw='3'   (或 raw='3.' / raw=' 3 ' / raw='"3"' 等变体)
+     [GLM Step1] raw was integer 3 → resolved to 'sva_handshake_timeout_v1'
+     ```
+
+     表明 LLM 仍偶发返编号但兜底成功 resolve，`confidence_source` 保持 `llm_step1`
+
+6. 若后端日志出现 `[Gate] no_matching_template: top_score=<n>` 且前端跳转 `/contribute/new`，说明修复**未生效**——核对 `_step1_select_id` 解析逻辑（数字兜底块是否在精确匹配失败后、`return ""` 之前）以及 `_render_step1_candidate` 输出是否含 `<candidate id="` / 不含 `### `
+
+**API 层独立验证**：
+
+```bash
+TOKEN=<jwt>
+curl -s -X POST http://localhost/api/v1/generate/preview \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"text":"AXI valid-ready 握手超时检测：awvalid 拉高后 16 周期内 awready 必须响应","code_type":"assertion","clk":"clk","rst":"rst_n","rst_polarity":"低有效","signals":[]}' \
+  | python3 -m json.tool
+```
+
+期望：返回正常 preview 响应（含 `template_id="sva_handshake_timeout_v1"` + `confidence_source="llm_step1"`），**不**是 422 `no_matching_template`。
+
+**自动化回归**：本场景已固化到 `backend/tests/test_step1_numeric_fallback.py`（数字兜底全路径）+ `backend/tests/test_step1_prompt_xml.py`（prompt XML 格式断言），CI 必跑。手测仅用于真 LLM 模型变更 / prompt 大改时的 sanity check。
+
 ### §2.6 5 道闸响应结构验证（API 层）
 
 ```bash
