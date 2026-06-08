@@ -1,4 +1,5 @@
 from __future__ import annotations
+import html
 import re
 from abc import ABC, abstractmethod
 from app.schemas.intent import TemplateSelectionOutput
@@ -65,6 +66,71 @@ def build_freeform_prompt(
         f"只输出一个 ```systemverilog 围栏的代码块。"
     )
     return system, user
+
+
+# lib_manager.py import 时把 differentiators / non_use_cases 拼到 description 末尾
+# （"区别要点：..."、"不适用场景：..."），实测最长 812 char（protocol_handshake_coverage）。
+# 截断设到 1000 留余量避免 non_use_cases 末项被切；若 lib_manager 拼接逻辑变动可在此调。
+_CANDIDATE_DESC_MAX_LEN = 1000
+
+
+def render_step1_candidate_xml(
+    c: dict,
+    extra_lines: list[str] | None = None,
+) -> str:
+    """Step1 候选 XML 块渲染（OpenAI-compat / Anthropic 共用，FEAT-14）。
+
+    输出形如：
+        <candidate id="sva_handshake_timeout_v1" name="Handshake Timeout">
+        描述：xxx
+        参数：a, b, c     ← 可选 extra_lines
+        </candidate>
+
+    安全：id / name 属性值与正文一律走 html.escape——template 字段（尤其 name 是
+    String(128) 自由文本）若含 `"` / `</candidate>` / `>` 等字符会破坏 XML 结构
+    并诱发 prompt 注入（review SEC-1）。description 截断到 _CANDIDATE_DESC_MAX_LEN。
+
+    extra_lines 用于 Anthropic 路径追加"参数：xxx"等附加信息行；OpenAI-compat 不传。
+    本函数对每条 extra line 做正文级 escape（quote=False，只转 `<>&`，保留中文 / 标点
+    可读），并把内嵌 `\\n` 替换为空格做防御性清洗——caller（如 Anthropic 的 _format_params）
+    通常来自 DB dict，不强类型，存在低概率参数名含 `\\n` 的情况；若不清洗，`\\n".join()`
+    会把违规行拆成额外正文行、破坏"描述 → 参数 → </candidate>"的顺序契约（review M-1）。
+    """
+    safe_id = html.escape(c["template_id"], quote=True)
+    safe_name = html.escape(c.get("name") or "", quote=True)
+    desc = html.escape((c.get("description") or "")[:_CANDIDATE_DESC_MAX_LEN], quote=False)
+    body_lines = [f"描述：{desc}"]
+    for line in extra_lines or []:
+        # 防御 caller 违约：把内嵌换行替换为空格，避免破坏 XML 块结构
+        body_lines.append(html.escape(line.replace("\n", " "), quote=False))
+    body = "\n".join(body_lines)
+    return f'<candidate id="{safe_id}" name="{safe_name}">\n{body}\n</candidate>'
+
+
+def resolve_numeric_fallback(
+    raw: str,
+    candidates: list[dict],
+    log_prefix: str,
+) -> str | None:
+    """LLM step1 数字兜底（FEAT-14）：把 '3' / '3.' / '"3"' / ' 3 ' 等序号字符串
+    映射回 candidates[N-1].template_id。
+
+    剥离链：strip → 去配对的 ASCII 引号 → 去尾部句号 → 再 strip。N 取值
+    1..len(candidates)；N=0 或 N>len 视为越界，返回 None 让 caller 走原 fallback。
+    非数字字符串（含中文"三"、'3 (我选的)' 这类带噪声形式）一律 None。日志前缀
+    与历史 [GLM Step1] / [Anthropic Step1] 对齐，便于线上日志排障。
+    """
+    stripped = (raw or "").strip().strip('"\'').rstrip('.').strip()
+    if stripped.isdigit():
+        n = int(stripped)
+        if 1 <= n <= len(candidates):
+            resolved = candidates[n - 1]["template_id"]
+            print(
+                f"[{log_prefix}] raw was integer {n} → resolved to {resolved!r}",
+                flush=True,
+            )
+            return resolved
+    return None
 
 
 class LLMClient(ABC):

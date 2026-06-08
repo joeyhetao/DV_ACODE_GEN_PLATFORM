@@ -10,6 +10,8 @@ from app.services.llm.base import (
     LLMClient,
     build_freeform_prompt,
     extract_sv_code_block,
+    render_step1_candidate_xml,
+    resolve_numeric_fallback,
 )
 
 
@@ -27,21 +29,6 @@ def _extract_json(text: str) -> dict:
     if not match:
         raise ValueError(f"LLM 响应中未找到 JSON: {text[:300]}")
     return json.loads(match.group())
-
-
-def _render_step1_candidate(i: int, c: dict) -> str:
-    """Step1 候选 Markdown 多行块渲染。
-
-    description 截断 1000（原 60 → A4 扩到 300 → C1 修复后改 1000）：旧值 60 严重
-    不足以表达"做什么/典型场景/边界"三要素；lib_manager.py import 时还把
-    differentiators / non_use_cases 拼到 description 末尾（"区别要点：..."、
-    "不适用场景：..."），合计实测可达 812 char（protocol_handshake_coverage），
-    所以截断设到 1000 留余量，避免 non_use_cases 末项被切掉（review NEW-1）。
-    顶端用 `###` 标题让 LLM 容易解析"块边界"——若回归发现 LLM 在长候选列表里
-    选错块号，可考虑改成 `<candidate id="...">` XML 风格再观察。
-    """
-    desc = (c.get("description") or "")[:1000]
-    return f"### {i + 1}. {c['template_id']}  {c['name']}\n描述：{desc}"
 
 
 def _reasoning_tokens(resp) -> int | str:
@@ -143,18 +130,18 @@ class OpenAICompatLLMClient(LLMClient):
         max_tokens 保持 64：候选文本扩容仅影响 input tokens（5×300 ≈ 1500），output
         不变；GLM-4.7 在更长 prompt 下 step1 延迟增幅实测 < 1s。
         """
-        candidates_text = "\n".join(
-            _render_step1_candidate(i, c) for i, c in enumerate(candidates)
-        )
+        candidates_text = "\n".join(render_step1_candidate_xml(c) for c in candidates)
         print(f"[GLM Step1] candidates:\n{candidates_text}", flush=True)
 
         system = (
             "你是IC验证工程师，判断用户意图能否被候选模板覆盖。\n"
             "\n"
+            "候选以 <candidate id=\"...\" name=\"...\"> XML 块给出，每个候选携带描述段。\n"
+            "\n"
             "判断流程：\n"
             "1. 识别意图的核心验证语义（如：握手协议、FSM转换、互斥约束、值域覆盖、延迟约束等）\n"
             "2. 逐一核查候选模板的验证目的是否与该语义一致\n"
-            "3. 匹配 → 返回 template_id；无任何候选匹配 → 返回字符串 none\n"
+            "3. 匹配 → 返回所选 <candidate> 的 id 属性值；无任何候选匹配 → 返回字符串 none\n"
             "\n"
             "候选描述末尾可能附『区别要点』段（列出与最近邻模板的区别要点）和『不适用场景』段"
             "（列出不适用场景），请优先用这两段做区分判断。\n"
@@ -164,12 +151,14 @@ class OpenAICompatLLMClient(LLMClient):
             "- '互斥约束/两信号不能同时有效/one-hot/竞争检测/仲裁' 与 '握手协议/稳定性/延迟/超时/复位/FSM/值域覆盖' 是不同语义类别，不可互换\n"
             "- 若候选中无专门处理互斥/one-hot/同时有效约束的模板，必须返回 none\n"
             "\n"
-            "只返回 template_id 或 none，不输出其他任何内容。"
+            "输出格式（强约束）：只输出 id 属性的值字符串（如 sva_handshake_timeout_v1），"
+            "或字符串 none。禁止输出 <candidate ...> XML 标签或属性形式、禁止输出序号"
+            "数字、禁止任何解释或多余字符。"
         )
         user = (
             f"[验证意图]\n{normalized_intent}\n\n"
             f"[候选模板]\n{candidates_text}\n\n"
-            f"只返回 template_id："
+            f"只输出所选 candidate 的 id 属性值（或 none）："
         )
 
         # Step1 是 pick-from-list 分类，依赖 system prompt 里的 FSM/handshake/value/cross 规则即可，
@@ -194,11 +183,16 @@ class OpenAICompatLLMClient(LLMClient):
         content = (resp.choices[0].message.content or "").strip()
         print(f"[GLM Step1] raw={content!r} finish={resp.choices[0].finish_reason}", flush=True)
 
-        # 精确匹配候选 ID
+        # TODO(BUG-1): 子串匹配——若候选含有共同 id 前缀（如 sva_v1 / sva_v10），
+        # 迭代到短 id 先命中，会错位返回较短候选。预存在行为，FEAT-14 范围外刻意延期；
+        # follow-up ticket 跟踪。修复时改为先全文精确等号比较，再降级到子串兜底，并补回归用例。
         for c in candidates:
             if c["template_id"] in content:
                 return c["template_id"]
-        return ""
+
+        # FEAT-14 数字兜底：candidates 与 prompt 渲染顺序一致，N→candidates[N-1]。
+        resolved = resolve_numeric_fallback(content, candidates, log_prefix="GLM Step1")
+        return resolved or ""
 
     async def _step2_fill_params(
         self,
