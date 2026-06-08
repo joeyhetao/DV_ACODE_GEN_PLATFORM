@@ -580,10 +580,12 @@ PR 前 checklist：
 - [ ] 跑 `lib_manager.py validate` 确认新模板的 `differentiators` / `non_use_cases` 都是非空 list
 
 **触发点 C：A4 / A8 / A10 关键参数变化（低频但风险高）**
-1. `_render_step1_candidate` 的 description 截断阈值变化（如 1000 → 600）：跑 mock 套件
-2. A8 `verify_step1_selection` prompt 调整：跑 real-llm 套件 `--real-llm`
-3. A10 模板 description 或 `differentiators` / `non_use_cases` 改动：两个套件都跑
-4. 若回归率上升，先修 prompt / 描述字段而**不是降语料**——语料是契约，不该被绕过
+1. A. `_render_step1_candidate` 的 description 截断阈值变化（如 1000 → 600）：跑 mock 套件
+2. B. **`_render_step1_candidate` XML 格式变更（v2.26 / FEAT-14）**：跑 `pytest backend/tests/test_step1_prompt_xml.py -v` 确认 prompt 无 `### ` 编号前缀且含 `<candidate id="`；再跑 mocked offtopic_corpus + pipeline_preview 回归套件（`pytest backend/tests/test_offtopic_corpus_mocked.py backend/tests/test_pipeline_preview_render.py -v`）确认零退步。任何对 `<candidate>` 标签 attribute 命名 / 嵌套结构的改动都必须在 prompt XML 测里更新断言，否则解析层精确 id 匹配会静默失效——数字兜底虽然能救一部分，但失去"LLM 直接返 id"的主路径就等于把所有 step1 决策推到兜底链
+3. C. A8 `verify_step1_selection` prompt 调整：跑 real-llm 套件 `--real-llm`
+4. D. A10 模板 description 或 `differentiators` / `non_use_cases` 改动：两个套件都跑
+5. **数字兜底逻辑改动（v2.26 / FEAT-14）**：`_step1_select_id` / `anthropic_client.select_template` 的数字序号兜底是 prompt XML 化的安全网——若 LLM 仍偶发返编号，兜底必须把 raw 数字 N（含 `'3.'` / `'"3"'` / `' 3 '` 各 strip 变体）正确 resolve。改解析层任何一行都必须跑 `pytest backend/tests/test_step1_numeric_fallback.py -v`（覆盖 raw=`'3'` / `'3.'` / `' 3 '` / `'"3"'` / `'none'` / 完整 id / 非法文字 id / `N=0` / `N=len+1` 边界 + AnthropicClient 同等兜底路径）
+6. 若回归率上升，先修 prompt / 描述字段而**不是降语料**——语料是契约，不该被绕过
 
 ### 12.2 维护准则
 
@@ -598,6 +600,12 @@ PR 前 checklist：
 ```bash
 # PR 必跑：mock 套件（快，纯本地，CI 默认）
 docker compose exec backend pytest tests/test_template_confusion_corpus_mocked.py -v
+
+# v2.26 / FEAT-14 新增：step1 数字兜底单测（mock LLM，CI 必跑）
+docker compose exec backend pytest tests/test_step1_numeric_fallback.py -v
+
+# v2.26 / FEAT-14 新增：step1 prompt XML 格式断言（mock LLM，CI 必跑）
+docker compose exec backend pytest tests/test_step1_prompt_xml.py -v
 
 # 手动跑：真 LLM + 真 RAG 套件（需 llm_configs 表已配 is_default=true 记录 + Qdrant 已 import 全模板）
 docker compose exec backend pytest tests/test_template_confusion_corpus_real_llm.py --real-llm -v
