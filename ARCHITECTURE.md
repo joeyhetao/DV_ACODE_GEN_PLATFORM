@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.26  
+**版本**：v2.27  
 **状态**：已确认  
-**日期**：2026-06-08  
+**日期**：2026-06-10  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -96,6 +96,12 @@
   - `anthropic_client.py::select_template` 在 tool calling 返回的 `template_id` 不在候选列表时同步追加数字兜底（安全网，tool schema 不改）
   - 新增测试文件 `backend/tests/test_step1_numeric_fallback.py`（覆盖 raw=`'3'` / `'3.'` / `' 3 '` / `'"3"'` / `'none'` / 完整 id / 非法文字 id / `N=0` / `N=len+1` 边界 + AnthropicClient 同等兜底路径）与 `backend/tests/test_step1_prompt_xml.py`（mock LLM 调用断言 user message 含 `<candidate id="`、不含 `"### "` 编号前缀）
   - **不在范围内**：`verify_step1_selection` yes/no 协议、`_step2_fill_params` 与 `normalize_intent` prompt、AnthropicClient `_TOOL_DEF` schema、pipeline.py 的 RAG fallback 链与 gate 顺序、`OFFTOPIC_DENSE_THRESHOLD` real-LLM 重校准、长候选列表（>5）prompt 截断策略
+- v2.26 → v2.27：**FEAT-15 off-topic 与 code_type_mismatch gate 协同——避免错选 code_type 被误判为非验证请求**——
+  - §3.15.3 Step 0a `off-topic dense 闸` 判定基准升级：由 `dense_top1_score(original_intent, selected_code_type) < OFFTOPIC_DENSE_THRESHOLD` 改为 `best_overall = max(selected_dense, max(cross_code_type_scores)) < OFFTOPIC_DENSE_THRESHOLD`。新增 helper `_compute_cross_code_type_scores(intent, selected_code_type, selected_score) -> dict[str, float]` 返回 `{code_type_id: dense_top1_score}` 全量字典（含 selected_code_type 自身），Step 0a / Step 0b 共用同一份扫描结果不重复 embedding。`OffTopicIntentError.top_dense_score` 字段语义由"所选 code_type 子集最高分"升级为"全 code_type 库最高分"，与前端 Modal "输入与**模板库**的最高相似度低于阈值" 文案语义对齐（前端文案/字段名不动）。修复场景：用户提"交叉覆盖 awsize 与 awburst 的所有合法组合" + 误选 `code_type=assertion`，老逻辑因 assertion 子集得分 0.4088 < 0.44 抛 `OffTopicIntentError` 误导"非 IC 请求"；新逻辑 `best_overall = max(0.41, 0.76) = 0.76 ≥ 0.44` 通过 Step 0a，让 Step 0b 抛 `CodeTypeMismatchError` 提示改用 `coverage`
+  - §3.15.3 Step 0b `code_type_mismatch 闸` 判定追加前置条件：原 `best_other_score - selected_score ≥ CODE_TYPE_MISMATCH_MARGIN` 升级为 `gap ≥ margin AND best_other_score ≥ OFFTOPIC_DENSE_THRESHOLD`。第二前提避免全库低分场景（如 `selected=0.30 / best_other=0.42 / gap=0.12 ≥ margin` 但 `best_other` 自身没"有把握"）仍弹"选错类型"误导；旧 `_detect_code_type_mismatch` 函数被内联删除（全 codebase grep 无外部调用），Step 0b 直调 `_compute_cross_code_type_scores` 共享 Step 0a 的扫描结果
+  - §3.15.3 `[Gate] offtopic` 日志格式扩字段：旧只记 `top_dense_score`，新格式打印 `selected_dense=<f.4> best_other_id=<id> best_other_score=<f.4> best_overall=<f.4> threshold=<f>`，便于排查"哪类高分把请求救回了 / 全库均匀低分触发 off-topic 时谁离阈值最近"。`registry 只有一个 code_type` 时 `best_other_id=None / best_other_score=-1.0` 哨兵值（日志里看到 `-1.0000` 即此情形），`best_overall` 自然退化为 `selected_dense`，Step 0b 跳过
+  - §1.1 确定性契约**不动**：本次仅闸语义调整，未引入新 LLM 调用、未改 template 选择 / param mapping / Jinja 渲染、未改缓存 key 结构；闸顺序（Step 0a → Step 0b）与异常类型不变；前端 `handleApiError` / Modal / `redirect_to` 字段约定不变
+  - 新增测试 `backend/tests/test_offtopic_codetype_priority.py` 覆盖 4 场景（错选 code_type → mismatch / 全离题 → off_topic / `best_overall ≥ threshold` 但 `gap < margin` → 两闸均不触发 / `gap ≥ margin` 但 `best_other < threshold` → off_topic 而非 mismatch）；`backend/tests/data/offtopic_corpus.yaml` 新增 4–6 条 cross-code-type 错选样本，分类为 `marginal`，新字段 `expected_gate: code_type_mismatch | off_topic | null` 由 `test_offtopic_corpus_mocked.py` 新增 `test_cross_code_type_mismatch_corpus_routing` 函数按 expected_gate 断言抛出的异常类型；既有 `test_pipeline_preview_code_type_mismatch_raises_with_suggestion` 与 marginal_ic 断言无回归
 
 ---
 
@@ -1516,8 +1522,25 @@ Step 2: IntentCacheLookup
   未命中 → 进入 Step 3
 
 Step 0a (preview 前置)：off-topic dense 闸（详见 §1.1）
-  dense_top1_score(original_intent, code_type) < OFFTOPIC_DENSE_THRESHOLD
-    → 抛 OffTopicIntentError → 端点映射 HTTP 422（redirect_to=None）
+  v2.27 / FEAT-15 起判定基准升级：
+    selected_dense = dense_top1_score(original_intent, code_type=inp.code_type)
+    cross_scores = _compute_cross_code_type_scores(
+                       original_intent, inp.code_type, selected_dense)
+        → 返回 {code_type_id: dense_top1_score} 全量字典（含 selected 自身），
+          供 Step 0a / Step 0b 共用同一份扫描结果不重复 embedding
+    best_other_id, best_other_score = max(
+        ((ct, s) for ct, s in cross_scores.items() if ct != inp.code_type),
+        key=lambda x: x[1], default=(None, -1.0))
+        → 哨兵 (None, -1.0)：registry 只有一个 code_type 时取不到"非选中"项，
+          best_overall 自然退化为 selected_dense（max 不会选到 -1.0）
+    best_overall = max(selected_dense, best_other_score)
+    best_overall < OFFTOPIC_DENSE_THRESHOLD
+      → 抛 OffTopicIntentError(top_dense_score=best_overall, threshold=...)
+        → 端点映射 HTTP 422（redirect_to=None）
+        → top_dense_score 字段语义自此为"全 code_type 库最高分"，与前端 Modal
+          "输入与模板库的最高相似度低于阈值" 文案语义对齐
+  日志格式：[Gate] offtopic selected_dense=... best_other_id=... best_other_score=...
+            best_overall=... threshold=...
   注（v2.25 / FEAT-13）：dense_top1_score 内部 Qdrant 查询 Filter 已带上
     maturity_level='production'，top-1 只在 production 子集计算；过滤后子集
     与全量分布若有显著差异，OFFTOPIC_DENSE_THRESHOLD 可能需重新校准
@@ -1525,12 +1548,18 @@ Step 0a (preview 前置)：off-topic dense 闸（详见 §1.1）
 
 Step 0b (preview 前置, off-topic 通过后)：code_type_mismatch 闸
   当 OFFTOPIC_GATE_ENABLED && CODE_TYPE_MISMATCH_GATE_ENABLED 时启用。
-  _detect_code_type_mismatch(original_intent, current_code_type, current_score,
-                              margin=CODE_TYPE_MISMATCH_MARGIN)：
-    对所有 registry 注册的 code_type 逐一算 dense top-1（同样仅在 production
-    模板上计算，v2.25 / FEAT-13），若某非当前 code_type 的得分 - 当前得分
-    ≥ margin（默认 0.10）→ 抛 CodeTypeMismatchError → 端点映射 HTTP 422
-    （redirect_to=None，前端在原页面 Modal 引导切换 code_type）
+  v2.27 / FEAT-15 起判定升级（与 Step 0a 共享 cross_scores 字典）：
+    best_other_id is not None
+      AND gap = best_other_score - selected_dense >= CODE_TYPE_MISMATCH_MARGIN
+      AND best_other_score >= OFFTOPIC_DENSE_THRESHOLD     ← 新增前置条件
+      → 抛 CodeTypeMismatchError(selected_code_type, suggested_code_type=best_other_id,
+                                  selected_score=selected_dense,
+                                  suggested_score=best_other_score)
+        → 端点映射 HTTP 422（redirect_to=None，前端在原页面 Modal 引导切换 code_type）
+    第二前提避免全库低分场景（如 selected=0.30 / best_other=0.42 / gap=0.12 >= margin
+      但 best_other 自身没"有把握"，全库实际仍属离域）仍弹"选错类型"误导用户。
+    旧 _detect_code_type_mismatch 函数被内联删除（全 codebase grep 无外部调用），
+    Step 0b 直调 _compute_cross_code_type_scores 共享 Step 0a 的扫描。
   无显著更优 code_type → 进入 Step 3
 
 Step 3+4: Embed + RAGRetrieve

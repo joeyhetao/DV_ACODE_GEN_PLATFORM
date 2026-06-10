@@ -91,8 +91,8 @@ docker compose logs -f backend | grep -E "\[Pipeline\]|\[Gate\]|\[Timing\]|\[GLM
 | `[Pipeline] extracted from intent: {...}` | regex 提取结果 |
 | `[Pipeline] params_resolved: [(name, source, value), ...]` | 每参数最终源标识，是判断 §1 高置信路径 / §2.3 under_specified 的关键 |
 | `[Pipeline] under_specified gate: missing=[...]` | §2.3 闸命中 |
-| `[Gate] off_topic: dense_top1=... threshold=...` | §2.1 闸命中 |
-| `[Pipeline] code_type mismatch: selected=... vs suggested=...` | §2.2 闸命中 |
+| `[Gate] offtopic selected_dense=... best_other_id=... best_other_score=... best_overall=... threshold=...` | §2.1 闸命中（v2.27 / FEAT-15 起 5 字段：selected_dense=所选 code_type 子集 top-1；best_other_id/score=非选中 code_type 中的最高分及其 id，单 code_type 时为 `None / -1.0000` 哨兵；best_overall=全库最高=`max(selected, best_other)`，与 threshold 比较） |
+| `[Pipeline] code_type mismatch: selected=<ct>(<f>) vs suggested=<ct>(<f>) margin=...` | §2.2 闸命中（v2.27 / FEAT-15 起共用 §2.1 的 cross_scores 字典，需 `gap >= margin` 且 `best_other_score >= threshold` 两前提同时成立） |
 | `[Gate] empty_retrieval: code_type=...` | §2.4 闸命中（基础设施异常） |
 | `[Gate] no_matching_template: top_score=...` | §2.5 第五道闸命中（LLM step1 返回 none 即触发），库内无此场景模板，直跳贡献页；top_score 仅作监控参考 |
 | `[Timing] llm=... ms=... reasoning_tokens=...` | LLM 单次调用耗时 + 是否真关 thinking |
@@ -252,6 +252,62 @@ echo $TOKEN
 | 期望 | 后端返 422，前端弹"代码类型选错了"Modal，建议改为 coverage |
 | detail.suggested_code_type | `coverage` |
 | detail.redirect_to | `null`（用户在原页面切换 code_type 重试） |
+
+#### §2.2.1 错选 code_type 不应误判为 off_topic（v2.27 / FEAT-15）
+
+**背景**：FEAT-15 前 gate 1 仅对所选 code_type 子集算 `dense_top1_score`。当用户合法 IC 意图错选了 code_type、且所选 code_type 子集刚好低于阈值时（典型 0.41 < 0.44），gate 1 直接抛 `OffTopicIntentError` 误导用户"提问非 IC 验证"——gate 2 根本拿不到执行机会。修复将 gate 1 / gate 2 判定基准统一升级为"全 code_type 库视角"（`best_overall = max(selected_dense, max(cross_code_type_scores))`），并给 gate 2 追加 `best_other_score >= threshold` 前置条件。本子节验证错选 code_type 路径正确路由到 `CodeTypeMismatchError`。
+
+**前置准备**：
+
+1. 库内必须已 import `cov_cross_coverage_v1` 或同语义覆盖率模板（默认种子库已含，`docker compose exec backend python lib_manager.py list --code-type coverage` 确认）
+2. 相关模板 `maturity_level='production'`（默认 backfill）
+3. 清意图缓存（避免 cache hit 跳过 gate）：
+
+   ```bash
+   docker compose exec redis redis-cli --raw EVAL "local keys = redis.call('KEYS', ARGV[1]); for i=1,#keys do redis.call('DEL', keys[i]); end; return #keys" 0 'intent_cache:*'
+   ```
+
+**手测步骤**：
+
+1. 打开 `/generate`，code_type **错选**「SVA 断言」
+2. 输入意图：`交叉覆盖 awsize 与 awburst 的所有合法组合`
+3. 提交 preview
+
+**期望前端**：弹"代码类型选错了"Modal，建议改为 `coverage`，停留生成页让用户切换 code_type 后重试。**不**弹"检测到非验证请求"Modal、**不**直接跳贡献页 / IntentBuilder。
+
+**期望后端响应**：
+
+| 字段 | 期望值 |
+|---|---|
+| HTTP status | `422` |
+| `detail.type` | `code_type_mismatch` |
+| `detail.suggested_code_type` | `coverage` |
+| `detail.selected_score` | 约 0.41（assertion 子集 dense top-1） |
+| `detail.suggested_score` | 约 0.76（coverage 子集 dense top-1，≥ 阈值 0.44） |
+| `detail.redirect_to` | `null` |
+
+**期望后端日志**（按顺序两行）：
+
+```
+[Timing] stage=offtopic_gate ms=<n>
+[Pipeline] code_type mismatch: selected=assertion(0.4xxx) vs suggested=coverage(0.7xxx) margin=0.10
+```
+
+`[Gate] offtopic ...` 不应出现——`best_overall = max(0.41, 0.76) = 0.76 ≥ 0.44` 通过 gate 1。
+
+**反例（旧 bug 现象，验证修复生效后不再发生）**：若 `detail.type='off_topic'`、前端弹"检测到非验证请求"Modal、后端日志出现 `[Gate] offtopic selected_dense=0.4xxx ... best_overall=0.4xxx`（best_overall 仍只看 selected）→ 说明 FEAT-15 未落地或被回滚（检查 `_compute_cross_code_type_scores` helper 是否存在 + gate 1 判定式是否用 `best_overall`）。
+
+**API 层验证**：
+
+```bash
+TOKEN=<jwt>
+curl -s -X POST http://localhost/api/v1/generate/preview \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"text":"交叉覆盖 awsize 与 awburst 的所有合法组合","code_type":"assertion","clk":"clk","rst":"rst_n","rst_polarity":"低有效","signals":[]}' \
+  | python3 -m json.tool
+```
+
+期望：`detail.type="code_type_mismatch"` + `detail.suggested_code_type="coverage"`。
 
 ### §2.3 under_specified（HTTP 422，跳转 IntentBuilder）
 
