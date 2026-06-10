@@ -611,10 +611,14 @@ def _patch_preview_deps(rag_candidates, llm_selection, db_get_return_value=None,
 
 @pytest.mark.asyncio
 async def test_pipeline_preview_off_topic_dense_threshold_early_returns():
-    """dense_top1_score < threshold → 在 normalize/RAG/LLM 之前就早返 OffTopicIntentError。
+    """全库 best_overall < threshold → 在 normalize/RAG/LLM 之前就早返 OffTopicIntentError。
 
     校准结果决定 threshold=0.44；mock dense=0.30 < 0.44，应当抛 OffTopicIntentError。
-    detector="rag_dense_threshold"，携带 top_dense_score 和 threshold 给前端。
+    FEAT-15：`top_dense_score` 现在传 `best_overall = max(selected, max(other))`，
+    本测试用 `_patch_preview_deps` 的均匀 mock，每个 code_type 都返 0.30 → best_overall
+    退化为 0.30，断言仍成立。若改用非均匀 mock（如 `_patch_dense_per_code_type`），
+    `top_dense_score` 会变成所有 code_type 中的最大值。
+    detector="rag_dense_threshold"，携带 top_dense_score 和 threshold 给前端 Modal。
     """
     rag = [_make_rag_candidate("any_id", score=0.9)]
     llm_sel = TemplateSelectionOutput(template_id="any_id", param_mapping={}, confidence=0.9)
@@ -623,6 +627,7 @@ async def test_pipeline_preview_off_topic_dense_threshold_early_returns():
         await pipeline_preview(_make_preview_inp(), fake_db)
 
     assert excinfo.value.detector == "rag_dense_threshold"
+    # uniform mock 下 best_overall == selected_dense == 0.30
     assert excinfo.value.top_dense_score == 0.30
     assert excinfo.value.threshold == 0.44  # 跟 config.py 默认一致
 
@@ -754,7 +759,10 @@ async def test_pipeline_preview_offtopic_short_circuits_normalize_and_rag():
     with stack, pytest.raises(OffTopicIntentError):
         await pipeline_preview(_make_preview_inp(), fake_db)
 
-    dense_mock.assert_awaited_once()
+    # FEAT-15：off-topic 闸现在同时算 selected + 每个非选中 code_type 的 dense top1
+    # （共享给 code_type_mismatch 闸）。调用次数 = registered code_type 数。
+    # 关键不变量：normalize / rag / llm 仍然零调用——闸触发前的早返契约。
+    assert dense_mock.await_count >= 1
     normalize_mock.assert_not_awaited()
     rag_mock.assert_not_awaited()
     llm_factory_mock.assert_not_awaited()
