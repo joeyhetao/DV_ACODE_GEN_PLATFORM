@@ -15,6 +15,7 @@ import pytest
 
 from app.schemas.intent import TemplateSelectionOutput
 from app.services.core.pipeline import (
+    CodeTypeMismatchError,
     OffTopicIntentError,
     PipelineInput,
     pipeline_preview,
@@ -146,3 +147,53 @@ async def test_marginal_ic_sample_passes_pipeline(sample):
 
     assert result.template_id == candidate_id
     assert result.confidence_source in {"llm_step1", "rag_fallback"}
+
+
+# ── cross_code_type_mismatch：错选 code_type 真请求 → mismatch 优先 ─────
+
+def _patch_pipeline_deps_per_code_type(
+    stack: ExitStack,
+    scores_by_code_type: dict[str, float],
+):
+    """FEAT-15：让 dense_top1_score 按 code_type kwarg 返不同分数。
+
+    其余下游（normalize/RAG/LLM/db）不需要 mock——本测试只到 gate 1/2 就抛异常，
+    pipeline 不会跑到后续阶段。
+    """
+    async def fake_dense(query_text, code_type=None):
+        return scores_by_code_type.get(code_type, 0.0)
+    stack.enter_context(patch(
+        "app.services.core.pipeline.dense_top1_score", new=fake_dense,
+    ))
+
+
+@pytest.mark.parametrize(
+    "sample",
+    load_corpus_samples("cross_code_type_mismatch"),
+    ids=lambda s: s["_pid"],
+)
+@pytest.mark.asyncio
+async def test_cross_code_type_mismatch_corpus_routing(sample):
+    """FEAT-15 永久回归：用户选错 code_type 的真 IC 请求应当抛 CodeTypeMismatchError。
+
+    mock 让 selected code_type 子集得分 0.41（< 阈值 0.44），suggested code_type 得分
+    0.76（≥ 阈值 0.44 且 gap=0.35 ≥ margin 0.10）。这是 FEAT-15 修复前会被错误地路由
+    到 OffTopicIntentError 的语义场景——本测试钉住"应当走 mismatch"的契约。
+    """
+    selected_ct = sample["code_type"]
+    suggested_ct = sample["suggested_code_type"]
+    assert sample.get("expected_gate") == "code_type_mismatch", \
+        f"corpus 该段所有样本应当声明 expected_gate=code_type_mismatch（{sample['_pid']}）"
+
+    scores = {selected_ct: 0.41, suggested_ct: 0.76}
+    with ExitStack() as stack:
+        _patch_pipeline_deps_per_code_type(stack, scores)
+        with pytest.raises(CodeTypeMismatchError) as excinfo:
+            await pipeline_preview(_build_input(sample), MagicMock())
+
+    e = excinfo.value
+    assert e.selected_code_type == selected_ct
+    assert e.suggested_code_type == suggested_ct
+    assert abs(e.selected_score - 0.41) < 1e-6
+    assert abs(e.suggested_score - 0.76) < 1e-6
+    assert e.detector == "rag_dense_cross_code_type"

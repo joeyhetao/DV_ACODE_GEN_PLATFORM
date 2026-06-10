@@ -235,39 +235,61 @@ async def pipeline_preview(inp: PipelineInput, db: AsyncSession) -> PreviewResul
     print(f"[Pipeline] source={inp.source} code_type={inp.code_type}", flush=True)
     selected_dense: float | None = None
     if settings.offtopic_gate_enabled:
+        # FEAT-15：off-topic 与 code_type_mismatch 共享一次跨 code_type dense 扫描。
+        # 老逻辑只看 selected 子集分数 → 错选 code_type 的真请求会被 off-topic 误拒；
+        # 新逻辑用 best_overall = max(selected, max(other)) 做"在域/离域"判定，离域
+        # 的同时仍可让 code_type_mismatch 拿到 best_other 信息给出 suggestion。
         _t = time.perf_counter()
         selected_dense = await dense_top1_score(inp.original_intent, code_type=inp.code_type)
+        cross_scores = await _compute_cross_code_type_scores(
+            inp.original_intent, inp.code_type, selected_dense
+        )
+        # default sentinel：当 registry 只有一个 code_type 时取不到"非选中"项，
+        # best_other_id=None 让 gate 2 跳过；best_other_score=-1.0 让 best_overall
+        # 自然退化为 selected_dense（max 不会选到 -1.0）。日志里看到 -1.0000 即此情况。
+        best_other_id, best_other_score = max(
+            ((ct, s) for ct, s in cross_scores.items() if ct != inp.code_type),
+            key=lambda x: x[1],
+            default=(None, -1.0),
+        )
+        best_overall = max(selected_dense, best_other_score)
         print(f"[Timing] stage=offtopic_gate ms={int((time.perf_counter() - _t) * 1000)}", flush=True)
-        if selected_dense < settings.offtopic_dense_threshold:
+
+        # gate 1: off-topic —— 全库最高分都低于阈值才算离域。语义切齐前端 Modal 文案
+        # "输入与模板库的最高相似度低于阈值"（"模板库" = 全库，不限选中 code_type）。
+        if best_overall < settings.offtopic_dense_threshold:
             print(
-                f"[Pipeline] off-topic dense gate: top1={selected_dense:.4f} "
-                f"< threshold={settings.offtopic_dense_threshold}",
+                f"[Gate] offtopic selected_dense={selected_dense:.4f} "
+                f"best_other_id={best_other_id} best_other_score={best_other_score:.4f} "
+                f"best_overall={best_overall:.4f} threshold={settings.offtopic_dense_threshold}",
                 flush=True,
             )
             raise OffTopicIntentError(
-                top_dense_score=selected_dense,
+                top_dense_score=best_overall,
                 threshold=settings.offtopic_dense_threshold,
             )
 
-    # Code-type 一致性闸：紧跟 off-topic 之后。off-topic 已经确认"在域"，这里再问
-    # "选对了类吗"——dense 跨 code_type 比较，谁高用谁的库。off-topic 闸关时本闸也跳。
-    if settings.offtopic_gate_enabled and settings.code_type_mismatch_gate_enabled:
-        suggestion = await _detect_code_type_mismatch(
-            inp.original_intent, inp.code_type, selected_dense, settings.code_type_mismatch_margin
-        )
-        if suggestion is not None:
-            sug_ct, sug_score = suggestion
-            print(
-                f"[Pipeline] code_type mismatch: selected={inp.code_type}({selected_dense:.4f}) "
-                f"vs suggested={sug_ct}({sug_score:.4f}) margin={settings.code_type_mismatch_margin}",
-                flush=True,
-            )
-            raise CodeTypeMismatchError(
-                selected_code_type=inp.code_type,
-                suggested_code_type=sug_ct,
-                selected_score=selected_dense or 0.0,
-                suggested_score=sug_score,
-            )
+        # gate 2: code_type_mismatch —— off-topic 已确认在域，再问"选对了类吗"。
+        # 追加 best_other_score >= threshold 前置条件：全库低分时不再给"换类"误导
+        # （场景如 selected=0.30 / other=0.42 / gap=0.12，best_other 自身就没"有把握"）。
+        if settings.code_type_mismatch_gate_enabled and best_other_id is not None:
+            gap = best_other_score - selected_dense
+            if (
+                gap >= settings.code_type_mismatch_margin
+                and best_other_score >= settings.offtopic_dense_threshold
+            ):
+                print(
+                    f"[Pipeline] code_type mismatch: selected={inp.code_type}({selected_dense:.4f}) "
+                    f"vs suggested={best_other_id}({best_other_score:.4f}) "
+                    f"margin={settings.code_type_mismatch_margin}",
+                    flush=True,
+                )
+                raise CodeTypeMismatchError(
+                    selected_code_type=inp.code_type,
+                    suggested_code_type=best_other_id,
+                    selected_score=selected_dense,
+                    suggested_score=best_other_score,
+                )
 
     # Resolve default LLM 提前到 normalize 之前：所有缓存 key 都需要 config_id 分桶，
     # 避免不同 LLM 配置写入的 (template_id, params) 互相覆盖。client 构造无网络 IO，开销可忽略。
@@ -725,35 +747,28 @@ def _values_only(params_with_source: dict[str, dict]) -> dict:
     return {name: meta["value"] for name, meta in params_with_source.items()}
 
 
-async def _detect_code_type_mismatch(
+async def _compute_cross_code_type_scores(
     intent: str,
     selected_code_type: str,
-    selected_score: float | None,
-    margin: float,
-) -> tuple[str, float] | None:
-    """跨 registry 里所有 code_type 跑 dense top1，找出"显著优于当前选择"的那个。
+    selected_score: float,
+) -> dict[str, float]:
+    """跨 registry 里所有 code_type 跑 dense top1，返回 {code_type_id: dense_top1_score}。
 
-    返回 (suggested_code_type, suggested_score)；无更优 / 没差到 margin → None。
-    selected_score 复用 off-topic 闸已算的值，避免重复 embedding。
+    返回的字典 **包含 selected_code_type 自身**——值复用传入的 selected_score，
+    避免重复 embedding 调用。调用方若只需"非选中"子集，自行过滤：
+        {ct: s for ct, s in d.items() if ct != selected_code_type}
+
+    被 pipeline_preview 的 gate 1（off-topic）+ gate 2（code_type_mismatch）共享，
+    一次调用满足两个闸的判定数据。
     """
     from app.services.registry import get_registry
     registry = get_registry()
-    if selected_score is None:
-        selected_score = await dense_top1_score(intent, code_type=selected_code_type)
-    best_other_ct: str | None = None
-    best_other_score = -1.0
+    scores: dict[str, float] = {selected_code_type: selected_score}
     for ct in registry.all():
         if ct.id == selected_code_type:
             continue
-        score = await dense_top1_score(intent, code_type=ct.id)
-        if score > best_other_score:
-            best_other_score = score
-            best_other_ct = ct.id
-    if best_other_ct is None:
-        return None
-    if best_other_score - selected_score >= margin:
-        return best_other_ct, best_other_score
-    return None
+        scores[ct.id] = await dense_top1_score(intent, code_type=ct.id)
+    return scores
 
 
 async def _keyword_supplement(
