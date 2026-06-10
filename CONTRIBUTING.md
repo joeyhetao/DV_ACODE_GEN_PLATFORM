@@ -542,6 +542,51 @@ docker compose exec backend pytest tests/test_offtopic_corpus_real_llm.py --real
 
 详细 schema 字段约定见 `backend/tests/data/offtopic_corpus.yaml` 文件头注释。
 
+### 11.5 添加 cross-code-type 错选样本（FEAT-15 起）
+
+FEAT-15 把 off-topic gate 判定基准从"所选 code_type 子集 dense top-1"升级为"全 code_type 库 best_overall"，并给 code_type_mismatch gate 追加 `best_other_score >= threshold` 前置条件。两闸语义切分后，`offtopic_corpus.yaml` 多出一类新样本——**"合法 IC 意图但用户选了错的 code_type"**，期望路由是 `CodeTypeMismatchError` 而非 `OffTopicIntentError`。本子节给这类样本的录入规范。
+
+**`expected_gate` 字段（必填，FEAT-15 起）**：
+
+| 取值 | 含义 | 适用段 |
+|---|---|---|
+| `off_topic` | 全 code_type 库 best_overall < threshold，真离题 | `off_topic` 段（默认值，已有样本可省略） |
+| `code_type_mismatch` | 在域但用户选错 code_type；`best_other_score - selected ≥ margin` 且 `best_other_score ≥ threshold` | `marginal_ic` 段（推荐）或新增 `cross_code_type_mismatch` 段 |
+| `null` | 两闸均不触发，请求继续进流水线（边界回归用） | `marginal_ic` 段 |
+
+老样本无 `expected_gate` 字段时按"`off_topic` 段→`off_topic`、`marginal_ic` 段→`null`"自动推断，保持向后兼容。
+
+**`marginal_ic` 与 `cross_code_type_mismatch` 的区别**：
+
+- `marginal_ic`（无 `expected_gate` 或 `expected_gate: null`）：边界 IC 请求，无论选哪个 code_type 都不触发任一闸——`best_overall` 自身没那么高（接近但 > threshold），且 gap 不显著
+- `cross_code_type_mismatch`（`expected_gate: code_type_mismatch`）：意图本身是合法 IC 验证请求，但用户选了错的 code_type——某非 selected 的 code_type 得分高出 selected 至少 margin（默认 0.10）且 ≥ threshold（默认 0.44）。**关键判据是"另一个 code_type 高分"，不是"全库都不太高"**
+
+**录入流程**（在 §11.1 触发点 A/B 之上的补充）：
+1. 复现：在前端选错 code_type（如"覆盖率"语义选 assertion），从后端日志读 `[Gate] offtopic selected_dense=... best_other_id=... best_other_score=... best_overall=... threshold=...` 行
+2. 确认 `best_other_score - selected_dense ≥ 0.10` 且 `best_other_score ≥ 0.44`——否则该样本不该期待 `code_type_mismatch`（仍按 §11.1 路径标 `off_topic` 或 `marginal_ic`）
+3. 在 `offtopic_corpus.yaml` 的 `marginal_ic` 段加一条样本，必填 `id` / `input` / `code_type`（用户当时选的错类）/ `added` / `source: "user report YYYY-MM-DD"` / `reason` / **`expected_gate: code_type_mismatch`** / 可选 `suggested_code_type`（仅供 review，断言不绑）
+4. **先跑 mock 测——预期当前 fail 或测试不识别新字段**（用 §11.1 红灯逻辑确认语料抓到真问题）
+5. 跑 `test_offtopic_corpus_mocked.py::test_cross_code_type_mismatch_corpus_routing` 变绿 → 提 PR → 永守
+
+**mocked 测试 patch 模式（与 `test_marginal_ic_passes` 关键差异）**：
+
+`test_marginal_ic_passes` 假设的是"单 dense top-1 函数返一个 float"，所以 `monkeypatch.setattr` 把 `dense_top1_score` 替换为 `lambda intent, code_type=None: 0.55` 这类常量返回值。这套 patch 对 cross-code-type 样本无效——`pipeline_preview` 会顺序调 `dense_top1_score(intent, code_type=selected)` + `_compute_cross_code_type_scores(intent, selected, selected_score)`，后者内部循环对每个非 selected code_type 各调一次 `dense_top1_score`。你必须 patch 两个 code_type 的得分分布而不是单一阈值，否则 best_other_score 永远 = selected_score → gate 2 永远不触发。推荐 patch 法：
+
+```python
+async def fake_dense_top1(intent, code_type=None):
+    # 按 (intent_fingerprint, code_type) 二元组返不同分布
+    if code_type == "assertion":
+        return 0.41
+    if code_type == "coverage":
+        return 0.76
+    return 0.0
+monkeypatch.setattr("app.services.rag.engine.dense_top1_score", fake_dense_top1)
+```
+
+或者参考 `test_pipeline_preview_code_type_mismatch_raises_with_suggestion` 已有的 `_patch_dense_per_code_type` helper 直接复用。`test_cross_code_type_mismatch_corpus_routing` 函数应循环消费 `expected_gate: code_type_mismatch` 的样本，对每条断言抛出的异常类型是 `CodeTypeMismatchError` 而非 `OffTopicIntentError`，**不绑** `suggested_code_type` 的具体值（避免新增 code_type 后破测）。
+
+**与 `test_marginal_ic_passes` 共存约定**：新函数独立编写，**不**修改 `test_marginal_ic_passes` 既有断言模式（后者继续守"边界 IC 请求两闸均不触发"语义），这是 FEAT-15 spec Q5 review 决议。
+
 ---
 
 ## 12. 近邻模板混淆对回归语料维护
