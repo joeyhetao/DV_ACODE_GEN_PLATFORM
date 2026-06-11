@@ -4,12 +4,7 @@ from pathlib import Path
 import openpyxl
 
 from app.services.registry import get_registry
-
-def _col_to_idx(col_letter: str) -> int:
-    result = 0
-    for ch in col_letter.upper():
-        result = result * 26 + (ord(ch) - ord("A") + 1)
-    return result
+from app.services.parser.utils import col_to_idx
 
 
 @dataclass
@@ -58,7 +53,7 @@ def parse_excel(file_path: Path, code_type: str) -> list[ParsedRow]:
             continue
 
         def get_cell(col_letter: str):
-            idx = _col_to_idx(col_letter) - 1
+            idx = col_to_idx(col_letter) - 1
             if idx < len(raw_row):
                 v = raw_row[idx]
                 return str(v).strip() if v is not None else None
@@ -74,7 +69,7 @@ def parse_excel(file_path: Path, code_type: str) -> list[ParsedRow]:
             start_col = signals_def["start_col"]
             max_count = signals_def["max_count"]
             cpp = signals_def["cols_per_signal"]
-            start_idx = _col_to_idx(start_col)
+            start_idx = col_to_idx(start_col)
 
             for i in range(max_count):
                 base = start_idx + i * cpp - 1
