@@ -22,6 +22,7 @@
 14. [FEAT-11 `llm_direct` 兜底路径测试 recipe](#14-feat-11-llm_direct-兜底路径测试-recipe)
 15. [FEAT-12 `improvement_reports` 测试 recipe](#15-feat-12-improvement_reports-测试-recipe)
 16. [FEAT-13 模板成熟度门控测试 recipe](#16-feat-13-模板成熟度门控测试-recipe)
+17. [FEAT-16 新增 code_type 时 template 自动同步](#17-feat-16-新增-code_type-时-template-自动同步)
 
 ---
 
@@ -924,6 +925,69 @@ cd backend && pytest tests/test_template_maturity_gating.py -v
 - 与 `test_pipeline_preview_render.py`：本套件断言 stage1 Filter 含 maturity 条件，pipeline 套件已 mock 整条 RAG 链；二者并行不耦合
 - 与 `test_offtopic_corpus_mocked.py` / `test_template_selection_corpus_mocked.py`：上线后这两份套件的 mock 不需要修改（它们 mock 的是 RAG 返回结果，不关心底层 Filter），但**真实回归套件** `--real-llm` / `--real-embedding` 跑法在 `OFFTOPIC_DENSE_THRESHOLD` 重新校准前可能出现边界样本误差，注意区分"模型问题"与"阈值需重校"
 - 与 `lib_manager.py` 手测：本套件不覆盖 Qdrant payload 写入（`_sync_to_qdrant` 的真实行为），需手测确认 `docker compose exec backend python lib_manager.py rebuild` 后 Qdrant points 的 payload 含 `maturity_level` 字段（详 docs/test-manual.md §7.5）
+
+---
+
+## 17. FEAT-16 新增 code_type 时 template 自动同步
+
+FEAT-16 的批量生成模板下载端点 `GET /api/v1/batch/template`（详 ARCHITECTURE §3.7.1、§5.1）由 `backend/app/services/parser/template_writer.py::build_template_workbook(registry)` 实现，遍历 `CodeTypeRegistry.all()` 动态构造 sheet。本节给出**新增 code_type 时模板自动扩展的工作机制**与**schema 字段顺序变化时必须重跑的回归测试**。
+
+### 17.1 新增 code_type：模板自动扩展，无需改 Python
+
+新增一个 code_type（按 ARCHITECTURE §3.14 "代码类型注册表（Code Type Registry）" 的"3 个 YAML 零 Python"约定）需要落地：
+
+1. `backend/data/code_types/<new_type>.yaml` — 声明 `id` / `excel_sheet_name` / `excel_schema_file` / `signal_roles` / `sentence_pattern` / 子分类等
+2. `backend/data/schemas/<new_type>_schema.yaml` — `fields` + 可选 `signals` 块
+3. `backend/data/scenarios/<new_type>_scenarios.yaml` — 意图构建器场景描述
+
+落地完成 + 后端重启 + （如需）`python lib_manager.py import` 后：
+
+- **模板下载端点自动新增一个 sheet**：`build_template_workbook` 遍历 `registry.all()`，新 code_type 的 `excel_sheet_name` 自动成为新 sheet 名，表头来源新 schema yaml 的 `fields`（跳过 `output: true` 字段）+ `signals` 块展开。**`template_writer.py` 完全不动**——这是 "registry 驱动" 设计的红利。
+- **维护成本为 0**：不需要追加新行/新列的 Python 分支，不需要在 `build_template_workbook` 写 `if code_type == "...":`；这与 §3.9 `excel_parser.py` 的解析层是同一份 schema 的两端使用，由此保证下载→填→上传的列结构闭环兼容。
+
+### 17.2 schema `col` 字段顺序变化时：必须重跑闭环回归
+
+模板下载端点和解析层共用 `data/schemas/*.yaml` 的 `col` 字段（`A` / `B` / `G` …）确定列绝对位置。当**已有 code_type** 的 schema yaml 出现以下任一变化时：
+
+- 调整字段的 `col`（如 `所属模块: B` 改 `所属模块: C`）
+- 调整 `signals` 块的 `start_col` / `cols_per_signal` / `max_count` / `sub_fields[*].suffix`
+- 切换 `output: true` 标记（让某列从"系统回填"变成"用户输入"或反向）
+- 增删非 output 字段（影响列序）
+
+**必须执行**：
+
+```bash
+# 在 backend 容器内（或 host venv）
+docker compose exec backend pytest tests/test_batch_template_download.py::test_download_template_then_upload_roundtrip -v
+```
+
+该用例把 `build_template_workbook()` 产物经 `BytesIO` 直接喂给 `excel_parser.parse_excel()`：
+
+- ✅ 通过 → 下载→填→上传闭环兼容，本次 schema 改动安全
+- ❌ 报错（`ValueError: 缺少必填列` / `KeyError: 'XXX'` / row 解析失败）→ schema 改动**破坏了模板下载与上传解析的列对齐**，必须修正 schema 或同步修正 `excel_parser.py`
+
+附加用例（可单独跑）：
+
+```bash
+# 验证 SVA 表头顺序与 sva_schema.yaml 一致
+docker compose exec backend pytest tests/test_batch_template_download.py::test_assertion_sheet_headers_match_schema -v
+# 验证 Coverage 表头顺序与 coverage_schema.yaml 一致
+docker compose exec backend pytest tests/test_batch_template_download.py::test_coverage_sheet_headers_match_schema -v
+```
+
+### 17.3 不变量回顾
+
+- **L1 — sheet 名来源单一**：sheet 名**只能**来自 `data/code_types/*.yaml` 的 `excel_sheet_name`，不允许在 `template_writer.py` 硬编码字符串
+- **L2 — 表头来源单一**：列名**只能**来自 `data/schemas/*.yaml` 的 `fields[*].name`，不允许在 `template_writer.py` 硬编码列名
+- **L3 — 列顺序**：`col` 字段（`A` / `B` / …）是唯一权威，与 `excel_parser._col_to_idx` 同源；任何"按 fields 出现顺序排列"的简化实现都会在 SVA 表 G–R 信号块上踩坑（fields 与 signals 不连续）
+- **L4 — output 字段过滤**：标注为 `output: true` 的"系统回填"列**不应**出现在下载模板中（用户不填这些列）；如需调整哪些列对用户可见，在 schema yaml 改 `output` 标记，**不要**改 `template_writer.py` 的过滤逻辑
+- **L5 — 闭环兼容**：任何 schema yaml 改动必须不破坏 `test_download_template_then_upload_roundtrip`；这是 schema 演化的**回归红线**
+
+### 17.4 与其他套件的关系
+
+- 与 `excel_parser.py` 单测：本套件断言的是"模板下载内容与 parser 期望对齐"，parser 自身的健壮性（中文列名、合并单元格、空行）由 §3.9 解析层既有单测覆盖
+- 与 `test_batch_preflight.py` / Celery 集成测试：本套件**不**覆盖批量任务执行（参见 §3.7），仅守护"用户拿到的空白模板"与 `parse_excel` 输入契约一致
+- 与 `lib_manager.py`：模板下载端点**完全不读 templates 表**，与 Qdrant / PG / Redis 无关，本套件不依赖任何活基础设施
 
 ---
 

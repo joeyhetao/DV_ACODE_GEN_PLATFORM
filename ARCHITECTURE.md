@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.27  
+**版本**：v2.28  
 **状态**：已确认  
-**日期**：2026-06-10  
+**日期**：2026-06-11  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -102,6 +102,12 @@
   - §3.15.3 `[Gate] offtopic` 日志格式扩字段：旧只记 `top_dense_score`，新格式打印 `selected_dense=<f.4> best_other_id=<id> best_other_score=<f.4> best_overall=<f.4> threshold=<f>`，便于排查"哪类高分把请求救回了 / 全库均匀低分触发 off-topic 时谁离阈值最近"。`registry 只有一个 code_type` 时 `best_other_id=None / best_other_score=-1.0` 哨兵值（日志里看到 `-1.0000` 即此情形），`best_overall` 自然退化为 `selected_dense`，Step 0b 跳过
   - §1.1 确定性契约**不动**：本次仅闸语义调整，未引入新 LLM 调用、未改 template 选择 / param mapping / Jinja 渲染、未改缓存 key 结构；闸顺序（Step 0a → Step 0b）与异常类型不变；前端 `handleApiError` / Modal / `redirect_to` 字段约定不变
   - 新增测试 `backend/tests/test_offtopic_codetype_priority.py` 覆盖 4 场景（错选 code_type → mismatch / 全离题 → off_topic / `best_overall ≥ threshold` 但 `gap < margin` → 两闸均不触发 / `gap ≥ margin` 但 `best_other < threshold` → off_topic 而非 mismatch）；`backend/tests/data/offtopic_corpus.yaml` 新增 4–6 条 cross-code-type 错选样本，分类为 `marginal`，新字段 `expected_gate: code_type_mismatch | off_topic | null` 由 `test_offtopic_corpus_mocked.py` 新增 `test_cross_code_type_mismatch_corpus_routing` 函数按 expected_gate 断言抛出的异常类型；既有 `test_pipeline_preview_code_type_mismatch_raises_with_suggestion` 与 marginal_ic 断言无回归
+- v2.27 → v2.28：**FEAT-16 批量生成 Excel 模板下载端点**——
+  - §3.7.1 新增"模板下载端点（FEAT-16）"小节：`GET /api/v1/batch/template` 登录用户+，动态遍历 `CodeTypeRegistry` 即时生成多 sheet `.xlsx`（assertion→`SVA需求` / coverage→`Coverage需求`），sheet 名 ← `data/code_types/*.yaml` 的 `excel_sheet_name`、表头 ← `data/schemas/*.yaml` 的 `fields`（跳过 `output: true`）+ `signals` 块展开；`Content-Disposition: attachment; filename=batch_template_<YYYYMMDD>.xlsx`；端点**无状态无持久化**（不写库、不计数、不缓存、不审计），构造逻辑落在 `backend/app/services/parser/template_writer.py::build_template_workbook(registry)`（纯 I/O 函数，不调 LLM、不读 Qdrant、不参与 §1.1 确定性契约）
+  - §5.1 端点表追加 `GET /api/v1/batch/template` 一行（必须先于 `GET /{job_id}/...` 参数化路由注册）
+  - **占位提示写在 B2（column=2）而非 A2**：`excel_parser` 在 A 列（`raw_row[0]`）为空时整行跳过，让"原样上传空模板"路径不会把占位文字误解析为一条 row_id，进而保证 `POST /api/v1/batch/preflight` 返 HTTP 200 + 0 行结果
+  - 新增 `backend/tests/test_batch_template_download.py` 7 个用例（详 §3.7.1 末段回归契约）；该套件不依赖任何活基础设施
+  - §1.1 确定性契约**不动**：本路径与 §3.7 Celery 异步批量任务路径互相独立——前者交付空白模板，后者消费用户填好的 Excel；未引入新 LLM 调用、未改 RAG / param mapping / Jinja 渲染、未改缓存 key 结构
 
 ---
 
@@ -592,6 +598,37 @@ Celery Worker 并行处理（默认并发数 10，I/O密集型任务，通过 CE
   ↓
 前端下载
 ```
+
+#### 3.7.1 模板下载端点（FEAT-16）
+
+批量生成的入口先于上传 Excel，需要用户拿到一份**符合系统格式约定**的空白模板。`GET /api/v1/batch/template`（详 §5.1）即为此而设，登录后所有角色均可访问，无 query 参数；响应是一个动态生成的 `.xlsx` 文件，`Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`，`Content-Disposition: attachment; filename=batch_template_YYYYMMDD.xlsx`（日期为请求当天 UTC）。本端点**无状态、无持久化**——不写库、不计数、不审计、不缓存，进程内每次按 registry 现状即时构造。
+
+构造逻辑落在 `backend/app/services/parser/template_writer.py::build_template_workbook(registry: CodeTypeRegistry) -> openpyxl.Workbook`，是一个纯 I/O 函数，不调 LLM、不读 Qdrant、不参与 §1.1 确定性契约。流程：
+
+```
+build_template_workbook(registry)
+  ↓
+for ct in registry.all():                              # 遍历已注册 code_type
+    ws = wb.create_sheet(ct.excel_sheet_name)          # sheet 名 ← code_type yaml
+    schema = registry.get_excel_schema(ct.id)          # 表头 ← schema yaml
+    写入 fields（跳过 output=true）+ signals 块展开    # 列序与 excel_parser._col_to_idx 对齐
+    首行加粗 + 居中 + 浅灰底（PatternFill D9D9D9）
+    第 2 行 B 列（column=2）写浅灰占位提示，A 列必须留空
+    （否则 excel_parser 会把占位文字当成一条 row_id 解析）
+    列宽 max(12, len(header) * 1.5)
+  ↓
+返回 openpyxl.Workbook（端点层 wb.save(BytesIO) → StreamingResponse）
+```
+
+关键解耦点：
+
+- **sheet 名 ← `data/code_types/*.yaml`**：assertion 对应 `SVA需求`、coverage 对应 `Coverage需求`，与 `excel_parser.py` 期望的 sheet 名严格一致；新增 code_type 时 yaml 落地后模板**自动**新增一个 sheet，`template_writer.py` 不动。
+- **表头 ← `data/schemas/*.yaml`**：列名与列绝对位置（`col` 字段，`A` / `B` / `G` …）从 schema 读取，跳过标注为 `output: true` 的"系统回填"列；`signals` 块按 `start_col` / `cols_per_signal` / `max_count` / `sub_fields[*].suffix` 展开（如"信号1名称"/"信号1位宽"/"信号1角色"… 共 4×3=12 列）。这与 §3.9.1 两份表格规范及 `excel_parser.py` 解析层是**同一份 schema 的两端使用**，由此保证下载→填→上传的列结构闭环兼容。
+- **路由顺序**：`batch.py` 中 `GET /{job_id}/...` 是参数化路由，`GET /template` 必须**先于**它们注册，否则 `template` 字面量会被当作 `job_id` 落入参数路由。
+- **auth**：依赖 `Depends(get_current_user)`，未携带 Bearer token 返 HTTP 401，权限粒度不细分到角色。
+- **依赖**：`openpyxl` 既有依赖（`excel_parser.py` 已用），无需新增 `requirements.txt` 行。
+
+回归契约：下载→上传闭环由 `backend/tests/test_batch_template_download.py::test_download_template_then_upload_roundtrip` 守护——`build_template_workbook()` 产物经 `BytesIO` 直接喂给 `excel_parser.parse_excel()` 必须无异常，且模板原样不修改（空数据行）走 `POST /api/v1/batch/preflight` 必须返 HTTP 200。该测试是 schema 演化（任何 `col` 字段顺序变化、`output` 标记变化、新增字段）的回归红线。
 
 ---
 
@@ -2471,6 +2508,7 @@ WHERE is_default = true;
 | POST | `/api/v1/generate/preview` | 两步式第一步：返回模板候选 + 参数预填（含 5 类源标识与 sanitized/validation_error） | 普通用户+ |
 | POST | `/api/v1/generate/render` | 两步式第二步：用户确认参数后渲染 + 写代码缓存（`intent_hash` 非空时也写 GenerationRecord）；响应体含 `generation_mode: "rag"` 字段（v2.23 / FEAT-11） | 普通用户+ |
 | POST | `/api/v1/generate/llm-fallback` | **v2.23 / FEAT-11 Stage 2**：用户对 `rag` 结果不满意时触发 LLM 自由生成兜底；入参 `{generation_record_id}`，写新 `GenerationRecord(generation_mode='llm_direct', parent_record_id=source.id)`；响应 `{code, generation_record_id, generation_mode: "llm_direct", cache_hit}`；5 类错误：404（detail 为纯字符串）/ 422 `llm_direct_chained_not_allowed` / 422 `llm_direct_no_code` / 422 `llm_direct_internal_error`（ValueError 分支）/ 500 `llm_direct_internal_error`（Exception 分支）（详 §3.17） | 普通用户+ |
+| GET | `/api/v1/batch/template` | **v2.27 / FEAT-16**：下载批量生成空白 Excel 模板（多 sheet 按 code_type 分页），sheet 名 ← `data/code_types/*.yaml`、表头 ← `data/schemas/*.yaml`，无状态、不写库；响应 `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` + `Content-Disposition: attachment; filename=batch_template_<YYYYMMDD>.xlsx`；路由必须先于 `/{job_id}/...` 注册（详 §3.7.1） | 登录用户+ |
 | POST | `/api/v1/batch/upload` | 上传 Excel 创建批量任务 | 普通用户+ |
 | POST | `/api/v1/batch/preflight` | 上传后前置信度预检（轻量，仅Stage1） | 普通用户+ |
 | GET | `/api/v1/batch/{job_id}` | 查询批量任务状态 | 普通用户+ |

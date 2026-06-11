@@ -21,6 +21,7 @@
   - [§5.5 我的贡献页状态追踪](#55-我的贡献页状态追踪)
   - [§5.6 管理员三层防冲突面板](#56-管理员三层防冲突分析面板feat-4)
 - [6. 批量生成](#6-批量生成)
+  - [§6.0 下载 Excel 模板（FEAT-16）](#60-下载-excel-模板feat-16)
 - [7. 模板库浏览与管理](#7-模板库浏览与管理)
   - [§7.4 admin 端模板成熟度切换（FEAT-13）](#74-admin-端模板成熟度切换feat-13--v35)
   - [§7.5 experimental 模板不参与 RAG 召回手测（FEAT-13）](#75-experimental-模板不参与-rag-召回手测feat-13--v35)
@@ -1301,9 +1302,54 @@ curl -s -X POST http://localhost/api/v1/contributions \
 
 ## 6. 批量生成
 
+### §6.0 下载 Excel 模板（FEAT-16）
+
+> 兑现 PRD §3.1.1 / §6.3 步骤 1 长期约定的下载入口。任何登录用户可执行。
+
+#### 前置
+
+- 已登录任一账号（角色不限：user / lib_admin / super_admin 均可）
+- 后端容器 healthy（`docker compose ps backend` → `healthy`）
+
+#### 步骤与期望
+
+1. **进入「批量生成」页**：浏览器登录后侧边栏点「批量生成」
+   - **期望**：页面顶部能看到两个并排按钮 —— 左侧「下载 Excel 模板」（次要按钮，`type="default"`，前缀图标为下载箭头 `DownloadOutlined`），右侧「选择 Excel 文件」（既有上传按钮）
+   - **期望**：按钮组下方有一行灰色提示文字（`Typography.Text type="secondary"`），说明模板包含 2 个 sheet（SVA需求、Coverage需求）
+
+2. **点击「下载 Excel 模板」**
+   - **期望**：按钮短暂呈 `loading` 状态（约 < 1s，单击不可重复触发）
+   - **期望**：浏览器弹出保存对话框，默认文件名为 `batch_template_<YYYYMMDD>.xlsx`，其中 `<YYYYMMDD>` 是当天 UTC 日期（如 `batch_template_20260611.xlsx`）
+   - 保存到本地任意位置
+
+3. **用 Excel / WPS 打开下载的文件**
+   - **期望 A — sheet 数量与名称**：底部 sheet 标签恰好 2 个，名称必须严格为 `SVA需求` 和 `Coverage需求`（中文字符，与 `backend/data/code_types/assertion.yaml` 的 `excel_sheet_name: "SVA需求"` 和 `coverage.yaml` 的 `excel_sheet_name: "Coverage需求"` 一致）。**不允许**出现 "Sheet1" / "assertion" / "coverage" 等英文名
+   - **期望 B — `SVA需求` 表头**：第 1 行为加粗灰底居中表头，按 **A → U 列**顺序（共 21 列）应为：`编号` / `所属模块` / `时钟` / `复位信号` / `复位极性` / `协议` / `信号1名称` / `信号1位宽` / `信号1角色` / `信号2名称` / `信号2位宽` / `信号2角色` / `信号3名称` / `信号3位宽` / `信号3角色` / `信号4名称` / `信号4位宽` / `信号4角色` / `验证意图` / `严重级别` / `备注`。**不包含** §3.9.1 表中 V/W/X 三列（`[输出]匹配模板` / `[输出]置信度` / `[输出]生成状态`）——这些是系统回填列（schema `output: true`），`template_writer._collect_headers` 显式跳过，不出现在用户下载的空白模板中
+   - **期望 C — `Coverage需求` 表头**：第 1 行按 **A → S 列**顺序（共 19 列）应为：`编号` / `所属模块` / `采样时钟` / `复位信号` / `复位极性` / `覆盖类型` / `主信号名称` / `主信号位宽` / `主信号数据类型` / `交叉信号1名称` / `交叉信号1位宽` / `交叉信号1数据类型` / `交叉信号2名称` / `交叉信号2位宽` / `交叉信号2数据类型` / `Bin提示` / `采样条件` / `覆盖意图` / `备注`。同样**不包含** §3.9.1 表中 T/U/V 三个 `[输出]` 列（理由同上）
+   - **期望 D — 视觉与占位行**：第 1 行所有单元格背景为浅灰（`#D9D9D9`），字体加粗，水平居中；列宽不挤压，能完整显示中文表头。**第 2 行 B 列（B2）**有浅灰占位提示文字指示从第 3 行开始填写；**A2 必须为空**（这是设计——`excel_parser` 在 A 列为空时跳过整行，让空模板原样上传 preflight 返 200 + 0 行结果，否则占位文字会被当成一条 row_id）
+
+4. **闭环验证：模板不修改直接上传**
+   - 回到「批量生成」页，**不在模板里填任何数据**，直接点「选择 Excel 文件」选刚才下载的 `batch_template_<YYYYMMDD>.xlsx` 上传
+   - 触发预检（`POST /api/v1/batch/preflight`）
+   - **期望**：返回 HTTP 200，前端预检面板显示"解析完毕：0 行需求"或类似空数据提示，**不报错**（非 400 / 422 / 500）
+   - **若返回 422 `excel_parse_error`** → 说明模板下载产物的 sheet 名/表头与 `excel_parser.py` 期望不对齐，属于回归。立刻在 backend 跑 `pytest tests/test_batch_template_download.py::test_download_template_then_upload_roundtrip -v` 复现并定位是 `data/schemas/*.yaml` `col` 字段错位还是 `template_writer.py` 渲染逻辑漂移（CONTRIBUTING §17.2 给出 schema 改动后必须重跑的回归命令）
+
+#### 错误路径
+
+| 现象 | 期望响应 | 排查 |
+|---|---|---|
+| 未登录访问 `GET /api/v1/batch/template`（用 `curl` 不带 Bearer token） | HTTP 401 `Not authenticated` | 端点 `Depends(get_current_user)` 是否被正确挂载 |
+| 点击按钮 spinner 转完后弹 `message.error` | 前端 Toast 显示后端报错原因 | 看 `docker compose logs backend \| tail -50`；可能是 registry 加载失败或 openpyxl 异常 |
+| sheet 名出现英文（如 `assertion` / `Sheet1`） | 不符合期望 A | 检查 `template_writer.py` 是否硬编码了 sheet 名；它应该读 `ct.excel_sheet_name` |
+| 表头列缺失（如 `严重级别` 不见了） | 不符合期望 B/C | 检查 `data/schemas/sva_schema.yaml` 该字段是否被错误标记 `output: true`，或 `col` 字段重复 |
+
+#### 与 §6.1 的衔接
+
+§6.1 完整批量生成流程的步骤 1 即"下载 Excel 模板"——本节是该步骤的详细验收。后续步骤 2-8 仍按 §6.1 走（填测试数据 → 上传 → 预览 → 生成 → 下载 ZIP）。
+
 ### §6.1 完整流程（Excel → ZIP）
 
-1. 「批量生成」页下载 Excel 模板（按 code_type 区分 sheet）
+1. 「批量生成」页下载 Excel 模板（按 code_type 区分 sheet，详 §6.0）
 2. 填 5 行测试数据（混合 assertion + coverage）
 3. 上传 Excel
 4. 看解析预览：行数、列识别
