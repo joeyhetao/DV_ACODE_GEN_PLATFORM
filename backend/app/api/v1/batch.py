@@ -1,8 +1,10 @@
 from __future__ import annotations
+import io
 import uuid
+from datetime import date
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -14,6 +16,7 @@ from app.schemas.generate import BatchUploadResponse, BatchStatusResponse, Prefl
 from app.services.registry import get_registry
 from app.services.intent.preflight import preflight_row
 from app.services.parser.excel_parser import parse_excel
+from app.services.parser.template_writer import build_template_workbook
 
 UPLOAD_DIR = Path("/app/uploads")
 RESULT_DIR = Path("/app/results")
@@ -78,6 +81,25 @@ async def upload_batch(
         total_rows=total_rows,
         code_type=code_type,
         status="pending",
+    )
+
+
+# 路由顺序关键：`GET /template` 必须注册在所有 `GET /{job_id}/...` 之前，否则 FastAPI
+# 会把 "template" 当作 job_id 路径参数命中 status / download 路由。
+@router.get("/template", response_class=StreamingResponse)
+async def download_template(current_user: User = Depends(get_current_user)):
+    buffer = io.BytesIO()
+    wb = build_template_workbook(get_registry())
+    wb.save(buffer)
+    buffer.seek(0)
+    filename = f"batch_template_{date.today().strftime('%Y%m%d')}.xlsx"
+    # filename 用 RFC 6266 推荐的 quoted-string 形式，避免日后 filename 含特殊字符
+    # 或来自外部输入时被 header injection。当前 filename 是固定 ASCII 模式，不会
+    # 触发 quoting 边角情况。
+    return StreamingResponse(
+        buffer,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

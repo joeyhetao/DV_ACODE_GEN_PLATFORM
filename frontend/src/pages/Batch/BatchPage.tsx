@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import {
   Card, Upload, Button, Select, Progress, Table, Tag, Space,
-  Steps, Alert, Statistic, Row, Col, message, Divider,
+  Steps, Alert, Statistic, Row, Col, message, Divider, Typography,
 } from 'antd'
 import { UploadOutlined, DownloadOutlined, EyeOutlined, SendOutlined } from '@ant-design/icons'
 import { batchApi, BatchJob, PreflightRowResult } from '../../api/batch'
@@ -19,6 +19,7 @@ export default function BatchPage() {
   const [jobStatus, setJobStatus] = useState<BatchJob | null>(null)
   const [uploading, setUploading] = useState(false)
   const [downloading, setDownloading] = useState(false)
+  const [templateLoading, setTemplateLoading] = useState(false)
   const pollRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const pollDelayRef = useRef(2000)
 
@@ -87,6 +88,17 @@ export default function BatchPage() {
     }
   }
 
+  const handleDownloadTemplate = async () => {
+    setTemplateLoading(true)
+    try {
+      await batchApi.downloadTemplate()
+    } catch {
+      message.error('模板下载失败')
+    } finally {
+      setTemplateLoading(false)
+    }
+  }
+
   const avgConfidence = preflightResults.length
     ? preflightResults.reduce((s, r) => s + r.estimated_confidence, 0) / preflightResults.length
     : 0
@@ -109,42 +121,54 @@ export default function BatchPage() {
       ]} />
 
       <Card title="文件上传">
-        <Space wrap>
-          <Select
-            placeholder="选择代码类型"
-            value={codeType || undefined}
-            onChange={setCodeType}
-            style={{ width: 200 }}
-          >
-            {codeTypes.map((ct) => (
-              <Select.Option key={ct.id} value={ct.id}>{ct.display_name}</Select.Option>
-            ))}
-          </Select>
-          <Upload
-            beforeUpload={(f) => { setFile(f); return false }}
-            maxCount={1}
-            accept=".xlsx,.xls"
-            onRemove={() => setFile(null)}
-          >
-            <Button icon={<UploadOutlined />}>选择 Excel 文件</Button>
-          </Upload>
-          <Button
-            icon={<EyeOutlined />}
-            onClick={handlePreflight}
-            loading={preflightLoading}
-            disabled={!file || !codeType}
-          >
-            预检分析
-          </Button>
-          <Button
-            type="primary"
-            icon={<SendOutlined />}
-            onClick={handleUpload}
-            loading={uploading}
-            disabled={!file || !codeType}
-          >
-            开始批量生成
-          </Button>
+        <Space direction="vertical" size="small" style={{ width: '100%' }}>
+          <Space wrap>
+            <Select
+              placeholder="选择代码类型"
+              value={codeType || undefined}
+              onChange={setCodeType}
+              style={{ width: 200 }}
+            >
+              {codeTypes.map((ct) => (
+                <Select.Option key={ct.id} value={ct.id}>{ct.display_name}</Select.Option>
+              ))}
+            </Select>
+            <Button
+              icon={<DownloadOutlined />}
+              loading={templateLoading}
+              onClick={handleDownloadTemplate}
+            >
+              下载 Excel 模板
+            </Button>
+            <Upload
+              beforeUpload={(f) => { setFile(f); return false }}
+              maxCount={1}
+              accept=".xlsx,.xls"
+              onRemove={() => setFile(null)}
+            >
+              <Button icon={<UploadOutlined />}>选择 Excel 文件</Button>
+            </Upload>
+            <Button
+              icon={<EyeOutlined />}
+              onClick={handlePreflight}
+              loading={preflightLoading}
+              disabled={!file || !codeType}
+            >
+              预检分析
+            </Button>
+            <Button
+              type="primary"
+              icon={<SendOutlined />}
+              onClick={handleUpload}
+              loading={uploading}
+              disabled={!file || !codeType}
+            >
+              开始批量生成
+            </Button>
+          </Space>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            首次使用请下载模板填写。模板含 2 个 sheet：SVA 断言需求、功能覆盖率需求。
+          </Typography.Text>
         </Space>
       </Card>
 
