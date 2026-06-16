@@ -2,7 +2,7 @@ from __future__ import annotations
 from app.core.config import get_settings
 from app.core.vector_store import get_qdrant
 from app.services.embedding_client import get_embedding_client
-from qdrant_client.models import SparseVector, NamedSparseVector, Prefetch, FusionQuery, Fusion
+from qdrant_client.models import SparseVector, Prefetch, FusionQuery, Fusion
 
 
 async def preflight_row(row_id: str, intent_text: str) -> dict:
@@ -23,11 +23,7 @@ async def preflight_row(row_id: str, intent_text: str) -> dict:
         collection_name=settings.qdrant_collection,
         prefetch=[
             Prefetch(query=dense_vec, using="dense", limit=3),
-            Prefetch(
-                query=NamedSparseVector(name="sparse", vector=sparse_vector),
-                using="sparse",
-                limit=3,
-            ),
+            Prefetch(query=sparse_vector, using="sparse", limit=3),
         ],
         query=FusionQuery(fusion=Fusion.RRF),
         limit=3,
