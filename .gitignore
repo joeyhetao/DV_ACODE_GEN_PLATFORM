@@ -63,7 +63,8 @@ pnpm-debug.log*
 # ═══════════════════════════════════════════════════════════════════════════
 backend/uploads/
 backend/backups/
-backend/results/          # Celery 批量生成产物（UUID-named zip）
+# Celery 批量生成产物（UUID-named zip）
+backend/results/
 *.dump                    # pg_dump 输出
 *.sql.gz
 *.sqlite
