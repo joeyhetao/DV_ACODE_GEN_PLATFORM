@@ -24,7 +24,7 @@ docker compose -f docker-compose.yml -f docker-compose.gpu-linux.yml up -d
 docker compose -f docker-compose.yml -f docker-compose.gpu-windows.yml up -d
 ```
 
-Entrypoints: frontend `http://localhost/`, API `http://localhost/api/`, OpenAPI `http://localhost/api/docs`.
+Entrypoints: frontend `http://localhost/`, API `http://localhost/api/`, OpenAPI `http://localhost/api/docs`. Batch users start at `GET /api/v1/batch/template` (FEAT-16) to download the multi-sheet Excel template — one sheet per registered code_type, built dynamically from registry + schema YAML; row 1 is the header and row 2 carries the prompt (`parse_excel` skips rows where `raw_row[0]` is empty so re-uploading the blank template never parses as data — preserve this invariant if you touch `template_writer.py`). Route order matters: `GET /batch/template` must be registered before `GET /batch/{job_id}/...`, otherwise FastAPI eats "template" as a `job_id` path param.
 
 ### Backend (host-native, for IDE debugging)
 
@@ -62,7 +62,7 @@ docker compose exec backend pytest tests/test_offtopic_corpus_real_llm.py --real
 ```bash
 python lib_manager.py import [--dir DIR] [--force]   # import YAML → PG + Qdrant; --force skips semantic dedup
 python lib_manager.py validate [--dir DIR]
-python lib_manager.py rebuild  [--collection NAME]   # re-sync rows with sync_status=syncing into Qdrant (also use after embedding model swap)
+python lib_manager.py rebuild  [--collection NAME] [--all]   # default re-syncs rows with sync_status=syncing; --all rewrites every PG row's Qdrant payload (use after payload schema changes like migration 009, or embedding model swap)
 python lib_manager.py export   [--dir DIR]           # PG → YAML snapshot
 python lib_manager.py backup                         # pg_dump → data/backups/
 python lib_manager.py list     [--code-type TYPE]
@@ -110,6 +110,19 @@ Four-layer determinism guard:
 
 Consequence: **never call an LLM from `app/services/core/`**. LLM calls live in `services/llm/` and are invoked by the pipeline orchestrator, not by core/render/cache.
 
+## Generation modes (FEAT-11 Stage 2)
+
+Two generation paths share the same `GenerationRecord` table; they're distinguished by the `generation_mode` column:
+
+- **`rag`** (default): full pipeline through all 7 gates. Deterministic by contract. UI shows no badge.
+- **`llm_direct`** (fallback): `POST /api/v1/generate/llm-fallback` triggered when the user clicks "对生成结果不满意？" on a `rag` record. Calls [`LLMClient.generate_code_freeform`](backend/app/services/llm/base.py) (Anthropic + OpenAI-compat both implement) which emits raw SystemVerilog inside fenced code blocks (`sv` / `systemverilog` / `verilog` / bare ``` all accepted by `extract_sv_code_block`; prose-only response → `ValueError("no_sv_code_block")` → 422 `detail.type="llm_direct_no_code"`). No template, no Jinja2, no determinism. Cache: `gen_llm:{llm_config_id}:{sha256(canonical(intent+code_type+signals+clk+rst))}` with **7-day TTL** (shorter than `gen:*`'s 90d because output is non-deterministic). Child record carries `parent_record_id` FK back to the source `rag` record (`ondelete=SET NULL`, migration 007).
+
+Rules:
+- `llm_direct` → `llm_direct` chaining is rejected (422); user must start from a `rag` record.
+- Frontend renders an orange "LLM 直接生成 · 非确定性" tag when `generation_mode === 'llm_direct'`; the LLM fallback button itself is only shown when `result.generation_mode === 'rag'`.
+- [`invalidate_all_llm_caches()`](backend/app/services/core/cache.py) flushes **three** prefixes now: `gen:*`, `intent_cache:*`, `gen_llm:*`.
+- `/render` always writes `generation_mode='rag'`; only `/llm-fallback` writes `'llm_direct'`. Don't add code paths that set `generation_mode` elsewhere.
+
 ## The generation pipeline
 
 `app/services/core/pipeline.py` is the *only* entry point for generation. Both the `/generate` HTTP endpoint and the Celery batch worker call the same `pipeline_preview` / `pipeline_render` (or the legacy one-shot `run_pipeline` wrapper). When adding a step, edit this file — do not bypass it from endpoints.
@@ -118,7 +131,7 @@ Two-step flow (UI plan 3, see ARCHITECTURE §3.15–3.16):
 
 - `pipeline_preview(PipelineInput) → PreviewResult` does **off-topic gate** → **code-type mismatch gate** → normalize → intent-cache → RAG → keyword-supplement → LLM step1 (pick id) → **step1 verify gate (A8)** → **reranker score gate (A9)** → LLM step2 (fill params) → multi-source param mapping → **under-specified gate**. Returns each parameter tagged with one of 6 `source`s: `llm` / `regex` / `signal_list` / `default` / `semantic_fallback` / `placeholder`. Frontend `ConfirmationPanel` + `ParametersForm` render these with colored badges.
 - `pipeline_render(RenderInput) → (code, cache_hit)` renders the user-confirmed params with Jinja2, writes generation cache, saves intent history.
-- `quick_render=True` on a preview means intent-cache hit; the frontend skips the confirmation panel.
+- `quick_render=True` on a preview means **either**: (a) intent-cache hit, **or** (b) [`_is_high_confidence_rag`](backend/app/services/core/pipeline.py) returned True after the under-specified gate — four conditions all green: `confidence_source=="llm_step1"` + step1 verify enabled & `verify_ok` + `selected_score >= reranker_min_score_threshold` + every param's `source ∈ {llm, regex, signal_list, default}`. In either case the frontend skips ConfirmationPanel and goes straight to `/render`. `selected_score` is computed once (in the A9 gate block) and reused — don't recompute it inside `_is_high_confidence_rag`.
 
 **Recovery chain** (intra-pipeline — applies *before* the under-specified gate decides whether to reject):
 RAG empty → keyword supplement (DB scan over `template.keywords`) → LLM picks none/invalid → take RAG top-1 (and rewrite confidence to RAG score with `confidence_source="rag_fallback"`) → LLM step2 returns nothing → regex `_extract_params_from_intent` → role-hint signal-list mapping → template `default` field → semantic fallback (`group_name`/`signal`/`state_list`/`bins_expr`). After all this, any required param still landing on `placeholder` or `semantic_fallback` (or LLM-with-trivial-value) **trips the under-specified gate** — system does NOT silently render with placeholders.
@@ -185,6 +198,17 @@ PR #25 (commit `5cde9d4`) added the feedback / analytics loop on top of the gene
 
 The feedback row never participates in the generation pipeline — it's a write-only side channel. Don't read `feedback_rating` from `services/core/`.
 
+## Improvement reports (FEAT-12)
+
+User-submitted comparison report between a `rag` record and its `llm_direct` child — the quality signal that closes the loop between "RAG picked template X" and "user preferred the freeform code". Table `improvement_reports` (migration 008) with status machine `pending → in_review → resolved`; illegal transitions return 422 `illegal_status_transition`. FK pair `(rag_record_id, llm_direct_record_id)` is **UNIQUE** — duplicate submit returns 409 with `existing_report_id` (TOCTOU-safe: catches `IntegrityError`, rolls back, re-SELECTs the row).
+
+Endpoints ([api/v1/improvement_reports.py](backend/app/api/v1/improvement_reports.py) + admin variants):
+- `POST /improvement-reports` — all logged-in users; `categories[]` and `note` may be empty.
+- `GET /improvement-reports/check` — frontend pre-mount to disable the "提交对比报告" button.
+- `GET/PATCH /admin/improvement-reports[/{id}]` — admin three-pane review (RAG record / llm_direct record / user submission + admin_note). Detail page mount auto-PATCHes pending → in_review (uses `useRef` to defuse React StrictMode double-mount).
+
+Ownership gate: regular users only see/submit reports on their own records; admin bypasses for moderation. Non-owner `/check` always returns `exists=false` — does not leak record existence.
+
 ## Data layout
 
 - **PostgreSQL** = source of truth (templates, users, generation history, batch jobs, llm_configs, contributions, audit logs). `templates.qdrant_point_id` links to Qdrant; `sync_status ∈ {ok, syncing, sync_error}` flags cross-store drift — `lib_manager.py rebuild` re-pushes any row in `syncing` state to Qdrant and flips it back to `ok`.
@@ -193,13 +217,22 @@ The feedback row never participates in the generation pipeline — it's a write-
 
 Template Qdrant point IDs are **deterministic UUIDs** (`uuid.uuid5(NAMESPACE_DNS, template.id)`) — never use `uuid4()`, or `lib_manager.py rebuild` will accumulate duplicate points and pollute retrieval.
 
+## Template maturity gating (FEAT-13)
+
+`templates.maturity_level ∈ {production, experimental, draft}` (PG ENUM `template_maturity_enum`, migration 009, server default `experimental`). RAG **only sees `production`** — [stage1_hybrid.py](backend/app/services/rag/stage1_hybrid.py) Qdrant Filter, [engine.py](backend/app/services/rag/engine.py) `dense_top1_score` (gates 1 + 2), and `rag_retrieve` DB query all enforce it (triple defense against payload drift). Contribution flow always writes `experimental`; admin approve does NOT auto-promote; only `super_admin` can PATCH the column (`lib_admin` 403, Pydantic `Literal` 422 on illegal values).
+
+Two columns named like maturity coexist: the old `maturity` (dev maturity, draft/validated/production — informational only) and the new `maturity_level` (RAG production gate — load-bearing). Don't confuse them; only `maturity_level` filters retrieval.
+
+**Deployment ritual** ⚠️: after `alembic upgrade head` for migration 009, you **must** run `python lib_manager.py rebuild --all`. Default `rebuild` only re-syncs `sync_status='syncing'` rows; migration 009 does not flip that flag, so without `--all` every existing Qdrant point lacks the `maturity_level` payload field and stage1 Filter evicts all of them → 503 across the board.
+
 ## Backend layout
 
 ```
 backend/app/
 ├── api/v1/        # endpoints flat (no endpoints/ subdir): auth, generate, batch,
 │                  # templates, admin, admin_llm, contributions, notifications,
-│                  # intent_builder, feedback; router.py mounts all under /api/v1
+│                  # intent_builder, feedback, improvement_reports; router.py
+│                  # mounts all under /api/v1
 ├── core/          # config, database, security (JWT), vector_store (qdrant client)
 ├── models/        # SQLAlchemy ORM
 ├── schemas/       # Pydantic request/response (TemplateSelectionOutput etc.)
@@ -209,7 +242,8 @@ backend/app/
 │   ├── rag/       # engine.py, stage1_hybrid, stage2_colbert, stage3_reranker
 │   ├── llm/       # base, anthropic_client, openai_compat_client, factory
 │   ├── intent/    # normalizer, builder, preflight, history (4 layers per ARCHITECTURE §3.11)
-│   ├── parser/    # Excel parser (schema-driven from data/schemas/)
+│   ├── parser/    # excel_parser (read), template_writer (FEAT-16, build downloadable
+│   │              # xlsx from registry+schemas), utils.col_to_idx (shared A1↔index)
 │   ├── platform/  # audit_service, backup_service, contribution_service
 │   ├── embedding_client.py
 │   └── registry.py
