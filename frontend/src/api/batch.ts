@@ -9,13 +9,17 @@ export interface BatchJob {
   result_url?: string
   error_message?: string
 }
-export interface PreflightRowResult { row_id: string; estimated_confidence: number; top_match?: Record<string, unknown> }
+export interface PreflightRowResult {
+  row_id: string
+  estimated_confidence: number
+  top_match?: Record<string, unknown>
+  code_type: string
+}
 
 export const batchApi = {
-  upload: async (file: File, code_type: string) => {
+  upload: async (file: File) => {
     const form = new FormData()
     form.append('file', file)
-    form.append('code_type', code_type)
     const res = await apiClient.post<{ job_id: string; total_rows: number; code_type: string; status: string }>('/batch/upload', form)
     return res.data
   },
@@ -32,10 +36,9 @@ export const batchApi = {
     a.click()
     URL.revokeObjectURL(url)
   },
-  preflight: async (file: File, code_type: string) => {
+  preflight: async (file: File) => {
     const form = new FormData()
     form.append('file', file)
-    form.append('code_type', code_type)
     const res = await apiClient.post<{ results: PreflightRowResult[] }>('/batch/preflight', form)
     return res.data
   },

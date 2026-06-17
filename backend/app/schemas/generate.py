@@ -157,6 +157,7 @@ class PreflightRowResult(BaseModel):
     row_id: str
     estimated_confidence: float
     top_match: dict | None = None
+    code_type: str = ""
 
 
 class PreflightResponse(BaseModel):

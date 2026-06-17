@@ -1,16 +1,13 @@
 import { useState, useEffect, useRef } from 'react'
 import {
-  Card, Upload, Button, Select, Progress, Table, Tag, Space,
+  Card, Upload, Button, Progress, Table, Tag, Space,
   Steps, Alert, Statistic, Row, Col, message, Divider, Typography,
 } from 'antd'
 import { UploadOutlined, DownloadOutlined, EyeOutlined, SendOutlined } from '@ant-design/icons'
 import { batchApi, BatchJob, PreflightRowResult } from '../../api/batch'
-import { generateApi } from '../../api/generate'
 
 
 export default function BatchPage() {
-  const [codeTypes, setCodeTypes] = useState<{ id: string; display_name: string }[]>([])
-  const [codeType, setCodeType] = useState<string>('')
   const [file, setFile] = useState<File | null>(null)
   const [step, setStep] = useState(0)
   const [preflightResults, setPreflightResults] = useState<PreflightRowResult[]>([])
@@ -24,37 +21,40 @@ export default function BatchPage() {
   const pollDelayRef = useRef(2000)
 
   useEffect(() => {
-    generateApi.codeTypes().then(setCodeTypes).catch(() => {})
     return () => { if (pollRef.current) clearTimeout(pollRef.current) }
   }, [])
 
   const handlePreflight = async () => {
-    if (!file || !codeType) return
+    if (!file) return
     setPreflight(true)
     try {
-      const res = await batchApi.preflight(file, codeType)
+      const res = await batchApi.preflight(file)
       setPreflightResults(res.results)
       setStep(1)
     } catch (e: unknown) {
-      const err = e as { response?: { data?: { detail?: string } } }
-      message.error(err?.response?.data?.detail || '预检失败')
+      const err = e as { response?: { data?: { detail?: string | { message?: string } } } }
+      const detail = err?.response?.data?.detail
+      const msg = typeof detail === 'string' ? detail : detail?.message
+      message.error(msg || '预检失败')
     } finally {
       setPreflight(false)
     }
   }
 
   const handleUpload = async () => {
-    if (!file || !codeType) return
+    if (!file) return
     setUploading(true)
     try {
-      const res = await batchApi.upload(file, codeType)
+      const res = await batchApi.upload(file)
       setJobId(res.job_id)
       setStep(2)
       pollDelayRef.current = 2000
       schedulePoll(res.job_id)
     } catch (e: unknown) {
-      const err = e as { response?: { data?: { detail?: string } } }
-      message.error(err?.response?.data?.detail || '上传失败')
+      const err = e as { response?: { data?: { detail?: string | { message?: string } } } }
+      const detail = err?.response?.data?.detail
+      const msg = typeof detail === 'string' ? detail : detail?.message
+      message.error(msg || '上传失败')
     } finally {
       setUploading(false)
     }
@@ -105,6 +105,7 @@ export default function BatchPage() {
 
   const confidenceColumns = [
     { title: '行ID', dataIndex: 'row_id', width: 120 },
+    { title: '代码类型', dataIndex: 'code_type', width: 120 },
     {
       title: '预估置信度', dataIndex: 'estimated_confidence', width: 130,
       render: (v: number) => <Tag color={v >= 0.85 ? 'green' : v >= 0.7 ? 'orange' : 'red'}>{(v * 100).toFixed(1)}%</Tag>,
@@ -123,16 +124,6 @@ export default function BatchPage() {
       <Card title="文件上传">
         <Space direction="vertical" size="small" style={{ width: '100%' }}>
           <Space wrap>
-            <Select
-              placeholder="选择代码类型"
-              value={codeType || undefined}
-              onChange={setCodeType}
-              style={{ width: 200 }}
-            >
-              {codeTypes.map((ct) => (
-                <Select.Option key={ct.id} value={ct.id}>{ct.display_name}</Select.Option>
-              ))}
-            </Select>
             <Button
               icon={<DownloadOutlined />}
               loading={templateLoading}
@@ -152,7 +143,7 @@ export default function BatchPage() {
               icon={<EyeOutlined />}
               onClick={handlePreflight}
               loading={preflightLoading}
-              disabled={!file || !codeType}
+              disabled={!file}
             >
               预检分析
             </Button>
@@ -161,13 +152,13 @@ export default function BatchPage() {
               icon={<SendOutlined />}
               onClick={handleUpload}
               loading={uploading}
-              disabled={!file || !codeType}
+              disabled={!file}
             >
               开始批量生成
             </Button>
           </Space>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            首次使用请下载模板填写。模板含 2 个 sheet：SVA 断言需求、功能覆盖率需求。
+            上传 Excel 后系统自动按 sheet 识别代码类型；模板含 SVA 需求 / Coverage 需求两 sheet，凡填了 A 列编号的 sheet 都会被处理。
           </Typography.Text>
         </Space>
       </Card>
