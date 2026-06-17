@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 产品需求文档（PRD）
 
-**版本**：v3.5  
+**版本**：v3.6  
 **状态**：起草中  
-**日期**：2026-06-03  
+**日期**：2026-06-17  
 **变更**：
 - v1.0 → v2.0：输入方式由"自然语言+Excel信号表"调整为"双表格结构化输入"（SVA需求表 + 功能覆盖率需求表）
 - v2.0 → v2.1：新增模板贡献与审核机制，处理 RAG 置信度 < 50% 时模板缺口的知识沉淀闭环
@@ -42,6 +42,7 @@
   - 数据库：migration 007 `generation_records` 新增 `parent_record_id VARCHAR(36) NULLABLE FK→generation_records.id ondelete=SET NULL` 列，让 `llm_direct` 子记录回链触发本次 fallback 的源 RAG 记录；源记录被删除（admin 操作）仅清空 FK，保留 `llm_direct` 子记录与其反馈数据
   - Stage 范围（明确不做，留待 Stage 3）：批量任务（Celery）不支持 `llm_direct` 模式；L4 仪表盘除 `generation_mode` 过滤参数外暂不做"按模式拆分的图表/趋势"；用户不可在没有源 RAG 记录前提下"冷启动"直接 `llm_direct`；管理员不可从 Admin UI 重触发 `llm_direct`；贡献向导不支持 `llm_direct` 路径；不为 `llm_direct` 结果发邮件/Webhook 推送；不做 `llm_direct` analytics 的 CSV 导出
 - v3.3 → v3.4：**FEAT-12 用户对比报告系统**——新增 §6.2「用户对比报告（FEAT-12）」小节（原 §6.2 批量生成顺延为 §6.3），描述用户在 GeneratePage result 阶段对 LLM 直接生成记录一键提交对比报告的完整链路：独立按钮（仅 `generation_mode==='llm_direct' && parent_record_id!=null` 渲染，与 §3.9 L3 差评按钮互相独立）→ Modal（4 项分类 Checkbox.Group + 自由文本 TextArea，**全选填均允许空提交**）→ `POST /api/v1/improvement-reports` → 后端写入新建 `improvement_reports` 表（独立于 `generation_records.feedback_*` 列）。引入分类枚举 `ReportCategoryEnum`（4 项 slug ↔ 中文 label：`wrong_template`/模板选错、`wrong_params`/参数映射错、`poor_style`/代码风格差、`other`/其他），并定义 admin 三态状态机 `pending → in_review → resolved`（详见 ARCH §3.18 / §4.1.4）；已有报告时按钮 disabled 文案"已有人提交对比报告，admin 处理中"。§6.1 错误模式表新增 3 行 `duplicate_report` (409) / `invalid_record_ref` (422) / `illegal_status_transition` (422)，前两条用于 `POST /improvement-reports`，第三条用于 `PATCH /admin/improvement-reports/{id}` 非法状态跳转（如 pending→resolved 跳过 in_review、resolved→pending 倒退），三者均不带 `redirect_to`。§3.9 L3 差评机制与本对比报告系统在 result 阶段并存——前者按记录评质量分（写 `generation_records.feedback_*`），后者按 RAG/LLM 直接生成对比（写 `improvement_reports`），用户可同时使用。**Out of scope（留 FEAT-13）**：resolved 报告语料回流到 `template_corpus_cases`（半自动或自动）、admin CSV 导出、报告邮件/Webhook 推送、admin↔用户对话、跨 admin 认领锁、用户撤回、批量任务行级对比报告
+- v3.5 → v3.6：**FEAT-18 批量页删 code_type 下拉 + sheet 自动检测多 code_type**——§3.1.1 两份输入表格描述补"前端不再要求用户在上传前选择 code_type，系统按 Excel 各 sheet 名（`SVA需求` / `Coverage需求`）自动识别每行对应的 code_type"；§3.1.2 处理流程框图"上传表格"步骤追加"系统检视 workbook.sheetnames → CodeTypeRegistry 反查 → 每个匹配 sheet 独立解析；未注册 sheet 名静默跳过；所有已知 sheet 均无有效数据行时返 HTTP 400 detail.type=no_valid_rows"注解；同一份 Excel 中两个 sheet 均填了数据时，系统在一次上传里混合生成两类代码。本版本**不**修改 §6 用户交互流程详述的单条生成 / IntentBuilder / 贡献向导任何文案——code_type 选择动作仅在批量生成页移除，单条生成页仍保留 code_type 选择控件。详细实现层影响（端点签名 / 解析函数 / 前端组件 / 测试覆盖）见 ARCHITECTURE v2.28→v2.29 与 CHANGELOG。
 - v3.4 → v3.5：**FEAT-13 模板成熟度门控（maturity_level 三档 + RAG 默认仅召回 production + admin 提升降级 UI）**——
   - §4 数据模型新增：`templates` 表追加 `maturity_level` 列（PostgreSQL ENUM `template_maturity_enum`，值 `production / experimental / draft`，NOT NULL，server_default `'experimental'`），由 Alembic migration 009 加列并 backfill：`id ~ '^(sva|cov)_.+_v[0-9]+$'` 命名规范的官方种子模板升为 `production`，其余行（含 `is_active=false`、含历史 `L6_E2E_*` 测试模板）落 `experimental`。三档语义如下：
     - `production`：经人工核验、**进入 RAG 召回主库**的官方模板；`stage1_hybrid_search` Qdrant Filter + `engine.py` DB 二次过滤 + `dense_top1_score`（off-topic gate / code_type_mismatch gate）三处均**仅**消费此档
@@ -102,7 +103,7 @@ IC验证工程师在日常工作中需要大量编写SystemVerilog断言（SVA�
 
 #### 3.1.1 两份输入表格
 
-平台提供两份固定格式的Excel模板供下载，工程师按需填写：
+平台提供两份固定格式的Excel模板供下载，工程师按需填写：**前端不再要求用户在上传前选择 code_type，系统按 Excel 各 sheet 名（`SVA需求` / `Coverage需求`）自动识别每行对应的 code_type**，详见 §3.1.2 处理流程与 ARCHITECTURE §3.9 解析层；同一份 Excel 中两个 sheet 均填了数据时，系统会在一次上传里混合生成两类代码。
 
 **SVA断言需求表**（每行 = 一条断言需求）：
 
@@ -165,7 +166,8 @@ IC验证工程师在日常工作中需要大量编写SystemVerilog断言（SVA�
 ```
 工程师下载标准Excel模板 → 填写需求行（可选：使用场景构建器辅助填写）
   ↓
-上传表格
+上传表格（系统检视 workbook.sheetnames → CodeTypeRegistry 反查 → 每个匹配 sheet 独立解析为 code_type 已知的行；
+         未注册的 sheet 名静默跳过；所有已知 sheet 均无有效数据行时返 HTTP 400 detail.type=no_valid_rows）
   ↓
 【前置信度预检】（见 §3.8 第三层）
   系统快速扫描所有行，展示逐行预估置信度

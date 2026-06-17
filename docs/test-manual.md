@@ -22,6 +22,7 @@
   - [§5.6 管理员三层防冲突面板](#56-管理员三层防冲突分析面板feat-4)
 - [6. 批量生成](#6-批量生成)
   - [§6.0 下载 Excel 模板（FEAT-16）](#60-下载-excel-模板feat-16)
+  - [§6.4 多 sheet 混合上传场景（FEAT-18）](#64-多-sheet-混合上传场景v228--feat-18)
 - [7. 模板库浏览与管理](#7-模板库浏览与管理)
   - [§7.4 admin 端模板成熟度切换（FEAT-13）](#74-admin-端模板成熟度切换feat-13--v35)
   - [§7.5 experimental 模板不参与 RAG 召回手测（FEAT-13）](#75-experimental-模板不参与-rag-召回手测feat-13--v35)
@@ -1315,7 +1316,8 @@ curl -s -X POST http://localhost/api/v1/contributions \
 
 1. **进入「批量生成」页**：浏览器登录后侧边栏点「批量生成」
    - **期望**：页面顶部能看到两个并排按钮 —— 左侧「下载 Excel 模板」（次要按钮，`type="default"`，前缀图标为下载箭头 `DownloadOutlined`），右侧「选择 Excel 文件」（既有上传按钮）
-   - **期望**：按钮组下方有一行灰色提示文字（`Typography.Text type="secondary"`），说明模板包含 2 个 sheet（SVA需求、Coverage需求）
+   - **期望（v2.28 / FEAT-18 后）**：按钮组**不再出现** code_type 下拉选择器（旧版本曾有「assertion / coverage」`<Select>` 控件，FEAT-18 已删除）；按钮禁用条件仅检查"是否已选择 Excel 文件"
+   - **期望**：按钮组下方有一行灰色提示文字（`Typography.Text type="secondary"`），文案为"上传前填写对应 sheet，系统自动识别代码类型"（FEAT-18 文案更新，原"上传前请在左侧选择本次需要生成的代码类型"已删除）
 
 2. **点击「下载 Excel 模板」**
    - **期望**：按钮短暂呈 `loading` 状态（约 < 1s，单击不可重复触发）
@@ -1328,11 +1330,12 @@ curl -s -X POST http://localhost/api/v1/contributions \
    - **期望 C — `Coverage需求` 表头**：第 1 行按 **A → S 列**顺序（共 19 列）应为：`编号` / `所属模块` / `采样时钟` / `复位信号` / `复位极性` / `覆盖类型` / `主信号名称` / `主信号位宽` / `主信号数据类型` / `交叉信号1名称` / `交叉信号1位宽` / `交叉信号1数据类型` / `交叉信号2名称` / `交叉信号2位宽` / `交叉信号2数据类型` / `Bin提示` / `采样条件` / `覆盖意图` / `备注`。同样**不包含** §3.9.1 表中 T/U/V 三个 `[输出]` 列（理由同上）
    - **期望 D — 视觉与占位行**：第 1 行所有单元格背景为浅灰（`#D9D9D9`），字体加粗，水平居中；列宽不挤压，能完整显示中文表头。**第 2 行 B 列（B2）**有浅灰占位提示文字指示从第 3 行开始填写；**A2 必须为空**（这是设计——`excel_parser` 在 A 列为空时跳过整行，让空模板原样上传 preflight 返 200 + 0 行结果，否则占位文字会被当成一条 row_id）
 
-4. **闭环验证：模板不修改直接上传**
+4. **闭环验证：模板不修改直接上传**（v2.28 / FEAT-18 后语义变更）
    - 回到「批量生成」页，**不在模板里填任何数据**，直接点「选择 Excel 文件」选刚才下载的 `batch_template_<YYYYMMDD>.xlsx` 上传
-   - 触发预检（`POST /api/v1/batch/preflight`）
-   - **期望**：返回 HTTP 200，前端预检面板显示"解析完毕：0 行需求"或类似空数据提示，**不报错**（非 400 / 422 / 500）
-   - **若返回 422 `excel_parse_error`** → 说明模板下载产物的 sheet 名/表头与 `excel_parser.py` 期望不对齐，属于回归。立刻在 backend 跑 `pytest tests/test_batch_template_download.py::test_download_template_then_upload_roundtrip -v` 复现并定位是 `data/schemas/*.yaml` `col` 字段错位还是 `template_writer.py` 渲染逻辑漂移（CONTRIBUTING §17.2 给出 schema 改动后必须重跑的回归命令）
+   - 触发预检（`POST /api/v1/batch/preflight`，UI 不再传 `code_type` 表单字段）
+   - **期望**：返回 **HTTP 400**，响应 `detail = {"type": "no_valid_rows", "message": "未检测到任何有效数据行；请确认 SVA 需求 / Coverage 需求 sheet 中至少一个 row A 列填了编号"}`，前端弹错误 Toast 显示该 message。**这是 FEAT-18 起的新约定**——multisheet 路径下空模板属于用户失误（忘了填数据），强制提前阻断比"返 200 + 0 行"更安全（避免用户误以为生成任务已下达却得到空 ZIP）
+   - **回归契约保留**：FEAT-16 单元测试 `test_template_upload_to_preflight_returns_200` 仍通过显式传 `code_type=assertion/coverage` 走单 sheet 路径，断言"空模板返 HTTP 200 + 0 行结果"不变——这是 schema 演化（`col` 字段错位 / `output` 标记变化 / 新增字段）的回归红线，与本节 UI 路径**互相独立**。若该单测失败，说明模板下载产物的 sheet 名/表头与 `excel_parser.py` 期望不对齐，立刻跑 `pytest tests/test_batch_template_download.py::test_download_template_then_upload_roundtrip -v` 定位是 `data/schemas/*.yaml` `col` 字段错位还是 `template_writer.py` 渲染逻辑漂移（CONTRIBUTING §17.2）
+   - **若 UI 路径返 422 `excel_parse_error`** → 说明 multisheet 解析层异常（registry 未加载 / openpyxl 解码失败），跑 `docker compose logs backend | tail -50` 查具体异常并复测 `pytest tests/test_batch_multisheet_parse.py -v`
 
 #### 错误路径
 
@@ -1350,9 +1353,9 @@ curl -s -X POST http://localhost/api/v1/contributions \
 ### §6.1 完整流程（Excel → ZIP）
 
 1. 「批量生成」页下载 Excel 模板（按 code_type 区分 sheet，详 §6.0）
-2. 填 5 行测试数据（混合 assertion + coverage）
-3. 上传 Excel
-4. 看解析预览：行数、列识别
+2. 填 5 行测试数据（混合 assertion + coverage，分别写入 `SVA需求` / `Coverage需求` 两个 sheet）
+3. 上传 Excel（v2.28 / FEAT-18 起 UI **不再要求选 code_type**，按钮禁用条件仅检查是否已选文件；系统按 sheet 名自动识别每行 code_type，详 §6.4）
+4. 看解析预览：行数、列识别（预检表格含「代码类型」列展示每行 code_type）
 5. 点「开始批量生成」
 6. 期望：实时进度条（已完成/总数）；每行调 `run_pipeline`，遇 5 道闸结构化记录该行状态
 7. 完成后展示结果列表：每行 `status` ∈ `success` / `under_specified` / `off_topic` / `code_type_mismatch` / `failed`
@@ -1379,6 +1382,66 @@ docker compose exec celery_worker celery -A app.tasks.celery_app inspect active
 
 # batch_jobs 表状态
 docker compose exec postgres psql -U dvuser -d dv_platform -c "SELECT id, status, started_at, completed_rows, total_rows FROM batch_jobs ORDER BY created_at DESC LIMIT 5;"
+```
+
+### §6.4 多 sheet 混合上传场景（v2.28 / FEAT-18）
+
+> 验证"前端不再要求选 code_type，系统按 sheet 自动识别"全链路：单次上传同时生成 assertion + coverage 两类代码。
+
+#### 前置
+
+- 已登录任一账号
+- 后端容器 healthy；Qdrant / Redis / embedding_service 均 healthy（多 sheet 路径下每行仍走完整 RAG 链路）
+- 已按 §6.0 下载到 `batch_template_<YYYYMMDD>.xlsx` 空白模板
+
+#### 场景 A：双 sheet 均有数据 → 单次混合生成
+
+1. 在下载到的空白模板的 `SVA需求` sheet 中填 2 行 SVA 断言需求行（编号 SVA-001 / SVA-002，意图选用与现有 assertion 模板能匹配的典型描述，如"valid 拉高后 ready 到来之间 data 必须保持稳定"）
+2. 在同一份 xlsx 的 `Coverage需求` sheet 中填 2 行覆盖率需求行（编号 COV-001 / COV-002，意图选用与现有 coverage 模板匹配的典型描述，如"统计 awsize 与 awburst 的交叉合法组合"）
+3. 在「批量生成」页选刚才编辑的 xlsx，点「预检分析」（`POST /api/v1/batch/preflight`，FormData 不再含 `code_type` 字段）
+   - **期望**：HTTP 200，前端预检表格新增一列「代码类型」（`dataIndex: code_type`，宽 120），按行展示该行被识别的 code_type
+   - **期望**：`results` 数组长度为 4，按 sheet 顺序排列——前 2 行 `code_type=="assertion"`，后 2 行 `code_type=="coverage"`（与 `parse_excel_multisheet` 遍历 registry 的顺序一致）
+4. 点「开始批量生成」（`POST /api/v1/batch/upload`）
+   - **期望**：HTTP 200，响应 `BatchUploadResponse.code_type == "mixed"`（multisheet sentinel）；Admin 批量任务列表如显示 code_type 列则展示 `mixed` 与单 sheet 任务的 `assertion` / `coverage` 区分
+   - **期望**：Celery 异步推进，每行独立调 `run_pipeline`，进度条实时更新到 4/4
+5. 下载结果 ZIP
+   - **期望**：ZIP 中 4 个 `.sv` 文件，前 2 个为 SVA 断言代码、后 2 个为 covergroup 代码（每行 status / output 文件名与 §6.2 行状态表一致）
+   - **期望**：ZIP 内 `results.json`（如有汇总文件）每条记录携带 `code_type` 字段（与 preflight 返回值一致）；按 job_id 单 ZIP 不拆分为两个
+
+#### 场景 B：仅 SVA 需求 sheet 有数据 → 单 code_type 回归不退化
+
+1. 重新下载空白模板，**仅在 `SVA需求` sheet** 填 1 行（编号 SVA-001）；`Coverage需求` sheet 保持空白
+2. 上传预检
+   - **期望**：HTTP 200，`results` 数组长度为 1，唯一行 `code_type=="assertion"`
+   - **期望**：行为与 FEAT-18 之前的单 code_type 模式完全等同（生成的代码内容、模板选择、置信度均与历史回归基线一致），证明 multisheet 路径在退化场景下不引入额外开销
+
+#### 场景 C：未知 sheet 名静默跳过
+
+1. 用 Excel / WPS 打开下载到的空白模板，在 `SVA需求` sheet 后**新增一个 sheet 命名为 `README`** 并填一些说明文字（A 列也可填，但 sheet 名不在 `CodeTypeRegistry` 中）
+2. 在 `SVA需求` sheet 填 1 行 SVA 需求；保存
+3. 上传预检
+   - **期望**：HTTP 200，`results` 数组长度为 1（仅来自 `SVA需求` sheet），`README` sheet 被 `parse_excel_multisheet` 内部的 `if ct.excel_sheet_name in wb.sheetnames` 判定后**静默跳过**——不报错、不计入结果，后端日志可见跳过条目（INFO 级）
+   - **期望**：用户看不到任何"未知 sheet"警告（设计如此：让用户自由在 xlsx 中添加备注 sheet 不影响主流程）
+
+#### 场景 D：空模板上传 → HTTP 400 no_valid_rows
+
+1. 下载空白模板，**不修改任何数据**，直接上传（与 §6.0 step 4 是同一路径，此处仅作 FEAT-18 错误码契约的独立点名）
+   - **期望**：HTTP 400，`detail = {"type": "no_valid_rows", "message": "未检测到任何有效数据行；请确认 SVA 需求 / Coverage 需求 sheet 中至少一个 row A 列填了编号"}`
+   - **期望**：前端 Toast 展示该 message（与 7 闸 detail 走相同 `handleApiError` 渲染路径）；用户根据提示在任一 sheet A 列填编号后重新上传应进入正常路径
+
+#### 场景 E：错选 sheet 写错 code_type 时 gate 2 文案覆盖
+
+1. 下载空白模板，在 **`SVA需求` sheet**（即用户把它当作 assertion 来填）填一行**覆盖率意图**（如"交叉覆盖 awsize 与 awburst 的所有合法组合"）；其他 sheet 留空
+2. 「开始批量生成」（不会被 preflight 拦下——preflight 仅走 Stage1 hybrid 检索，多 sheet 路径下该行带 `code_type=assertion` 标注进入 pipeline）
+3. **期望**：Celery worker 处理该行时命中 pipeline gate 2（`CodeTypeMismatchError`），被 `batch_tasks.py` 的 `except CodeTypeMismatchError` 块捕获并回写 `BatchJobRow.reason`
+4. **期望（FEAT-18 文案覆盖生效）**：`reason` 字面含**「sheet」关键词**，具体格式如"您在「SVA需求」sheet 中写了更像「coverage」的描述。请将该行挪到对应 sheet 后重跑该行（提示：编辑 Excel 时把该行 cut 到正确 sheet）"——**不**显示旧版"请切换 code_type 后重跑该行"措辞（因为 UI 已无 code_type 切换器，旧文案会误导用户找不到按钮）
+5. **回归点**：单条页 `/generate` 端点的 gate 2 仍走原 422 + Modal "代码类型选错了" 路径（详 §2.2），未被本票文案覆盖影响——pipeline `CodeTypeMismatchError` 异常类本身未改
+
+#### 自动化套件
+
+```bash
+# 多 sheet 解析 + 端点路由 + 文案覆盖 4 场景一并验证
+docker compose exec backend pytest tests/test_batch_multisheet_parse.py -v
 ```
 
 ---

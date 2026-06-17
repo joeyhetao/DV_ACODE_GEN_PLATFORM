@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.28  
+**版本**：v2.29  
 **状态**：已确认  
-**日期**：2026-06-11  
+**日期**：2026-06-17  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -102,6 +102,11 @@
   - §3.15.3 `[Gate] offtopic` 日志格式扩字段：旧只记 `top_dense_score`，新格式打印 `selected_dense=<f.4> best_other_id=<id> best_other_score=<f.4> best_overall=<f.4> threshold=<f>`，便于排查"哪类高分把请求救回了 / 全库均匀低分触发 off-topic 时谁离阈值最近"。`registry 只有一个 code_type` 时 `best_other_id=None / best_other_score=-1.0` 哨兵值（日志里看到 `-1.0000` 即此情形），`best_overall` 自然退化为 `selected_dense`，Step 0b 跳过
   - §1.1 确定性契约**不动**：本次仅闸语义调整，未引入新 LLM 调用、未改 template 选择 / param mapping / Jinja 渲染、未改缓存 key 结构；闸顺序（Step 0a → Step 0b）与异常类型不变；前端 `handleApiError` / Modal / `redirect_to` 字段约定不变
   - 新增测试 `backend/tests/test_offtopic_codetype_priority.py` 覆盖 4 场景（错选 code_type → mismatch / 全离题 → off_topic / `best_overall ≥ threshold` 但 `gap < margin` → 两闸均不触发 / `gap ≥ margin` 但 `best_other < threshold` → off_topic 而非 mismatch）；`backend/tests/data/offtopic_corpus.yaml` 新增 4–6 条 cross-code-type 错选样本，分类为 `marginal`，新字段 `expected_gate: code_type_mismatch | off_topic | null` 由 `test_offtopic_corpus_mocked.py` 新增 `test_cross_code_type_mismatch_corpus_routing` 函数按 expected_gate 断言抛出的异常类型；既有 `test_pipeline_preview_code_type_mismatch_raises_with_suggestion` 与 marginal_ic 断言无回归
+- v2.28 → v2.29：**FEAT-18 批量页删 code_type 下拉 + sheet 自动检测多 code_type**——
+  - §3.7 batch 流程图首框 `上传 Excel` 追加 multisheet 端点签名说明：`code_type: str | None = Form(None)` 可选，缺省走 `parse_excel_multisheet` 多 sheet 路径，显式传入保留 `parse_excel` 单 sheet 兼容路径；多 sheet 路径下 `BatchJob.code_type` 写字面量 `"mixed"` sentinel
+  - §3.9 新增"多 sheet 路径"段落：`parse_excel_multisheet(file_path) -> list[ParsedRow]` 函数描述（遍历 `get_registry().all()` 的每个 `excel_sheet_name` → 复用单 sheet 解析逻辑 → 标注 `row.code_type` → 汇总按 sheet 顺序排列）；未注册 sheet 名静默跳过；全部已知 sheet 均无有效行抛 `ValueError("no_valid_rows")` → HTTP 400 `detail.type="no_valid_rows"`；`MULTISHEET_CODE_TYPE_SENTINEL = "mixed"` 常量
+  - §5.1 端点表 `POST /batch/upload` 与 `POST /batch/preflight` 行更新：`code_type` 字段标注**可选**，缺省 multisheet / 显式传入单 sheet 行为两路；`PreflightRowResult` 携带 `code_type` 字段
+  - §1.1 确定性契约**不动**：本路径未引入新 LLM 调用、未改 RAG / param mapping / Jinja 渲染、未改缓存 key 结构、未改 5 道闸顺序；`parse_excel(file_path, code_type)` 单 sheet 接口签名与行为完全不变
 - v2.27 → v2.28：**FEAT-16 批量生成 Excel 模板下载端点**——
   - §3.7.1 新增"模板下载端点（FEAT-16）"小节：`GET /api/v1/batch/template` 登录用户+，动态遍历 `CodeTypeRegistry` 即时生成多 sheet `.xlsx`（assertion→`SVA需求` / coverage→`Coverage需求`），sheet 名 ← `data/code_types/*.yaml` 的 `excel_sheet_name`、表头 ← `data/schemas/*.yaml` 的 `fields`（跳过 `output: true`）+ `signals` 块展开；`Content-Disposition: attachment; filename=batch_template_<YYYYMMDD>.xlsx`；端点**无状态无持久化**（不写库、不计数、不缓存、不审计），构造逻辑落在 `backend/app/services/parser/template_writer.py::build_template_workbook(registry)`（纯 I/O 函数，不调 LLM、不读 Qdrant、不参与 §1.1 确定性契约）
   - §5.1 端点表追加 `GET /api/v1/batch/template` 一行（必须先于 `GET /{job_id}/...` 参数化路由注册）
@@ -583,7 +588,10 @@ maxmemory-policy allkeys-lru
 ### 3.7 批量生成（Celery 异步任务）
 
 ```
-上传 Excel
+上传 Excel（POST /batch/upload + /batch/preflight 端点签名为 code_type: str | None = Form(None)；
+            v2.28 / FEAT-18 起前端不再传 code_type，端点缺省走 parse_excel_multisheet 多 sheet 解析路径；
+            显式传入 code_type 时保留旧 parse_excel 单 sheet 路径用于向后兼容；
+            多 sheet 路径下 BatchJob.code_type 写字面量 "mixed" sentinel（详 §3.9.2 / §5.1））
   ↓
 创建 BatchJob（PostgreSQL，status=pending）
   ↓
@@ -635,6 +643,8 @@ for ct in registry.all():                              # 遍历已注册 code_ty
 ### 3.9 Excel 表格解析层
 
 > **架构说明**：`excel_parser.py` 是**纯通用解释器**，不含任何代码类型特定的列定义。每种代码类型的 Excel 列结构由独立 Schema YAML 文件描述（`data/schemas/sva_schema.yaml`、`data/schemas/coverage_schema.yaml`），解析器在运行时动态读取对应 Schema 完成解析。新增代码类型时只需添加 Schema YAML，无需修改 Python 代码。
+
+> **多 sheet 路径（v2.28 / FEAT-18）**：`parse_excel_multisheet(file_path: Path) -> list[ParsedRow]` 是批量入口的默认解析函数（`/batch/upload` 与 `/batch/preflight` 在 `code_type=None` 时调用）。流程：打开 workbook → 遍历 `get_registry().all()` 取每个 `ct.excel_sheet_name` → 若该 sheet 名出现在 `wb.sheetnames` 则复用现有单 sheet 解析逻辑产出 `ParsedRow` 列表并把 `row.code_type = ct.id` 标注回去 → 汇总所有非空结果按 sheet 顺序排列；不在 registry 中的 sheet 名（如用户额外加的 README sheet）**静默跳过**不报错。所有已注册 sheet 均无有效数据行时抛 `ValueError("no_valid_rows")`，由端点翻译为 HTTP 400 + `detail = {"type": "no_valid_rows", "message": "未检测到任何有效数据行…"}`，与其它 7 闸 detail 结构一致。`parse_excel(file_path, code_type)` 单 sheet 接口签名与行为完全不变，显式传入 `code_type` 时仍走旧路径——这是保留向后兼容的关键。`ParsedRow.code_type` 字段在 multisheet 路径下决定该行被路由到的 pipeline 上下文；下游 `tasks/batch_tasks.py` 逐行调 `pipeline_preview` / `run_pipeline` 时直接读 `row.code_type` 无须特殊处理（不引入任何新的 LLM 调用，不动 §1.1 确定性契约）。多 sheet 上传创建的 `BatchJob.code_type` 列写字面量 `"mixed"`（`MULTISHEET_CODE_TYPE_SENTINEL`），与单 sheet 上传写 `"assertion"` / `"coverage"` 区分。
 
 #### 3.9.1 两份输入表格规范
 
@@ -2509,8 +2519,8 @@ WHERE is_default = true;
 | POST | `/api/v1/generate/render` | 两步式第二步：用户确认参数后渲染 + 写代码缓存（`intent_hash` 非空时也写 GenerationRecord）；响应体含 `generation_mode: "rag"` 字段（v2.23 / FEAT-11） | 普通用户+ |
 | POST | `/api/v1/generate/llm-fallback` | **v2.23 / FEAT-11 Stage 2**：用户对 `rag` 结果不满意时触发 LLM 自由生成兜底；入参 `{generation_record_id}`，写新 `GenerationRecord(generation_mode='llm_direct', parent_record_id=source.id)`；响应 `{code, generation_record_id, generation_mode: "llm_direct", cache_hit}`；5 类错误：404（detail 为纯字符串）/ 422 `llm_direct_chained_not_allowed` / 422 `llm_direct_no_code` / 422 `llm_direct_internal_error`（ValueError 分支）/ 500 `llm_direct_internal_error`（Exception 分支）（详 §3.17） | 普通用户+ |
 | GET | `/api/v1/batch/template` | **v2.27 / FEAT-16**：下载批量生成空白 Excel 模板（多 sheet 按 code_type 分页），sheet 名 ← `data/code_types/*.yaml`、表头 ← `data/schemas/*.yaml`，无状态、不写库；响应 `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` + `Content-Disposition: attachment; filename=batch_template_<YYYYMMDD>.xlsx`；路由必须先于 `/{job_id}/...` 注册（详 §3.7.1） | 登录用户+ |
-| POST | `/api/v1/batch/upload` | 上传 Excel 创建批量任务 | 普通用户+ |
-| POST | `/api/v1/batch/preflight` | 上传后前置信度预检（轻量，仅Stage1） | 普通用户+ |
+| POST | `/api/v1/batch/upload` | 上传 Excel 创建批量任务；`code_type: str \| None = Form(None)` **可选**（v2.28 / FEAT-18），缺省时按 Excel sheet 名自动识别每行 code_type（multisheet 路径，`BatchJob.code_type="mixed"`），显式传入时走单 sheet 兼容路径；所有 sheet 均无有效行返 HTTP 400 `detail.type="no_valid_rows"` | 普通用户+ |
+| POST | `/api/v1/batch/preflight` | 上传后前置信度预检（轻量，仅Stage1）；`code_type` 同 `/upload` 端点**可选**（v2.28 / FEAT-18）；`PreflightResponse.results[*]` 携带 `code_type` 字段供前端按行展示 | 普通用户+ |
 | GET | `/api/v1/batch/{job_id}` | 查询批量任务状态 | 普通用户+ |
 | GET | `/api/v1/batch/{job_id}/download` | 下载批量生成结果 | 普通用户+ |
 | POST | `/api/v1/intent-builder/chat` | v3.0 多轮 RAG-grounded 对话；首轮 `session_id=""` 由后端 mint，TTL 24h | 登录用户+ |
