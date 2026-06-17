@@ -72,24 +72,16 @@ def _build_unauthed_app() -> FastAPI:
 
 
 def _expected_headers(schema_filename: str) -> dict[int, str]:
-    """从 schema yaml 直接读取期望表头：跳过 output 字段，signals 块展开为
-    "信号N<suffix>"。该函数刻意复刻 template_writer._collect_headers 的契约，
-    用 schema yaml 真值作为表头断言的金标准。"""
+    """从 schema yaml 直接读取期望表头：跳过 output 字段。FEAT-19 起 schema
+    `signals: null`，模板无 signals 块。该函数刻意复刻
+    template_writer._collect_headers 的契约，用 schema yaml 真值作为表头
+    断言的金标准。"""
     schema = yaml.safe_load((_SCHEMAS_DIR / schema_filename).read_text(encoding="utf-8"))
     out: dict[int, str] = {}
     for fdef in schema.get("fields", []) or []:
         if fdef.get("output"):
             continue
         out[col_to_idx(fdef["col"])] = fdef["name"]
-    signals = schema.get("signals")
-    if signals:
-        start = col_to_idx(signals["start_col"])
-        cpp = int(signals["cols_per_signal"])
-        max_count = int(signals["max_count"])
-        sub_fields = signals.get("sub_fields", []) or []
-        for i in range(max_count):
-            for j, sub in enumerate(sub_fields):
-                out[start + i * cpp + j] = f"信号{i + 1}{sub['suffix']}"
     return out
 
 
@@ -139,10 +131,11 @@ def test_assertion_sheet_headers_match_schema():
             f"实际 {ws.cell(row=1, column=col_idx).value!r}"
         )
 
-    # signals 块校验：G-R 列共 12 列展开为 "信号N名称/位宽/角色"
-    for n in (1, 2, 3, 4):
-        for suffix in ("名称", "位宽", "角色"):
-            assert f"信号{n}{suffix}" in expected.values()
+    # FEAT-19: schema 精简为 3 列（A 编号 / B 验证意图 / C 备注），
+    # signals 块已删除——所有 module/clk/rst/signals 等旧表头不应再出现。
+    assert set(expected.values()) == {"编号", "验证意图", "备注"}, (
+        f"SVA sheet 用户可见表头应为 3 列固定集合，实际：{expected.values()!r}"
+    )
 
 
 # ── 4. Coverage 表头匹配 coverage_schema.yaml ──────────────────────────
@@ -158,9 +151,11 @@ def test_coverage_sheet_headers_match_schema():
             f"实际 {ws.cell(row=1, column=col_idx).value!r}"
         )
 
-    # coverage_schema.yaml 没有 signals 块，所有表头都不应包含 "信号N" 前缀
-    for v in expected.values():
-        assert not v.startswith("信号")
+    # FEAT-19: Coverage schema 同步精简为 3 列（A 编号 / B 覆盖意图 / C 备注），
+    # main_signal_* / cross*_* / bin_hint / sample_condition 等旧字段全部移除。
+    assert set(expected.values()) == {"编号", "覆盖意图", "备注"}, (
+        f"Coverage sheet 用户可见表头应为 3 列固定集合，实际：{expected.values()!r}"
+    )
 
 
 # ── 5. 闭环：生成 → 落盘 → excel_parser 解析为空列表 ────────────────────

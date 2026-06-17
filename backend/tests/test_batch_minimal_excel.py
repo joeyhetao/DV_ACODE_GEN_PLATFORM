@@ -66,6 +66,8 @@ def authed_client(monkeypatch):
 
 
 def _build_minimal_workbook(sva_rows: list[str] = None, cov_rows: list[str] = None) -> BytesIO:
+    """FEAT-19: schema 精简后 SVA 与 Coverage 两 sheet 均为 3 列（A row_id /
+    B intent / C 备注），最小可解析数据行只需写 A + B。"""
     sva_rows = sva_rows or []
     cov_rows = cov_rows or []
     wb = build_template_workbook(get_registry())
@@ -73,14 +75,12 @@ def _build_minimal_workbook(sva_rows: list[str] = None, cov_rows: list[str] = No
         ws_sva = wb["SVA需求"]
         for i, rid in enumerate(sva_rows, start=3):
             ws_sva.cell(row=i, column=1, value=rid)
-            ws_sva.cell(row=i, column=2, value="cpu")
-            ws_sva.cell(row=i, column=19, value=f"sva intent {rid}")
+            ws_sva.cell(row=i, column=2, value=f"sva intent {rid}")
     if cov_rows:
         ws_cov = wb["Coverage需求"]
         for i, rid in enumerate(cov_rows, start=3):
             ws_cov.cell(row=i, column=1, value=rid)
-            ws_cov.cell(row=i, column=2, value="cpu")
-            ws_cov.cell(row=i, column=18, value=f"cov intent {rid}")
+            ws_cov.cell(row=i, column=2, value=f"cov intent {rid}")
     buf = BytesIO()
     wb.save(buf)
     buf.seek(0)
