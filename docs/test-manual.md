@@ -1326,9 +1326,9 @@ curl -s -X POST http://localhost/api/v1/contributions \
 
 3. **用 Excel / WPS 打开下载的文件**
    - **期望 A — sheet 数量与名称**：底部 sheet 标签恰好 2 个，名称必须严格为 `SVA需求` 和 `Coverage需求`（中文字符，与 `backend/data/code_types/assertion.yaml` 的 `excel_sheet_name: "SVA需求"` 和 `coverage.yaml` 的 `excel_sheet_name: "Coverage需求"` 一致）。**不允许**出现 "Sheet1" / "assertion" / "coverage" 等英文名
-   - **期望 B — `SVA需求` 表头**：第 1 行为加粗灰底居中表头，按 **A → U 列**顺序（共 21 列）应为：`编号` / `所属模块` / `时钟` / `复位信号` / `复位极性` / `协议` / `信号1名称` / `信号1位宽` / `信号1角色` / `信号2名称` / `信号2位宽` / `信号2角色` / `信号3名称` / `信号3位宽` / `信号3角色` / `信号4名称` / `信号4位宽` / `信号4角色` / `验证意图` / `严重级别` / `备注`。**不包含** §3.9.1 表中 V/W/X 三列（`[输出]匹配模板` / `[输出]置信度` / `[输出]生成状态`）——这些是系统回填列（schema `output: true`），`template_writer._collect_headers` 显式跳过，不出现在用户下载的空白模板中
-   - **期望 C — `Coverage需求` 表头**：第 1 行按 **A → S 列**顺序（共 19 列）应为：`编号` / `所属模块` / `采样时钟` / `复位信号` / `复位极性` / `覆盖类型` / `主信号名称` / `主信号位宽` / `主信号数据类型` / `交叉信号1名称` / `交叉信号1位宽` / `交叉信号1数据类型` / `交叉信号2名称` / `交叉信号2位宽` / `交叉信号2数据类型` / `Bin提示` / `采样条件` / `覆盖意图` / `备注`。同样**不包含** §3.9.1 表中 T/U/V 三个 `[输出]` 列（理由同上）
-   - **期望 D — 视觉与占位行**：第 1 行所有单元格背景为浅灰（`#D9D9D9`），字体加粗，水平居中；列宽不挤压，能完整显示中文表头。**第 2 行 B 列（B2）**有浅灰占位提示文字指示从第 3 行开始填写；**A2 必须为空**（这是设计——`excel_parser` 在 A 列为空时跳过整行，让空模板原样上传 preflight 返 200 + 0 行结果，否则占位文字会被当成一条 row_id）
+   - **期望 B — `SVA需求` 表头**（v2.30 / FEAT-19）：第 1 行为加粗灰底居中表头，**共 3 列**（旧 21 列已退役），按 **A → C 列**顺序应为：`编号` / `验证意图` / `备注`。**不包含**旧 17 列大表里的 `所属模块` / `时钟` / `复位信号` / `复位极性` / `协议` / `信号1~4 (名称+位宽+角色)` / `严重级别` 等 18 个用户列字段（已从 `sva_schema.yaml` 删除），也**不包含** §3.9.1 表中 D/E/F 三个 `[输出]` 列（`[输出]匹配模板` / `[输出]置信度` / `[输出]生成状态`）——这些是系统回填列（schema `output: true`），`template_writer._collect_headers` 显式跳过，不出现在用户下载的空白模板中
+   - **期望 C — `Coverage需求` 表头**（v2.30 / FEAT-19）：第 1 行**共 3 列**（旧 19 列已退役），按 **A → C 列**顺序应为：`编号` / `覆盖意图` / `备注`。**不包含**旧 19 列大表里的 `所属模块` / `采样时钟` / `复位信号` / `复位极性` / `覆盖类型` / `主信号名称~数据类型` / `交叉信号1~2` / `Bin提示` / `采样条件` 等 16 个用户列字段，同样**不包含** §3.9.1 表中 D/E/F 三个 `[输出]` 列（理由同上）
+   - **期望 D — 视觉与占位行**（v2.30 / FEAT-19）：第 1 行所有单元格背景为浅灰（`#D9D9D9`），字体加粗，水平居中；列宽不挤压，能完整显示中文表头。**第 2 行 B 列（B2）**有浅灰占位提示文字提示用户从第 3 行起填 A/B/C 三列（A=编号、B=验证/覆盖意图、C=备注；模块/时钟/复位/信号等结构化字段已删除，无需手填）；**A2 必须为空**（这是设计——`excel_parser` 在 A 列为空时跳过整行，让空模板原样上传 preflight 返 200 + 0 行结果，否则占位文字会被当成一条 row_id）
 
 4. **闭环验证：模板不修改直接上传**（v2.28 / FEAT-18 后语义变更）
    - 回到「批量生成」页，**不在模板里填任何数据**，直接点「选择 Excel 文件」选刚才下载的 `batch_template_<YYYYMMDD>.xlsx` 上传
@@ -1344,7 +1344,8 @@ curl -s -X POST http://localhost/api/v1/contributions \
 | 未登录访问 `GET /api/v1/batch/template`（用 `curl` 不带 Bearer token） | HTTP 401 `Not authenticated` | 端点 `Depends(get_current_user)` 是否被正确挂载 |
 | 点击按钮 spinner 转完后弹 `message.error` | 前端 Toast 显示后端报错原因 | 看 `docker compose logs backend \| tail -50`；可能是 registry 加载失败或 openpyxl 异常 |
 | sheet 名出现英文（如 `assertion` / `Sheet1`） | 不符合期望 A | 检查 `template_writer.py` 是否硬编码了 sheet 名；它应该读 `ct.excel_sheet_name` |
-| 表头列缺失（如 `严重级别` 不见了） | 不符合期望 B/C | 检查 `data/schemas/sva_schema.yaml` 该字段是否被错误标记 `output: true`，或 `col` 字段重复 |
+| 表头出现旧 17/19 列字段（如 `所属模块` / `严重级别` / `信号1名称`） | 不符合 v2.30 / FEAT-19 期望 B/C（应只有 3 列） | 检查是否还在用历史下载的旧模板；新模板按 §6.0 step 2 重新下载。若新下载的模板仍含旧字段，检查 `data/schemas/sva_schema.yaml` / `coverage_schema.yaml` 是否回滚到了 v3.6 之前的 17/19 字段版本 |
+| 用户上传的是 v3.6 之前下载的旧 17/19 列模板（B 列填了"所属模块"文字，真实意图在 SVA S 列 / Coverage R 列） | 系统不报错但 `intent` 字段被解析成模块名（B 列内容），top-1 模板匹配偏向"以模块名为主题"的无关模板、置信度 < 50%；预检结果中"代码类型"列识别成空或错误类型 | **设计行为，无运行时报错**：v2.30 / FEAT-19 起后端不实现旧 17/19 列模板兼容转换层。处置方法：让用户按 §6.0 step 2 重新下载新 3 列模板，仅填 A=编号、B=意图、C=备注；旧模板里已填的"所属模块/时钟/复位/信号"字段在新格式下无需手填，pipeline 6 级回退会用默认值兜底 |
 
 #### 与 §6.1 的衔接
 
@@ -1353,13 +1354,17 @@ curl -s -X POST http://localhost/api/v1/contributions \
 ### §6.1 完整流程（Excel → ZIP）
 
 1. 「批量生成」页下载 Excel 模板（按 code_type 区分 sheet，详 §6.0）
-2. 填 5 行测试数据（混合 assertion + coverage，分别写入 `SVA需求` / `Coverage需求` 两个 sheet）
+2. 在两个 sheet 中**从 row 3 起填 A/B/C 三列**（A=编号、B=验证/覆盖意图、C=备注）——混合 assertion + coverage，例如 `SVA需求` sheet 填 3 行（SVA-001 / 002 / 003）、`Coverage需求` sheet 填 2 行（COV-001 / 002）；C 列可空。**v2.30 / FEAT-19 起不再需要填模块/时钟/复位/信号等字段**（旧 17/19 列已退役，pipeline 6 级回退会用 `clk="clk"` / `rst="rst_n"` / `signals=[]` 等默认值兜底）
 3. 上传 Excel（v2.28 / FEAT-18 起 UI **不再要求选 code_type**，按钮禁用条件仅检查是否已选文件；系统按 sheet 名自动识别每行 code_type，详 §6.4）
 4. 看解析预览：行数、列识别（预检表格含「代码类型」列展示每行 code_type）
 5. 点「开始批量生成」
 6. 期望：实时进度条（已完成/总数）；每行调 `run_pipeline`，遇 5 道闸结构化记录该行状态
 7. 完成后展示结果列表：每行 `status` ∈ `success` / `under_specified` / `off_topic` / `code_type_mismatch` / `failed`
 8. 下载结果 ZIP
+9. **AC 3 默认值兜底验收（v2.30 / FEAT-19 新增）**：在 ZIP 中找一行 `status=success` 的 `.sv` 文件用文本编辑器打开——这是验证"Excel 没填模块/时钟/复位/信号 → pipeline 6 级回退用 ParsedRow dataclass 默认值兜底"全链路打通的唯一手测信号（注：批量路径 `results.json` 仅记 `{row_id, status, template_id, confidence, code}`，不含 `rendered_params` / `params_source`，所以仅靠 `.sv` 文件正文做验收）
+   - **期望 A — 时钟/复位走默认值**：`.sv` 文件正文中能搜到时钟名 `clk` 与复位名 `rst_n`（裸字符串，不是 Excel 模板里曾经填过的 `aclk` / `aresetn` 等具体信号）——证明 `ParsedRow.clk` / `rst` dataclass 默认值经 pipeline default 源进入了模板渲染。具体表现因模板而异（如 `always_ff @(posedge clk or negedge rst_n)`、`@(posedge clk) disable iff (!rst_n)` 等），但 `clk` / `rst_n` 字面量必定出现
+   - **期望 B — 业务信号走 LLM/模板 default**：`.sv` 文件中所有业务端口名（valid/ready/data 等）由 LLM 从 B 列意图反推或走模板自身 `default` 字段；**不应**出现旧批量页 G–R 信号块里曾经手填的具体信号名（因为 Excel 已无此列），亦不应渲染出 placeholder / semantic_fallback 字面量（若有，对应行应在结果列表中显示为 `under_specified` 而非 `success`，已被 under_specified 闸 422 拦截）
+   - **失败处置**：若 `.sv` 中 `clk` / `rst_n` 字面量缺失（如出现 `clock` / `rstn` 等非默认值），可能是 `excel_parser.py` 的 `ParsedRow` 默认值未生效（检查 `clk: str = "clk"` / `rst: str = "rst_n"` 是否被覆盖回 Excel 字段读取），或 `tasks/batch_tasks.py:84-89` 在 `PipelineInput` 构造时显式传了非默认值（应保持 `clk=row.clk or "clk"` 写法）。跑 `pytest tests/test_batch_multisheet_parse.py::test_parse_3col_only_required_no_comment -v` 复测解析层默认值；后端 `docker compose logs backend | grep -i 'clk\|rst'` 可定位 pipeline 实际收到的字段值
 
 ### §6.2 每行结果状态对应
 
@@ -1437,11 +1442,26 @@ docker compose exec postgres psql -U dvuser -d dv_platform -c "SELECT id, status
 4. **期望（FEAT-18 文案覆盖生效）**：`reason` 字面含**「sheet」关键词**，具体格式如"您在「SVA需求」sheet 中写了更像「coverage」的描述。请将该行挪到对应 sheet 后重跑该行（提示：编辑 Excel 时把该行 cut 到正确 sheet）"——**不**显示旧版"请切换 code_type 后重跑该行"措辞（因为 UI 已无 code_type 切换器，旧文案会误导用户找不到按钮）
 5. **回归点**：单条页 `/generate` 端点的 gate 2 仍走原 422 + Modal "代码类型选错了" 路径（详 §2.2），未被本票文案覆盖影响——pipeline `CodeTypeMismatchError` 异常类本身未改
 
+#### 场景 F：旧 17/19 列模板上传（v2.30 / FEAT-19 不兼容声明手测）
+
+> 验证"旧 17/19 列模板不再兼容、后端不做运行时兼容、parse_excel 不崩溃但语义错位"的设计行为。无新错误码——本场景不期望 HTTP 4xx，而是验证**生成结果质量下降**作为不兼容信号。
+
+1. 准备一份 v3.6 之前下载的旧 17 列 / 19 列 Excel 模板（若手头没有：用 `git show <old-commit>:backend/data/schemas/sva_schema.yaml` 拷出旧 schema 临时回滚 → `lib_manager` 或直接手工构造一份 17 列 SVA 模板，row 3 起填一行如 `SVA-LEGACY-001 / cpu_top / aclk / aresetn / 低有效 / AXI4 / awvalid / 1 / valid / ... / "握手时 valid 拉高后 ready 16 周期内必须响应" / error / ""`，意图列在 S 列）
+2. 在「批量生成」页选这份旧模板上传 → 触发预检
+   - **期望**：HTTP 200（**不报错**），后端按新 3 列 schema 解析——`row_id` 取 A 列（SVA-LEGACY-001 正常）、`intent` 取 **B 列**（"cpu_top" 而非 S 列的真实意图）、`comment` 取 C 列（"aclk"）
+   - **期望**：预检表格中该行 `code_type=="assertion"`（sheet 名仍能识别），但置信度/匹配模板栏明显异常——top-1 模板偏向"以模块名/cpu_top 为主题"的无关模板（如可能召回任意 `module_name` 参数有相关性的模板），置信度 < 50%
+3. 用户在 UI 上看到低置信结果应能直接定位是模板格式问题
+   - **期望（前端无提示）**：本场景不弹任何 Modal/Toast——后端无法区分"语义错位"与"用户写了一个奇怪的意图"。**手测时确认前端 UI 没有伪兼容信号**（如自动重映射 S 列到 intent），证明后端没有偷偷做兼容转换
+   - 文档指引（CONTRIBUTING / test-manual §6.0 错误路径表最后一行）应能让 SRE 或 lib_admin 在用户报问题时快速判断为"用了旧模板"
+4. **处置方法**：让用户按 §6.0 step 2 重新下载新 3 列模板。重新填 A=编号 / B=真实意图 / C=备注 三列后上传应进入正常路径，模板匹配置信度回升
+
 #### 自动化套件
 
 ```bash
 # 多 sheet 解析 + 端点路由 + 文案覆盖 4 场景一并验证
 docker compose exec backend pytest tests/test_batch_multisheet_parse.py -v
+# v2.30 / FEAT-19 新增 3 列 schema 解析与 D/E/F 输出列回归
+docker compose exec backend pytest tests/test_batch_template_download.py tests/test_batch_multisheet_parse.py tests/test_batch_minimal_excel.py -v
 ```
 
 ---

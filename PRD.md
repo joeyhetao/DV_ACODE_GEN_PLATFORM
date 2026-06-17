@@ -1,6 +1,6 @@
 # IC验证辅助代码生成平台 — 产品需求文档（PRD）
 
-**版本**：v3.6  
+**版本**：v3.7  
 **状态**：起草中  
 **日期**：2026-06-17  
 **变更**：
@@ -42,6 +42,7 @@
   - 数据库：migration 007 `generation_records` 新增 `parent_record_id VARCHAR(36) NULLABLE FK→generation_records.id ondelete=SET NULL` 列，让 `llm_direct` 子记录回链触发本次 fallback 的源 RAG 记录；源记录被删除（admin 操作）仅清空 FK，保留 `llm_direct` 子记录与其反馈数据
   - Stage 范围（明确不做，留待 Stage 3）：批量任务（Celery）不支持 `llm_direct` 模式；L4 仪表盘除 `generation_mode` 过滤参数外暂不做"按模式拆分的图表/趋势"；用户不可在没有源 RAG 记录前提下"冷启动"直接 `llm_direct`；管理员不可从 Admin UI 重触发 `llm_direct`；贡献向导不支持 `llm_direct` 路径；不为 `llm_direct` 结果发邮件/Webhook 推送；不做 `llm_direct` analytics 的 CSV 导出
 - v3.3 → v3.4：**FEAT-12 用户对比报告系统**——新增 §6.2「用户对比报告（FEAT-12）」小节（原 §6.2 批量生成顺延为 §6.3），描述用户在 GeneratePage result 阶段对 LLM 直接生成记录一键提交对比报告的完整链路：独立按钮（仅 `generation_mode==='llm_direct' && parent_record_id!=null` 渲染，与 §3.9 L3 差评按钮互相独立）→ Modal（4 项分类 Checkbox.Group + 自由文本 TextArea，**全选填均允许空提交**）→ `POST /api/v1/improvement-reports` → 后端写入新建 `improvement_reports` 表（独立于 `generation_records.feedback_*` 列）。引入分类枚举 `ReportCategoryEnum`（4 项 slug ↔ 中文 label：`wrong_template`/模板选错、`wrong_params`/参数映射错、`poor_style`/代码风格差、`other`/其他），并定义 admin 三态状态机 `pending → in_review → resolved`（详见 ARCH §3.18 / §4.1.4）；已有报告时按钮 disabled 文案"已有人提交对比报告，admin 处理中"。§6.1 错误模式表新增 3 行 `duplicate_report` (409) / `invalid_record_ref` (422) / `illegal_status_transition` (422)，前两条用于 `POST /improvement-reports`，第三条用于 `PATCH /admin/improvement-reports/{id}` 非法状态跳转（如 pending→resolved 跳过 in_review、resolved→pending 倒退），三者均不带 `redirect_to`。§3.9 L3 差评机制与本对比报告系统在 result 阶段并存——前者按记录评质量分（写 `generation_records.feedback_*`），后者按 RAG/LLM 直接生成对比（写 `improvement_reports`），用户可同时使用。**Out of scope（留 FEAT-13）**：resolved 报告语料回流到 `template_corpus_cases`（半自动或自动）、admin CSV 导出、报告邮件/Webhook 推送、admin↔用户对话、跨 admin 认领锁、用户撤回、批量任务行级对比报告
+- v3.6 → v3.7：**FEAT-19 批量 Excel schema 推倒重建为 3 列**（BREAKING）——§3.1.1 两份输入表格规范从 v3.6 的 SVA 17 列 / Coverage 19 列大表精简为 3 列（A=编号、B=验证/覆盖意图、C=备注）+ 3 个系统输出列（D=匹配模板、E=置信度、F=生成状态）。删除 `所属模块 / 时钟 / 复位信号 / 复位极性 / 协议 / 信号1~4 (名称+位宽+角色) / 严重级别 / 覆盖类型 / 主信号 / 交叉信号 / Bin提示 / 采样条件` 共 14~16 列用户手填字段，这些字段在批量场景下已与单条页 `/generate` 表单 / pipeline 6 级回退（`clk="clk"` / `rst="rst_n"` / `signals=[]`）语义重复。§3.1.2 处理流程图同步更新："填写需求行"动作描述删除"模块/时钟/复位/信号"枚举，简化为"按 3 列格式填写（编号 + 意图 + 备注）"；§6.3 批量主流程步骤 2 同步从"填写Excel（描述列 + 信号列）"改为"按 3 列格式填写 A/B/C 三列"。**旧 17/19 列模板不向后兼容**——继续上传旧模板时 parse_excel 不会崩溃，但因列错位会把"所属模块"列内容解析成 intent 字段（典型表现：top-1 匹配模板偏向"以模块名为主题"的无关模板），用户须重新通过 `GET /api/v1/batch/template` 下载新模板。本次仅改 parser 输入侧（`backend/data/schemas/*.yaml` + `excel_parser.py`），pipeline / LLM / RAG / 缓存 key 结构与确定性契约**完全不受影响**。
 - v3.5 → v3.6：**FEAT-18 批量页删 code_type 下拉 + sheet 自动检测多 code_type**——§3.1.1 两份输入表格描述补"前端不再要求用户在上传前选择 code_type，系统按 Excel 各 sheet 名（`SVA需求` / `Coverage需求`）自动识别每行对应的 code_type"；§3.1.2 处理流程框图"上传表格"步骤追加"系统检视 workbook.sheetnames → CodeTypeRegistry 反查 → 每个匹配 sheet 独立解析；未注册 sheet 名静默跳过；所有已知 sheet 均无有效数据行时返 HTTP 400 detail.type=no_valid_rows"注解；同一份 Excel 中两个 sheet 均填了数据时，系统在一次上传里混合生成两类代码。本版本**不**修改 §6 用户交互流程详述的单条生成 / IntentBuilder / 贡献向导任何文案——code_type 选择动作仅在批量生成页移除，单条生成页仍保留 code_type 选择控件。详细实现层影响（端点签名 / 解析函数 / 前端组件 / 测试覆盖）见 ARCHITECTURE v2.28→v2.29 与 CHANGELOG。
 - v3.4 → v3.5：**FEAT-13 模板成熟度门控（maturity_level 三档 + RAG 默认仅召回 production + admin 提升降级 UI）**——
   - §4 数据模型新增：`templates` 表追加 `maturity_level` 列（PostgreSQL ENUM `template_maturity_enum`，值 `production / experimental / draft`，NOT NULL，server_default `'experimental'`），由 Alembic migration 009 加列并 backfill：`id ~ '^(sva|cov)_.+_v[0-9]+$'` 命名规范的官方种子模板升为 `production`，其余行（含 `is_active=false`、含历史 `L6_E2E_*` 测试模板）落 `experimental`。三档语义如下：
@@ -105,66 +106,36 @@ IC验证工程师在日常工作中需要大量编写SystemVerilog断言（SVA�
 
 平台提供两份固定格式的Excel模板供下载，工程师按需填写：**前端不再要求用户在上传前选择 code_type，系统按 Excel 各 sheet 名（`SVA需求` / `Coverage需求`）自动识别每行对应的 code_type**，详见 §3.1.2 处理流程与 ARCHITECTURE §3.9 解析层；同一份 Excel 中两个 sheet 均填了数据时，系统会在一次上传里混合生成两类代码。
 
-**SVA断言需求表**（每行 = 一条断言需求）：
+**FEAT-19 推倒重建说明（v3.7 起）**：批量 Excel schema 从 v3.6 的 17 列（SVA）/ 19 列（Coverage）大表**精简为 3 列**，删除 `所属模块 / 时钟 / 复位信号 / 复位极性 / 协议 / 信号1~4 (名称+位宽+角色) / 严重级别 / 覆盖类型 / 主信号 / 交叉信号 / Bin提示 / 采样条件` 共 14~16 个用户手填字段。这些字段在单条页 `/generate` 表单中已由独立控件承载，在批量场景下与 pipeline 6 级回退（`clk="clk"` / `rst="rst_n"` / `signals=[]` 等默认值兜底）语义重复。**旧 17/19 列模板不再向后兼容**，请重新通过 `GET /api/v1/batch/template` 下载新模板；继续上传旧模板的后果详见 ARCHITECTURE §3.9.1 末段。
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| 编号 | 文本 | 是 | SVA-001，用于结果追踪 |
-| 所属模块 | 文本 | 是 | 断言挂载的模块/接口名 |
-| 时钟 | 文本 | 是 | 时钟信号名 |
-| 复位信号 | 文本 | 是 | 复位信号名 |
-| 复位极性 | 枚举 | 是 | 高有效 / 低有效 |
-| 协议 | 枚举 | 否 | AXI4 / AHB / APB / 通用，辅助RAG过滤 |
-| 信号1名称 | 文本 | 是 | — |
-| 信号1位宽 | 整数 | 是 | bit |
-| 信号1角色 | 枚举 | 是 | valid / ready / data / state / req / ack / start / end / enable / count / other |
-| 信号2名称 | 文本 | 否 | — |
-| 信号2位宽 | 整数 | 否 | — |
-| 信号2角色 | 枚举 | 否 | 同上 |
-| 信号3名称 | 文本 | 否 | — |
-| 信号3位宽 | 整数 | 否 | — |
-| 信号3角色 | 枚举 | 否 | 同上 |
-| 信号4名称 | 文本 | 否 | — |
-| 信号4位宽 | 整数 | 否 | — |
-| 信号4角色 | 枚举 | 否 | 同上 |
-| 验证意图 | 长文本 | 是 | 自然语言描述，驱动RAG检索匹配模板 |
-| 严重级别 | 枚举 | 否 | error / warning / info（默认error） |
-| 备注 | 文本 | 否 | 可选补充说明 |
-| **[输出]匹配模板** | 文本 | — | 系统回填，如 SVA-HAND-001 |
-| **[输出]置信度** | 数字 | — | 系统回填，如 0.95 |
-| **[输出]生成状态** | 枚举 | — | 系统回填：已生成 / 需确认 / 需修改 |
+**SVA断言需求表**（每行 = 一条断言需求，共 3 个用户列 + 3 个系统输出列）：
 
-**功能覆盖率需求表**（每行 = 一个covergroup需求）：
+| 列 | 字段 | 类型 | 必填 | 说明 |
+|----|------|------|------|------|
+| A | 编号 | 文本 | 是 | SVA-001，用于结果追踪 |
+| B | 验证意图 | 长文本 | 是 | 自然语言描述，驱动RAG检索匹配模板（信号名 / 时钟 / 复位等结构化字段由 pipeline 默认值兜底，无需手填） |
+| C | 备注 | 文本 | 否 | 可选补充说明，pipeline 不消费 |
+| D | **[输出]匹配模板** | 文本 | — | 系统回填，如 SVA-HAND-001 |
+| E | **[输出]置信度** | 数字 | — | 系统回填，如 0.95 |
+| F | **[输出]生成状态** | 枚举 | — | 系统回填：已生成 / 需确认 / 需修改 |
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| 编号 | 文本 | 是 | COV-001，用于结果追踪 |
-| 所属模块 | 文本 | 是 | covergroup挂载的模块/接口名 |
-| 采样时钟 | 文本 | 是 | 采样时钟信号名 |
-| 复位信号 | 文本 | 是 | 复位信号名 |
-| 复位极性 | 枚举 | 是 | 高有效 / 低有效 |
-| 覆盖类型 | 枚举 | 否 | 值覆盖 / 转移覆盖 / 交叉覆盖，辅助RAG过滤 |
-| 主信号名称 | 文本 | 是 | 主要覆盖信号名 |
-| 主信号位宽 | 整数 | 是 | bit |
-| 主信号数据类型 | 枚举 | 是 | logic / uint / enum |
-| 交叉信号1名称 | 文本 | 否 | 交叉覆盖时填写 |
-| 交叉信号1位宽 | 整数 | 否 | — |
-| 交叉信号1数据类型 | 枚举 | 否 | logic / uint / enum |
-| 交叉信号2名称 | 文本 | 否 | 三维交叉时填写 |
-| 交叉信号2位宽 | 整数 | 否 | — |
-| 交叉信号2数据类型 | 枚举 | 否 | logic / uint / enum |
-| Bin提示 | 文本 | 否 | 期望分段，如 `1,2,4,8,16` 或 `0-15,16-255` |
-| 采样条件 | 文本 | 否 | 采样触发条件，留空则时钟沿采样 |
-| 覆盖意图 | 长文本 | 是 | 自然语言描述，驱动RAG检索匹配模板 |
-| 备注 | 文本 | 否 | 可选补充说明 |
-| **[输出]匹配模板** | 文本 | — | 系统回填，如 COV-VAL-001 |
-| **[输出]置信度** | 数字 | — | 系统回填，如 0.92 |
-| **[输出]生成状态** | 枚举 | — | 系统回填：已生成 / 需确认 / 需修改 |
+**功能覆盖率需求表**（每行 = 一个covergroup需求，共 3 个用户列 + 3 个系统输出列）：
+
+| 列 | 字段 | 类型 | 必填 | 说明 |
+|----|------|------|------|------|
+| A | 编号 | 文本 | 是 | COV-001，用于结果追踪 |
+| B | 覆盖意图 | 长文本 | 是 | 自然语言描述，驱动RAG检索匹配模板（主信号 / 交叉信号 / Bin 提示 / 采样条件等结构化字段由 pipeline 默认值兜底，无需手填） |
+| C | 备注 | 文本 | 否 | 可选补充说明，pipeline 不消费 |
+| D | **[输出]匹配模板** | 文本 | — | 系统回填，如 COV-VAL-001 |
+| E | **[输出]置信度** | 数字 | — | 系统回填，如 0.92 |
+| F | **[输出]生成状态** | 枚举 | — | 系统回填：已生成 / 需确认 / 需修改 |
+
+说明：批量页第 1 行为表头、第 2 行为占位提示行（仅 B2 写浅灰提示文字，A2 留空——保证空模板原样上传 preflight 不会误把提示当 row_id）、第 3 行起为用户填写区；A/B 列必填，C 列可空；D/E/F 输出列在下载的空模板里不会出现（由 schema `output=true` 字段过滤），仅在后续 Excel 回填功能落地时由系统写入。
 
 #### 3.1.2 处理流程
 
 ```
-工程师下载标准Excel模板 → 填写需求行（可选：使用场景构建器辅助填写）
+工程师下载标准Excel模板 → 按 3 列格式填写需求行（A=编号、B=验证/覆盖意图、C=备注；模块/时钟/复位/信号等结构化字段无需手填，由 pipeline 默认值兜底）
   ↓
 上传表格（系统检视 workbook.sheetnames → CodeTypeRegistry 反查 → 每个匹配 sheet 独立解析为 code_type 已知的行；
          未注册的 sheet 名静默跳过；所有已知 sheet 均无有效数据行时返 HTTP 400 detail.type=no_valid_rows）
@@ -179,7 +150,7 @@ IC验证工程师在日常工作中需要大量编写SystemVerilog断言（SVA�
 每行：验证意图 →【LLM标准化】（见 §3.8 第一层）→ bge-m3向量化
       → Qdrant RAG检索（含协议/类型过滤）
       → Top-3候选 → reranker精排 → LLM选模板（工具调用）
-      → 信号角色表直接填充模板参数 → Jinja2渲染
+      → pipeline 6 级回退默认值兜底填充模板参数（clk="clk" / rst="rst_n" / signals=[]） → Jinja2渲染
   ↓
 结果回填到Excel原表（输出列）+ Web端展示进度与结果列表
   ↓
@@ -192,9 +163,9 @@ IC验证工程师在日常工作中需要大量编写SystemVerilog断言（SVA�
 
 #### 3.1.3 信号角色的作用
 
-表格中每个信号明确标注"角色"（valid/ready/data/state等），在RAG匹配到模板后，系统直接将信号名填入模板对应参数位置，**无需LLM猜测信号角色**，参数填充完全确定性。
+v3.7 (FEAT-19) 起，批量 Excel 不再要求工程师手填信号角色表——表格只保留意图列。RAG 匹配到模板后，系统按 pipeline 6 级回退（`clk="clk"` / `rst="rst_n"` / `signals=[]` 等默认值）填充模板参数；如生成结果需要更精确的信号名，工程师可在 Web 端展开行后编辑参数面板重渲染（见 §3.1.4）。
 
-Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最匹配的一个，并确认角色与模板参数的对应关系。
+Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最匹配的一个，并按意图反推参数填充（不再依赖用户填写的信号角色列）。
 
 #### 3.1.4 结果查看与操作
 
@@ -925,10 +896,10 @@ admin 端入口：侧边栏「管理」分组新增「对比报告」菜单项 `
 
 ### 6.3 批量生成主流程
 
-1. 用户下载Excel模板
-2. 填写Excel（描述列 + 信号列）
-3. 上传Excel，选择默认代码类型
-4. 系统显示解析预览（行数、识别到的列）
+1. 用户下载Excel模板（3 列格式：A=编号、B=验证/覆盖意图、C=备注）
+2. 在 Excel 第 3 行起按需填写 A/B/C 三列（B 列必填；模块/时钟/复位/信号等结构化字段无需手填）
+3. 上传Excel（无需在前端选择 code_type，按 sheet 名自动识别；见 §3.1.2）
+4. 系统显示解析预览（行数、识别到的 sheet → code_type）
 5. 确认开始批量生成
 6. 显示实时进度（已完成/总数）
 7. 生成完成，展示结果列表（含每行状态）

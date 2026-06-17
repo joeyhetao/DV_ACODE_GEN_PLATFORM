@@ -1,6 +1,6 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.29  
+**版本**：v2.30  
 **状态**：已确认  
 **日期**：2026-06-17  
 **变更**：
@@ -102,6 +102,16 @@
   - §3.15.3 `[Gate] offtopic` 日志格式扩字段：旧只记 `top_dense_score`，新格式打印 `selected_dense=<f.4> best_other_id=<id> best_other_score=<f.4> best_overall=<f.4> threshold=<f>`，便于排查"哪类高分把请求救回了 / 全库均匀低分触发 off-topic 时谁离阈值最近"。`registry 只有一个 code_type` 时 `best_other_id=None / best_other_score=-1.0` 哨兵值（日志里看到 `-1.0000` 即此情形），`best_overall` 自然退化为 `selected_dense`，Step 0b 跳过
   - §1.1 确定性契约**不动**：本次仅闸语义调整，未引入新 LLM 调用、未改 template 选择 / param mapping / Jinja 渲染、未改缓存 key 结构；闸顺序（Step 0a → Step 0b）与异常类型不变；前端 `handleApiError` / Modal / `redirect_to` 字段约定不变
   - 新增测试 `backend/tests/test_offtopic_codetype_priority.py` 覆盖 4 场景（错选 code_type → mismatch / 全离题 → off_topic / `best_overall ≥ threshold` 但 `gap < margin` → 两闸均不触发 / `gap ≥ margin` 但 `best_other < threshold` → off_topic 而非 mismatch）；`backend/tests/data/offtopic_corpus.yaml` 新增 4–6 条 cross-code-type 错选样本，分类为 `marginal`，新字段 `expected_gate: code_type_mismatch | off_topic | null` 由 `test_offtopic_corpus_mocked.py` 新增 `test_cross_code_type_mismatch_corpus_routing` 函数按 expected_gate 断言抛出的异常类型；既有 `test_pipeline_preview_code_type_mismatch_raises_with_suggestion` 与 marginal_ic 断言无回归
+- v2.29 → v2.30：**FEAT-19 批量 Excel schema 推倒重建为 3 列**（BREAKING）——
+  - §3.9.1 两份输入表格规范全量替换：SVA 17 列 / Coverage 19 列大表精简为 3 个用户列（A=编号、B=验证/覆盖意图、C=备注）+ 3 个系统输出列（D/E/F = 匹配模板 / 置信度 / 生成状态）；schema yaml `signals:` 键置为 `null`，`module / clk / rst / rst_polarity / protocol / signals 1~4 / 严重级别 / 覆盖类型 / 主信号 / 交叉信号 / Bin提示 / 采样条件` 共 14~16 个用户列字段全部删除
+  - §3.9.1 ParsedRow 字段策略：`ParsedRow` 保留旧字段名但改为 dataclass `field(default=...)` 落硬编码默认值（`clk="clk"` / `rst="rst_n"` / `rst_polarity="低有效"` / `module=""` / `protocol=None` / `signals=[]`），`tasks/batch_tasks.py` 中 `row.clk` / `row.rst` / `row.signals` 等引用零改动（FEAT-18 定型的 batch_tasks 不动），与 pipeline 6 级回退（step2 / regex / signal_list / default / semantic_fallback / placeholder）在用户没填信号名时落默认值的语义保持一致
+  - §3.9.1 输出列前移至 D/E/F（旧 SVA V/W/X、Coverage T/U/V）：`_write_result_zip` 当前只写 `results.json` + 单个 `.sv` 不写回 Excel，输出列纯为占位字段标记 schema 输出契约，前移安全且语义清晰
+  - §3.9.1 不兼容旧 17/19 列模板的设计声明：后端不实现运行时兼容转换层；旧模板继续上传时 `parse_excel` 不崩溃但因列错位会把旧 B 列"所属模块"内容当 intent 解析，典型表现为 top-1 模板偏向"以模块名为主题"的无关模板、置信度 < 50%；用户须重新通过 `GET /api/v1/batch/template`（§3.7.1）下载新模板
+  - §3.9.2 解析流程：`ParsedSVARow` / `ParsedCoverageRow` 双 dataclass 合并为单一 `ParsedRow`，三列从 Excel 读取，其余字段固定默认值
+  - §3.9.3 信号角色直接参数填充：批量路径下 `ParsedRow.signals` 恒为空 list，规则映射不再在批量生效，pipeline 6 级回退兜底；必填参数最终落 `semantic_fallback` / `placeholder` 由 under_specified 闸 422 拒绝（详见 §1.1 / pipeline `_detect_under_specified`）；单条页 `/generate` 表单仍保留信号角色控件，本节描述保留供历史参考
+  - §3.7.1 模板下载端点：`_collect_headers` 中 `if signals:` 守卫在 schema `signals: null` 后自动跳过 signals 块展开，下载的模板只剩 A/B/C 三列用户表头；占位提示仍写在 B2（A 列必须留空，否则 `excel_parser` 会把占位文字当 row_id 解析），列序与 `app.services.parser.utils.col_to_idx` 对齐（`excel_parser` 与 `template_writer` 共享同一 helper）
+  - §1.1 确定性契约**不动**：本次仅改 parser 输入侧（`backend/data/schemas/*.yaml` + `services/parser/excel_parser.py` + `services/parser/template_writer.py` schema 驱动跳过）；pipeline / LLM / RAG / 缓存 key 结构、5 道闸顺序、参数源优先级、`PipelineInput` dataclass 字段定义、单条页表单**全部不变**；前端批量页上传/下载 UI 由 FEAT-18 完成无需改动；无数据库迁移
+  - 测试：更新 `tests/test_batch_template_download.py` 表头断言（删除 4 个"信号N{suffix}" assert）、`tests/test_batch_multisheet_parse.py` helper 中 `column=19/18 → column=2` 列号迁移、`tests/test_batch_minimal_excel.py` 同步；新增 3 个用例覆盖：(a) A 有编号 + B 意图 + C 空备注 → ParsedRow.comment 空 / parse 正常 (b) A 有编号 + B 空意图 → ParsedRow 仍生成但 batch_tasks 走 skipped 分支 (c) 下载模板的 D/E/F 输出列不在用户表头出现
 - v2.28 → v2.29：**FEAT-18 批量页删 code_type 下拉 + sheet 自动检测多 code_type**——
   - §3.7 batch 流程图首框 `上传 Excel` 追加 multisheet 端点签名说明：`code_type: str | None = Form(None)` 可选，缺省走 `parse_excel_multisheet` 多 sheet 路径，显式传入保留 `parse_excel` 单 sheet 兼容路径；多 sheet 路径下 `BatchJob.code_type` 写字面量 `"mixed"` sentinel
   - §3.9 新增"多 sheet 路径"段落：`parse_excel_multisheet(file_path) -> list[ParsedRow]` 函数描述（遍历 `get_registry().all()` 的每个 `excel_sheet_name` → 复用单 sheet 解析逻辑 → 标注 `row.code_type` → 汇总按 sheet 顺序排列）；未注册 sheet 名静默跳过；全部已知 sheet 均无有效行抛 `ValueError("no_valid_rows")` → HTTP 400 `detail.type="no_valid_rows"`；`MULTISHEET_CODE_TYPE_SENTINEL = "mixed"` 常量
@@ -619,7 +629,7 @@ build_template_workbook(registry)
 for ct in registry.all():                              # 遍历已注册 code_type
     ws = wb.create_sheet(ct.excel_sheet_name)          # sheet 名 ← code_type yaml
     schema = registry.get_excel_schema(ct.id)          # 表头 ← schema yaml
-    写入 fields（跳过 output=true）+ signals 块展开    # 列序与 excel_parser._col_to_idx 对齐
+    写入 fields（跳过 output=true）                    # v2.30 / FEAT-19：仅 A/B/C 三列输出
     首行加粗 + 居中 + 浅灰底（PatternFill D9D9D9）
     第 2 行 B 列（column=2）写浅灰占位提示，A 列必须留空
     （否则 excel_parser 会把占位文字当成一条 row_id 解析）
@@ -631,7 +641,7 @@ for ct in registry.all():                              # 遍历已注册 code_ty
 关键解耦点：
 
 - **sheet 名 ← `data/code_types/*.yaml`**：assertion 对应 `SVA需求`、coverage 对应 `Coverage需求`，与 `excel_parser.py` 期望的 sheet 名严格一致；新增 code_type 时 yaml 落地后模板**自动**新增一个 sheet，`template_writer.py` 不动。
-- **表头 ← `data/schemas/*.yaml`**：列名与列绝对位置（`col` 字段，`A` / `B` / `G` …）从 schema 读取，跳过标注为 `output: true` 的"系统回填"列；`signals` 块按 `start_col` / `cols_per_signal` / `max_count` / `sub_fields[*].suffix` 展开（如"信号1名称"/"信号1位宽"/"信号1角色"… 共 4×3=12 列）。这与 §3.9.1 两份表格规范及 `excel_parser.py` 解析层是**同一份 schema 的两端使用**，由此保证下载→填→上传的列结构闭环兼容。
+- **表头 ← `data/schemas/*.yaml`**：列名与列绝对位置（`col` 字段，`A` / `B` / `C` …）从 schema 读取，跳过标注为 `output: true` 的"系统回填"列。**v2.30 / FEAT-19 起 schema `signals:` 键已置为 `null`**，`_collect_headers` 中原 `if signals:` 守卫自动跳过 signals 块展开逻辑——下载的模板只剩 A/B/C 三列用户表头，D/E/F 输出列因 `output=true` 不写出（仅在 schema 文档化输出契约）。列字母 → 1-based 列号映射由 `app.services.parser.utils.col_to_idx` 统一提供（`excel_parser.py` 解析层与 `template_writer.py` 写表头层共享 import），新 schema 与 `excel_parser.py` 解析层仍是**同一份 schema 的两端使用**，由此保证下载→填→上传的 3 列闭环兼容。
 - **路由顺序**：`batch.py` 中 `GET /{job_id}/...` 是参数化路由，`GET /template` 必须**先于**它们注册，否则 `template` 字面量会被当作 `job_id` 落入参数路由。
 - **auth**：依赖 `Depends(get_current_user)`，未携带 Bearer token 返 HTTP 401，权限粒度不细分到角色。
 - **依赖**：`openpyxl` 既有依赖（`excel_parser.py` 已用），无需新增 `requirements.txt` 行。
@@ -648,99 +658,66 @@ for ct in registry.all():                              # 遍历已注册 code_ty
 
 #### 3.9.1 两份输入表格规范
 
-平台接受两种固定格式的 Excel 文件（`.xlsx`），分别对应 SVA 断言需求和功能覆盖率需求。列定义分别存储于 `data/schemas/sva_schema.yaml` 和 `data/schemas/coverage_schema.yaml`，以下为 v1.0 列规范参考。
+平台接受两种固定格式的 Excel 文件（`.xlsx`），分别对应 SVA 断言需求和功能覆盖率需求。列定义分别存储于 `data/schemas/sva_schema.yaml` 和 `data/schemas/coverage_schema.yaml`。**v2.30 / FEAT-19 起** 两份 schema 均推倒重建为 3 个用户列 + 3 个系统输出列；旧 17/19 列结构不再使用，相关 `signals:` 块在 schema 中已置为 `null`。
 
 **SVA断言需求表列定义**（sheet名：`SVA需求`）：
 
-| 列索引 | 列名 | 数据类型 | 必填 | 枚举值 |
-|--------|------|---------|------|-------|
-| A | 编号 | 文本 | 是 | — |
-| B | 所属模块 | 文本 | 是 | — |
-| C | 时钟 | 文本 | 是 | — |
-| D | 复位信号 | 文本 | 是 | — |
-| E | 复位极性 | 枚举 | 是 | 高有效 / 低有效 |
-| F | 协议 | 枚举 | 否 | AXI4 / AHB / APB / 通用 |
-| G | 信号1名称 | 文本 | 是 | — |
-| H | 信号1位宽 | 整数 | 是 | — |
-| I | 信号1角色 | 枚举 | 是 | valid/ready/data/state/req/ack/start/end/enable/count/other |
-| J | 信号2名称 | 文本 | 否 | — |
-| K | 信号2位宽 | 整数 | 否 | — |
-| L | 信号2角色 | 枚举 | 否 | 同上 |
-| M | 信号3名称 | 文本 | 否 | — |
-| N | 信号3位宽 | 整数 | 否 | — |
-| O | 信号3角色 | 枚举 | 否 | 同上 |
-| P | 信号4名称 | 文本 | 否 | — |
-| Q | 信号4位宽 | 整数 | 否 | — |
-| R | 信号4角色 | 枚举 | 否 | 同上 |
-| S | 验证意图 | 长文本 | 是 | — |
-| T | 严重级别 | 枚举 | 否 | error / warning / info |
-| U | 备注 | 文本 | 否 | — |
-| V | **[输出]匹配模板** | 文本 | — | 系统回填 |
-| W | **[输出]置信度** | 数字 | — | 系统回填 |
-| X | **[输出]生成状态** | 枚举 | — | 已生成 / 需确认 / 需修改 |
+| 列索引 | 列名 | 数据类型 | 必填 | 输出列 | 枚举值 |
+|--------|------|---------|------|--------|-------|
+| A | 编号 | 文本 | 是 | ✗ | — |
+| B | 验证意图 | 长文本 | 是 | ✗ | — |
+| C | 备注 | 文本 | 否 | ✗ | — |
+| D | **[输出]匹配模板** | 文本 | — | ✓ | 系统回填 |
+| E | **[输出]置信度** | 数字 | — | ✓ | 系统回填 |
+| F | **[输出]生成状态** | 枚举 | — | ✓ | 已生成 / 需确认 / 需修改 |
 
 **功能覆盖率需求表列定义**（sheet名：`Coverage需求`）：
 
-| 列索引 | 列名 | 数据类型 | 必填 | 枚举值 |
-|--------|------|---------|------|-------|
-| A | 编号 | 文本 | 是 | — |
-| B | 所属模块 | 文本 | 是 | — |
-| C | 采样时钟 | 文本 | 是 | — |
-| D | 复位信号 | 文本 | 是 | — |
-| E | 复位极性 | 枚举 | 是 | 高有效 / 低有效 |
-| F | 覆盖类型 | 枚举 | 否 | 值覆盖 / 转移覆盖 / 交叉覆盖 |
-| G | 主信号名称 | 文本 | 是 | — |
-| H | 主信号位宽 | 整数 | 是 | — |
-| I | 主信号数据类型 | 枚举 | 是 | logic / uint / enum |
-| J | 交叉信号1名称 | 文本 | 否 | — |
-| K | 交叉信号1位宽 | 整数 | 否 | — |
-| L | 交叉信号1数据类型 | 枚举 | 否 | logic / uint / enum |
-| M | 交叉信号2名称 | 文本 | 否 | — |
-| N | 交叉信号2位宽 | 整数 | 否 | — |
-| O | 交叉信号2数据类型 | 枚举 | 否 | logic / uint / enum |
-| P | Bin提示 | 文本 | 否 | 如 `1,2,4,8,16` 或 `0-15,>15` |
-| Q | 采样条件 | 文本 | 否 | 如 `awvalid && awready` |
-| R | 覆盖意图 | 长文本 | 是 | — |
-| S | 备注 | 文本 | 否 | — |
-| T | **[输出]匹配模板** | 文本 | — | 系统回填 |
-| U | **[输出]置信度** | 数字 | — | 系统回填 |
-| V | **[输出]生成状态** | 枚举 | — | 已生成 / 需确认 / 需修改 |
+| 列索引 | 列名 | 数据类型 | 必填 | 输出列 | 枚举值 |
+|--------|------|---------|------|--------|-------|
+| A | 编号 | 文本 | 是 | ✗ | — |
+| B | 覆盖意图 | 长文本 | 是 | ✗ | — |
+| C | 备注 | 文本 | 否 | ✗ | — |
+| D | **[输出]匹配模板** | 文本 | — | ✓ | 系统回填 |
+| E | **[输出]置信度** | 数字 | — | ✓ | 系统回填 |
+| F | **[输出]生成状态** | 枚举 | — | ✓ | 已生成 / 需确认 / 需修改 |
+
+**ParsedRow 字段策略（v2.30 / FEAT-19）**：`excel_parser._parse_sheet` 不再从 Excel 读取 `module / clk / rst / rst_polarity / protocol / signals` 等 14~16 列字段，但 `ParsedRow` dataclass **保留这些字段名**并以 dataclass `field(default=...)` 落入硬编码默认值：`clk: str = "clk"`、`rst: str = "rst_n"`、`rst_polarity: str = "低有效"`、`module: str = ""`、`protocol: str | None = None`、`signals: list[SignalInfo] = field(default_factory=list)`。这样 `tasks/batch_tasks.py` 中对 `row.clk` / `row.rst` / `row.rst_polarity` / `row.protocol` / `row.signals` 的引用**零改动**（FEAT-18 定型的 batch_tasks 不动），pipeline 6 级回退在 step2/regex/signal_list/default 三个高置信源都拿不到信号名时使用上述默认值作为"用户没填"的兜底语义，与单条页表单留空的行为一致。`SignalInfo` dataclass 保留供 type hint 用，但 `signals` 实际永远是空 list。
+
+**输出列前移至 D/E/F（v2.30 / FEAT-19）**：旧 schema 中 `_out_template / _out_confidence / _out_status` 三个输出列位于 SVA V/W/X 列、Coverage T/U/V 列。新 3 列 schema 后前移至 D/E/F 共用列号。当前 `_write_result_zip`（[backend/app/tasks/batch_tasks.py](backend/app/tasks/batch_tasks.py)）只写 `results.json` + 单个 `.sv` 代码文件、**不写回 Excel**，因此输出列在模板里纯为占位字段标记 schema 输出契约，无实际写入路径；前移 D/E/F 安全且语义清晰，后续若实现 Excel 回填功能列号已对齐。
+
+**不兼容旧 17/19 列模板（v2.30 / FEAT-19）**：v3.6 (FEAT-18) 之前的 SVA 17 列 / Coverage 19 列 Excel 模板**不再向后兼容**，请用户重新通过 `GET /api/v1/batch/template`（§3.7.1）下载新模板。后端不实现运行时兼容转换层，原因：(1) 列错位的语义鉴别需要 LLM 介入，违反 §1.1 确定性契约；(2) 旧模板信号块字段（信号N名称/位宽/角色）在 pipeline 6 级回退下已可由默认值兜底，无功能性损失；(3) 强制下载新模板是更明确的设计契约边界。继续上传旧 17/19 列模板时 `parse_excel` **不会崩溃**——它会按新 3 列规范读 A/B/C 列，把旧 B 列"所属模块"内容当 intent 解析（旧 SVA 模板真实意图列在 S 列、旧 Coverage 模板在 R 列）。典型表现：top-1 模板匹配偏向"以模块名为主题"的无关模板，置信度 < 50%。**该行为是设计决策**，无运行时报错，仅由文档显式声明。
 
 #### 3.9.2 解析流程（完全确定性）
 
 ```python
-# 每行解析产出结构化对象，供 RAG 引擎和渲染引擎使用
-class ParsedSVARow:
-    row_id: str               # 编号
-    module: str               # 所属模块
-    clk: str                  # 时钟信号名
-    rst: str                  # 复位信号名
-    rst_polarity: str         # high_active / low_active
-    protocol: str | None      # 协议（可选）
-    signals: list[SignalInfo] # [{name, width, role}, ...]
-    intent: str               # 验证意图（驱动RAG）
-    severity: str             # error / warning / info
-
-class ParsedCoverageRow:
-    row_id: str
-    module: str
-    clk: str
-    rst: str
-    rst_polarity: str
-    cover_type: str | None         # 覆盖类型（辅助RAG过滤）
-    main_signal: SignalInfo        # 主信号
-    cross_signals: list[SignalInfo]# 交叉信号列表
-    bin_hint: str | None           # Bin提示
-    sample_condition: str | None   # 采样条件
-    intent: str                    # 覆盖意图（驱动RAG）
+# v2.30 / FEAT-19：ParsedRow 统一为单一 dataclass（不再按 code_type 分两种），
+# 三列从 Excel 读取，其余字段固定默认值，保持 batch_tasks.py 消费侧零改动
+@dataclass
+class ParsedRow:
+    row_id: str                                            # A 列：编号（必填）
+    code_type: str                                         # 由 sheet 名 → registry 反查得出
+    intent: str                                            # B 列：验证意图 / 覆盖意图（必填，驱动 RAG）
+    comment: str | None = None                             # C 列：备注（可选，pipeline 不消费）
+    # 以下 6 字段在 v3.6 之前由 Excel 列填写；v2.30 / FEAT-19 起一律取默认值，
+    # 与 PipelineInput 表单留空、pipeline 6 级回退兜底等价
+    module: str = ""
+    clk: str = "clk"
+    rst: str = "rst_n"
+    rst_polarity: str = "低有效"
+    protocol: str | None = None
+    signals: list[SignalInfo] = field(default_factory=list)
+    extra: dict = field(default_factory=dict)              # 历史 severity / cover_type 等字段流转位，新 schema 不再写入
 ```
 
 #### 3.9.3 信号角色直接参数填充
 
-RAG 检索并由 Claude 确认模板选择后，信号角色到模板参数的映射**直接由规则完成**，无需 LLM 二次推断：
+> **v2.30 / FEAT-19 起本节描述的"信号角色规则映射"已不在批量路径生效**——批量 Excel 不再要求用户填写信号角色表，`ParsedRow.signals` 恒为空 list，pipeline 6 级回退（step2 / regex / signal_list / default / semantic_fallback / placeholder）按默认值兜底。若 required 参数最终落在 `semantic_fallback` / `placeholder` 或 LLM trivial 值，由 under_specified 闸 422 拒绝（详见 §1.1 / pipeline `_detect_under_specified`）；这是设计折衷：批量场景下意图列承担全部信号语义，单条页 `/generate` 表单仍保留信号角色控件用于高精度场景。下述规则映射保留供历史参考与单条页流程读者建立心智模型用，**勿据此判断当前批量行为**。
+
+RAG 检索并由 Claude 确认模板选择后，单条页表单填写的信号角色到模板参数的映射**直接由规则完成**，无需 LLM 二次推断：
 
 ```
-ParsedRow.signals = [
+PipelineInput.signals = [   # 单条页表单 / v3.6 之前的批量 Excel
     {name: "awvalid", width: 1,  role: "valid"},
     {name: "awready", width: 1,  role: "ready"},
     {name: "awaddr",  width: 32, role: "data"},
