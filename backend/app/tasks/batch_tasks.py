@@ -27,7 +27,11 @@ async def _run_batch_job_async(job_id: str) -> None:
     from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker
     from app.core.config import get_settings
     from app.models.batch_job import BatchJob
-    from app.services.parser.excel_parser import parse_excel
+    from app.services.parser.excel_parser import (
+        MULTISHEET_CODE_TYPE_SENTINEL,
+        parse_excel,
+        parse_excel_multisheet,
+    )
     from app.services.core.pipeline import (
         PipelineInput,
         run_pipeline,
@@ -56,7 +60,10 @@ async def _run_batch_job_async(job_id: str) -> None:
         await db.commit()
 
         try:
-            rows = parse_excel(input_file, job.code_type)
+            if job.code_type == MULTISHEET_CODE_TYPE_SENTINEL:
+                rows = parse_excel_multisheet(input_file)
+            else:
+                rows = parse_excel(input_file, job.code_type)
             RESULT_DIR.mkdir(parents=True, exist_ok=True)
             results = []
 
@@ -124,7 +131,10 @@ async def _run_batch_job_async(job_id: str) -> None:
                         "reason": "输入似乎与 IC 验证需求无关，请重写意图。",
                     })
                 except CodeTypeMismatchError as e:
-                    # code_type 选错——让用户切 code_type 后重跑该行
+                    # FEAT-18: 批量场景下用户不再"选 code_type"，是"在哪个 sheet 填行"。
+                    # gate 2 触发说明用户把行写在了不匹配 sheet——文案改成"挪到对应
+                    # sheet 后重跑"。具体文案构造在 _build_code_type_mismatch_reason
+                    # helper 中（便于单测覆盖"sheet"关键词）。
                     logger.info(
                         "row %s code_type_mismatch selected=%s suggested=%s",
                         row.row_id, e.selected_code_type, e.suggested_code_type,
@@ -134,9 +144,9 @@ async def _run_batch_job_async(job_id: str) -> None:
                         "status": "code_type_mismatch",
                         "selected_code_type": e.selected_code_type,
                         "suggested_code_type": e.suggested_code_type,
-                        "reason": (
-                            f"意图更像是「{e.suggested_code_type}」类型，"
-                            f"当前选了「{e.selected_code_type}」。请切换 code_type 后重跑该行。"
+                        "reason": _build_code_type_mismatch_reason(
+                            e.selected_code_type,
+                            e.suggested_code_type,
                         ),
                     })
                 except Exception as e:
@@ -166,6 +176,27 @@ async def _run_batch_job_async(job_id: str) -> None:
             await db.commit()
         finally:
             await engine.dispose()
+
+
+def _build_code_type_mismatch_reason(
+    selected_code_type: str,
+    suggested_code_type: str,
+) -> str:
+    """FEAT-18: 把 gate 2 在批量场景下的 reason 文案抽成独立 helper，便于单测验证
+    "sheet" 关键词覆盖生效。运行时由 _run_batch_job_async 的 CodeTypeMismatchError
+    分支调用；registry 反查在 helper 内完成，registry 故障时退化为 code_type id 字面量。
+    """
+    from app.services.registry import get_registry
+
+    try:
+        sheet_name = get_registry().get(selected_code_type).excel_sheet_name
+    except ValueError:
+        sheet_name = selected_code_type
+    return (
+        f"您在「{sheet_name}」sheet 中写了更像「{suggested_code_type}」"
+        f"的描述。请将该行挪到对应 sheet 后重跑该行（提示：编辑 Excel "
+        f"时把该行 cut 到正确 sheet）"
+    )
 
 
 def _find_input_file(job_id: str) -> Path | None:
