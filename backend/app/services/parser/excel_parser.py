@@ -24,12 +24,16 @@ class SignalInfo:
 class ParsedRow:
     row_id: str
     code_type: str
-    module: str
-    clk: str
-    rst: str
-    rst_polarity: str
-    protocol: str | None
     intent: str
+    comment: str | None = None
+    # FEAT-19: 以下 6 字段在 3 列 schema 下不再由 Excel 提供，全部走 dataclass 默认值。
+    # 字段名保留是为了让 batch_tasks.py 的 `row.clk` / `row.rst` / `row.signals` 等引用
+    # 零改动；pipeline 6 级回退本就以这些字面量为默认值（参见 ARCHITECTURE §3.7）。
+    module: str = ""
+    clk: str = "clk"
+    rst: str = "rst_n"
+    rst_polarity: str = "低有效"
+    protocol: str | None = None
     signals: list[SignalInfo] = field(default_factory=list)
     extra: dict = field(default_factory=dict)
 
@@ -38,7 +42,6 @@ def _parse_sheet(ws, schema: dict, code_type: str) -> list[ParsedRow]:
     rows = list(ws.iter_rows(min_row=2, values_only=True))
 
     fields_def = {f["col"]: f for f in schema["fields"] if not f.get("output")}
-    signals_def = schema.get("signals")
 
     results: list[ParsedRow] = []
     for raw_row in rows:
@@ -57,39 +60,11 @@ def _parse_sheet(ws, schema: dict, code_type: str) -> list[ParsedRow]:
             val = get_cell(col)
             extra[fdef["field_key"]] = val
 
-        signals: list[SignalInfo] = []
-        if signals_def:
-            start_col = signals_def["start_col"]
-            max_count = signals_def["max_count"]
-            cpp = signals_def["cols_per_signal"]
-            start_idx = col_to_idx(start_col)
-
-            for i in range(max_count):
-                base = start_idx + i * cpp - 1
-                if base >= len(raw_row):
-                    break
-                name = str(raw_row[base]).strip() if raw_row[base] else None
-                if not name:
-                    continue
-                width_raw = raw_row[base + 1] if base + 1 < len(raw_row) else None
-                role_raw = raw_row[base + 2] if base + 2 < len(raw_row) else None
-                try:
-                    width = int(width_raw) if width_raw else 1
-                except (ValueError, TypeError):
-                    width = 1
-                role = str(role_raw).strip() if role_raw else "other"
-                signals.append(SignalInfo(name=name, width=width, role=role))
-
         row = ParsedRow(
             row_id=extra.get("row_id", ""),
             code_type=code_type,
-            module=extra.get("module", ""),
-            clk=extra.get("clk", "clk"),
-            rst=extra.get("rst", "rst_n"),
-            rst_polarity=extra.get("rst_polarity", "低有效"),
-            protocol=extra.get("protocol"),
-            intent=extra.get("intent", ""),
-            signals=signals,
+            intent=extra.get("intent", "") or "",
+            comment=extra.get("comment"),
             extra=extra,
         )
         results.append(row)

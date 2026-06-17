@@ -72,42 +72,33 @@ def _build_authed_app() -> FastAPI:
 def _make_sva_workbook(file_path: Path, *, row_ids: list[str]) -> None:
     """生成 SVA 需求 sheet 含 row_ids 列数据行的 workbook + 空 Coverage 需求 sheet。
 
-    用 build_template_workbook 取真实 sheet 名 + 表头，再在 SVA 需求 sheet 的
-    row 2 起按 row_id 数填入数据（A 列 row_id、B 列 module、C 列 clk、D 列 rst、
-    E 列 rst_polarity、S 列 intent）。这样既保证表头列结构对齐 schema，又能
-    生成可被 parse_excel_multisheet 识别的真实数据行。
+    FEAT-19 起 SVA schema 精简为 3 列（A row_id / B 验证意图 / C 备注），数据
+    从 row 3 起仅写 A + B 两列即可命中 parse_excel_multisheet 的行识别。
     """
     wb = build_template_workbook(get_registry())
     ws = wb["SVA需求"]
     # 占位说明在 row 2（B2），数据从 row 3 起
     for i, rid in enumerate(row_ids, start=3):
         ws.cell(row=i, column=1, value=rid)  # A: row_id
-        ws.cell(row=i, column=2, value="cpu")  # B: module
-        ws.cell(row=i, column=3, value="clk")  # C: clk
-        ws.cell(row=i, column=4, value="rst_n")  # D: rst
-        ws.cell(row=i, column=5, value="低有效")  # E: rst_polarity
-        ws.cell(row=i, column=19, value=f"intent for {rid}")  # S (19): intent
+        ws.cell(row=i, column=2, value=f"intent for {rid}")  # B: 验证意图
     wb.save(file_path)
 
 
 def _make_dual_workbook(
     file_path: Path, *, sva_row_ids: list[str], cov_row_ids: list[str]
 ) -> None:
-    """两 sheet 都填数据：SVA 需求 + Coverage 需求。"""
+    """两 sheet 都填数据：SVA 需求 + Coverage 需求（均为 3 列 schema）。"""
     wb = build_template_workbook(get_registry())
     ws_sva = wb["SVA需求"]
     for i, rid in enumerate(sva_row_ids, start=3):
         ws_sva.cell(row=i, column=1, value=rid)
-        ws_sva.cell(row=i, column=2, value="cpu")
-        ws_sva.cell(row=i, column=19, value=f"sva intent for {rid}")
+        ws_sva.cell(row=i, column=2, value=f"sva intent for {rid}")
 
     ws_cov = wb["Coverage需求"]
-    # Coverage schema intent 在 R 列（idx 18）；main_signal_name 在 G(7) / width H(8) /
-    # dtype I(9)。填最低限度让 ParsedRow 非空（A 列编号即可触发 row 入列）。
+    # FEAT-19: Coverage schema 同 SVA 精简为 3 列，intent 在 B 列。
     for i, rid in enumerate(cov_row_ids, start=3):
         ws_cov.cell(row=i, column=1, value=rid)
-        ws_cov.cell(row=i, column=2, value="cpu")
-        ws_cov.cell(row=i, column=18, value=f"cov intent for {rid}")
+        ws_cov.cell(row=i, column=2, value=f"cov intent for {rid}")
     wb.save(file_path)
 
 
@@ -117,8 +108,7 @@ def _make_unknown_sheet_workbook(file_path: Path, *, sva_row_ids: list[str]) -> 
     ws_sva = wb["SVA需求"]
     for i, rid in enumerate(sva_row_ids, start=3):
         ws_sva.cell(row=i, column=1, value=rid)
-        ws_sva.cell(row=i, column=2, value="cpu")
-        ws_sva.cell(row=i, column=19, value=f"sva intent for {rid}")
+        ws_sva.cell(row=i, column=2, value=f"sva intent for {rid}")
 
     garbage = wb.create_sheet(title="Garbage")
     garbage.cell(row=1, column=1, value="编号")
@@ -259,3 +249,69 @@ def test_gate2_batch_reason_unknown_code_type_falls_back_gracefully():
     # registry.get 失败时退化为 selected_code_type 字面量
     assert "bogus_unknown_type" in reason
     assert "sheet" in reason
+
+
+# ── 6. FEAT-19 — 3 列 schema 新场景 ────────────────────────────────────
+
+def test_parse_3col_only_required_no_comment(tmp_path):
+    """只填 A 编号 + B 意图，C 备注为空 → parse 正常返回 ParsedRow，
+    comment 字段为 None 或空串，intent 字段非空。"""
+    fp = tmp_path / "no_comment.xlsx"
+    wb = build_template_workbook(get_registry())
+    ws = wb["SVA需求"]
+    ws.cell(row=3, column=1, value="ROW-1")
+    ws.cell(row=3, column=2, value="check req before ack")
+    # 故意不写 column=3（C 备注）
+    wb.save(fp)
+
+    rows = parse_excel_multisheet(fp)
+    assert len(rows) == 1, f"应得 1 条行，实际 {len(rows)}"
+    row = rows[0]
+    assert row.row_id == "ROW-1"
+    assert row.code_type == "assertion"
+    assert row.intent == "check req before ack"
+    # comment 缺失列时 _parse_sheet 的 get_cell 返回 None
+    assert not row.comment, f"未填备注应为空（None 或 ''），实际 {row.comment!r}"
+
+
+def test_parse_3col_empty_intent_skipped_by_worker(tmp_path):
+    """A 编号有值 + B 意图空 → parse_excel_multisheet 仍返回该行（A 非空），
+    但 ParsedRow.intent 为空串，batch_tasks 的 `if not intent_text` 分支
+    会把这一行归为 `skipped`/`reason="空意图"`。
+
+    这条用例锁的是 parser 侧的契约——parser 不负责跳行（A 非空就返回），
+    跳行决策完全由 worker 在 batch_tasks.py:71-77 做。"""
+    fp = tmp_path / "empty_intent.xlsx"
+    wb = build_template_workbook(get_registry())
+    ws = wb["SVA需求"]
+    ws.cell(row=3, column=1, value="ROW-EMPTY")
+    # column=2 (B 验证意图) 故意留空
+    wb.save(fp)
+
+    rows = parse_excel_multisheet(fp)
+    assert len(rows) == 1, "A 列有值即应入列，由 worker 决定是否 skipped"
+    row = rows[0]
+    assert row.row_id == "ROW-EMPTY"
+    assert row.intent == "", f"B 列空时 intent 应为空串，实际 {row.intent!r}"
+    # 同步验证 worker 跳行条件命中：`row.intent` 假值 + `row.extra["intent"]` 也为 None
+    intent_text = row.intent if row.intent else row.extra.get("intent", "")
+    assert not intent_text, "worker 应将此行判为空意图"
+
+
+def test_download_template_output_cols_at_d_e_f():
+    """FEAT-19: 输出列 _out_template / _out_confidence / _out_status 在
+    sva/coverage schema 中已前移至 D/E/F，且带 output=true 标记——模板
+    下载时 template_writer 必须把 D/E/F 全部跳过，用户可见表头仅 A/B/C。"""
+    wb = build_template_workbook(get_registry())
+    for sheet_name in ("SVA需求", "Coverage需求"):
+        ws = wb[sheet_name]
+        # A/B/C 必须有表头
+        assert ws.cell(row=1, column=1).value is not None, f"{sheet_name} A1 缺表头"
+        assert ws.cell(row=1, column=2).value is not None, f"{sheet_name} B1 缺表头"
+        assert ws.cell(row=1, column=3).value is not None, f"{sheet_name} C1 缺表头"
+        # D/E/F 必须为空（output 字段不渲染到表头）
+        for col_idx, letter in ((4, "D"), (5, "E"), (6, "F")):
+            assert ws.cell(row=1, column=col_idx).value is None, (
+                f"{sheet_name} {letter}1 不应有表头（应被 output=true 过滤），"
+                f"实际 {ws.cell(row=1, column=col_idx).value!r}"
+            )
