@@ -17,6 +17,12 @@
 9. [版本发布流程](#9-版本发布流程)
 10. [常用命令速查](#10-常用命令速查)
 11. [无关意图回归语料维护](#11-无关意图回归语料维护)
+12. [近邻模板混淆对回归语料维护](#12-近邻模板混淆对回归语料维护)
+13. [L3 反馈 `reason_tags` 维护流程](#13-l3-反馈-reason_tags-维护流程)
+14. [FEAT-11 `llm_direct` 兜底路径测试 recipe](#14-feat-11-llm_direct-兜底路径测试-recipe)
+15. [FEAT-12 `improvement_reports` 测试 recipe](#15-feat-12-improvement_reports-测试-recipe)
+16. [FEAT-13 模板成熟度门控测试 recipe](#16-feat-13-模板成熟度门控测试-recipe)
+17. [FEAT-16 新增 code_type 时 template 自动同步](#17-feat-16-新增-code_type-时-template-自动同步)
 
 ---
 
@@ -536,6 +542,452 @@ docker compose exec backend pytest tests/test_offtopic_corpus_real_llm.py --real
 **不要在代码里硬编码这条流程的频率**。这是数据工程职责，进 ops runbook 即可——本节作为一份"未来想到再做"的备忘。
 
 详细 schema 字段约定见 `backend/tests/data/offtopic_corpus.yaml` 文件头注释。
+
+### 11.5 添加 cross-code-type 错选样本（FEAT-15 起）
+
+FEAT-15 把 off-topic gate 判定基准从"所选 code_type 子集 dense top-1"升级为"全 code_type 库 best_overall"，并给 code_type_mismatch gate 追加 `best_other_score >= threshold` 前置条件。两闸语义切分后，`offtopic_corpus.yaml` 多出一类新样本——**"合法 IC 意图但用户选了错的 code_type"**，期望路由是 `CodeTypeMismatchError` 而非 `OffTopicIntentError`。本子节给这类样本的录入规范。
+
+**`expected_gate` 字段（必填，FEAT-15 起）**：
+
+| 取值 | 含义 | 适用段 |
+|---|---|---|
+| `off_topic` | 全 code_type 库 best_overall < threshold，真离题 | `off_topic` 段（默认值，已有样本可省略） |
+| `code_type_mismatch` | 在域但用户选错 code_type；`best_other_score - selected ≥ margin` 且 `best_other_score ≥ threshold` | `marginal_ic` 段（推荐）或新增 `cross_code_type_mismatch` 段 |
+| `null` | 两闸均不触发，请求继续进流水线（边界回归用） | `marginal_ic` 段 |
+
+老样本无 `expected_gate` 字段时按"`off_topic` 段→`off_topic`、`marginal_ic` 段→`null`"自动推断，保持向后兼容。
+
+**`marginal_ic` 与 `cross_code_type_mismatch` 的区别**：
+
+- `marginal_ic`（无 `expected_gate` 或 `expected_gate: null`）：边界 IC 请求，无论选哪个 code_type 都不触发任一闸——`best_overall` 自身没那么高（接近但 > threshold），且 gap 不显著
+- `cross_code_type_mismatch`（`expected_gate: code_type_mismatch`）：意图本身是合法 IC 验证请求，但用户选了错的 code_type——某非 selected 的 code_type 得分高出 selected 至少 margin（默认 0.10）且 ≥ threshold（默认 0.44）。**关键判据是"另一个 code_type 高分"，不是"全库都不太高"**
+
+**录入流程**（在 §11.1 触发点 A/B 之上的补充）：
+1. 复现：在前端选错 code_type（如"覆盖率"语义选 assertion），从后端日志读 `[Gate] offtopic selected_dense=... best_other_id=... best_other_score=... best_overall=... threshold=...` 行
+2. 确认 `best_other_score - selected_dense ≥ 0.10` 且 `best_other_score ≥ 0.44`——否则该样本不该期待 `code_type_mismatch`（仍按 §11.1 路径标 `off_topic` 或 `marginal_ic`）
+3. 在 `offtopic_corpus.yaml` 的 `marginal_ic` 段加一条样本，必填 `id` / `input` / `code_type`（用户当时选的错类）/ `added` / `source: "user report YYYY-MM-DD"` / `reason` / **`expected_gate: code_type_mismatch`** / 可选 `suggested_code_type`（仅供 review，断言不绑）
+4. **先跑 mock 测——预期当前 fail 或测试不识别新字段**（用 §11.1 红灯逻辑确认语料抓到真问题）
+5. 跑 `test_offtopic_corpus_mocked.py::test_cross_code_type_mismatch_corpus_routing` 变绿 → 提 PR → 永守
+
+**mocked 测试 patch 模式（与 `test_marginal_ic_passes` 关键差异）**：
+
+`test_marginal_ic_passes` 假设的是"单 dense top-1 函数返一个 float"，所以 `monkeypatch.setattr` 把 `dense_top1_score` 替换为 `lambda intent, code_type=None: 0.55` 这类常量返回值。这套 patch 对 cross-code-type 样本无效——`pipeline_preview` 会顺序调 `dense_top1_score(intent, code_type=selected)` + `_compute_cross_code_type_scores(intent, selected, selected_score)`，后者内部循环对每个非 selected code_type 各调一次 `dense_top1_score`。你必须 patch 两个 code_type 的得分分布而不是单一阈值，否则 best_other_score 永远 = selected_score → gate 2 永远不触发。推荐 patch 法：
+
+```python
+async def fake_dense_top1(intent, code_type=None):
+    # 按 (intent_fingerprint, code_type) 二元组返不同分布
+    if code_type == "assertion":
+        return 0.41
+    if code_type == "coverage":
+        return 0.76
+    return 0.0
+monkeypatch.setattr("app.services.rag.engine.dense_top1_score", fake_dense_top1)
+```
+
+或者参考 `test_pipeline_preview_code_type_mismatch_raises_with_suggestion` 已有的 `_patch_dense_per_code_type` helper 直接复用。`test_cross_code_type_mismatch_corpus_routing` 函数应循环消费 `expected_gate: code_type_mismatch` 的样本，对每条断言抛出的异常类型是 `CodeTypeMismatchError` 而非 `OffTopicIntentError`，**不绑** `suggested_code_type` 的具体值（避免新增 code_type 后破测）。
+
+**与 `test_marginal_ic_passes` 共存约定**：新函数独立编写，**不**修改 `test_marginal_ic_passes` 既有断言模式（后者继续守"边界 IC 请求两闸均不触发"语义），这是 FEAT-15 spec Q5 review 决议。
+
+---
+
+## 12. 近邻模板混淆对回归语料维护
+
+第五道闸 `no_matching_template` 是"库内没有任何模板能覆盖意图"的兜底；但更隐蔽的失效是 **LLM step1 在两个语义接近的模板间选错**——意图属于 `handshake_stable` 却选了 `handshake_timeout`，或 `timing_max_delay` 被选成 `handshake_timeout`。这类错误不触发任何 gate，最终用户拿到的是"看起来合理但语义错位的代码"，回归隐患极高。
+
+`backend/tests/data/template_confusion_corpus.yaml` 是这条防线——一份 checked-in 的近邻混淆对样本集，每条 case 声明 `correct_template` + `confusion_template`，由两套 pytest 守护：
+
+- `tests/test_template_confusion_corpus_mocked.py`：mock RAG 把 `confusion_template` 注入为 top-1，断言 pipeline 最终选中 `correct_template`，CI 必跑，守 candidate 渲染（A4）+ differentiators 投喂（A10）+ A8 verify 联动逻辑
+- `tests/test_template_confusion_corpus_real_llm.py --real-llm`：手动跑，调真 LLM + 真 RAG，守 prompt + 模型在不利 RAG 排序下的鲁棒性
+
+### 12.1 新增样本的标准流程
+
+**触发点 A：发现新混淆对（最高频）**
+1. 用户报告"我说 X，系统给我 Y"（X / Y 在语义上接近但 X 才对），或 real-llm 套件 fail
+2. 复现并定位是不是模板 description / differentiators / non_use_cases 信息不足导致 LLM 误判
+3. 在 `template_confusion_corpus.yaml` 加一条样本，必填：
+   - `id`（蛇形命名，唯一）
+   - `input`（用户原始意图文本）
+   - `code_type`（"assertion" | "coverage"）
+   - `signals`（可选，避免触发 under_specified 闸）
+   - `correct_template`（应命中的 template_id）
+   - `confusion_template`（最容易混淆的竞争 id，也是 mock 测注入为 RAG top-1 的 id）
+   - `added`（"YYYY-MM-DD"）
+   - `source`（"initial seed" / "user report 2026-XX-XX" / "PR fix-X"）
+   - `reason`（6 个月后能看懂"这对为啥容易混"）
+   - `flaky`（可选，true 表示 real-llm 测可能不稳定）
+4. **先跑 mock 测——预期当前 fail**（红灯证明在干扰候选下确实会选错）
+5. 修：补 template YAML 的 `differentiators` / `non_use_cases`、A4 候选渲染逻辑、或 A8 `verify_step1_selection` prompt，让 mock 测变绿
+6. PR → CI 永守
+
+**触发点 B：新增模板上线（中频）**
+PR 前 checklist：
+- [ ] 新模板找出至少 1 个最近邻竞争者，写一条混淆对样本
+- [ ] 至少覆盖新模板的两个方向（A→B 和 B→A 各一条），避免单向偏置
+- [ ] 跑 `lib_manager.py validate` 确认新模板的 `differentiators` / `non_use_cases` 都是非空 list
+
+**触发点 C：A4 / A8 / A10 关键参数变化（低频但风险高）**
+1. A. `_render_step1_candidate` 的 description 截断阈值变化（如 1000 → 600）：跑 mock 套件
+2. B. **`_render_step1_candidate` XML 格式变更（v2.26 / FEAT-14）**：跑 `pytest backend/tests/test_step1_prompt_xml.py -v` 确认 prompt 无 `### ` 编号前缀且含 `<candidate id="`；再跑 mocked offtopic_corpus + pipeline_preview 回归套件（`pytest backend/tests/test_offtopic_corpus_mocked.py backend/tests/test_pipeline_preview_render.py -v`）确认零退步。任何对 `<candidate>` 标签 attribute 命名 / 嵌套结构的改动都必须在 prompt XML 测里更新断言，否则解析层精确 id 匹配会静默失效——数字兜底虽然能救一部分，但失去"LLM 直接返 id"的主路径就等于把所有 step1 决策推到兜底链
+3. C. A8 `verify_step1_selection` prompt 调整：跑 real-llm 套件 `--real-llm`
+4. D. A10 模板 description 或 `differentiators` / `non_use_cases` 改动：两个套件都跑
+5. **数字兜底逻辑改动（v2.26 / FEAT-14）**：`_step1_select_id` / `anthropic_client.select_template` 的数字序号兜底是 prompt XML 化的安全网——若 LLM 仍偶发返编号，兜底必须把 raw 数字 N（含 `'3.'` / `'"3"'` / `' 3 '` 各 strip 变体）正确 resolve。改解析层任何一行都必须跑 `pytest backend/tests/test_step1_numeric_fallback.py -v`（覆盖 raw=`'3'` / `'3.'` / `' 3 '` / `'"3"'` / `'none'` / 完整 id / 非法文字 id / `N=0` / `N=len+1` 边界 + AnthropicClient 同等兜底路径）
+6. 若回归率上升，先修 prompt / 描述字段而**不是降语料**——语料是契约，不该被绕过
+
+### 12.2 维护准则
+
+- **append-only 优先**：除非彻底改设计契约，不要删除已有样本——它们是历史回归的疫苗
+- **测试断言精确到 `template_id`**（与 `template_selection_corpus.yaml` 的松散匹配不同——混淆对必须看具体走向）
+- **pair-A / pair-B / FSM / coverage 四类至少各 1 条**：确保最容易混的对都有兜底
+- **`source` + `reason` 必填**：6 个月后能看懂"这条为什么在这里"
+- **`added` 日期**：便于定期 review 时识别老化样本
+
+### 12.3 跑法速查
+
+```bash
+# PR 必跑：mock 套件（快，纯本地，CI 默认）
+docker compose exec backend pytest tests/test_template_confusion_corpus_mocked.py -v
+
+# v2.26 / FEAT-14 新增：step1 数字兜底单测（mock LLM，CI 必跑）
+docker compose exec backend pytest tests/test_step1_numeric_fallback.py -v
+
+# v2.26 / FEAT-14 新增：step1 prompt XML 格式断言（mock LLM，CI 必跑）
+docker compose exec backend pytest tests/test_step1_prompt_xml.py -v
+
+# 手动跑：真 LLM + 真 RAG 套件（需 llm_configs 表已配 is_default=true 记录 + Qdrant 已 import 全模板）
+docker compose exec backend pytest tests/test_template_confusion_corpus_real_llm.py --real-llm -v
+```
+
+### 12.4 与 A9 reranker score gate 的关系
+
+`scripts/calibrate_reranker_threshold.py` 以 `template_selection_corpus + template_confusion_corpus` 为输入跑真 RAG（stage1 + stage2 + stage3），输出每条 intent 的 `correct_template` 和 `confusion_template` 的 reranker score 分布，建议 `reranker_min_score_threshold` 阈值（约 `correct_p10 与 wrong_p50 中点`）。本节语料同时是 A9 阈值标定的数据源；**新增样本时也会顺便扩大标定基础**。
+
+阈值取法：让大多数 `correct` 通过、大多数 `confusion` 拦下；两段分布重叠严重时（`correct_p10 < confusion_p50`）→ 标定无解，**优先扩 `differentiators` / `description`** 或重训 reranker，不要直接放宽阈值。
+
+详细字段约定见 `backend/tests/data/template_confusion_corpus.yaml` 文件头注释。
+
+---
+
+## 13. L3 反馈 `reason_tags` 维护流程
+
+L3 用户反馈的差评原因标签是固定枚举（不允许用户自定义），由 `backend/app/schemas/feedback.py::ReasonTagEnum` 与前端 `frontend/src/api/feedback.ts::REASON_TAG_OPTIONS` 双向定义。两份必须**同步演进**，否则前端选项与后端校验会错位 → 差评 Modal 提交后被 422 拦下。
+
+### 13.1 新增枚举值
+
+1. 后端先扩 `ReasonTagEnum`：
+   ```python
+   # backend/app/schemas/feedback.py
+   class ReasonTagEnum(str, Enum):
+       WRONG_TEMPLATE = "wrong_template"
+       # ...既有 6 项...
+       MY_NEW_TAG = "my_new_tag"  # 新增
+   ```
+2. 前端同步 `ReasonTag` 类型与 `REASON_TAG_OPTIONS`：
+   ```ts
+   // frontend/src/api/feedback.ts
+   export type ReasonTag =
+     | 'wrong_template' | ... | 'other'
+     | 'my_new_tag'  // 新增
+   export const REASON_TAG_OPTIONS = [
+     ...,
+     { value: 'my_new_tag', label: '中文标签' },  // 新增
+   ]
+   ```
+3. **不需要 migration** —— `generation_records.feedback_reason_tags` 是 JSONB 字段，没有 enum schema 约束；老记录的 7 项标签和新记录的 8 项标签可在同一列共存
+4. **不需要刷数据** —— 老数据天然不带新标签值，差评率 KPI 仍准确
+5. PR 描述里记一句"扩 reason_tag" + 选项理由（哪类用户反馈现有 7 项接不住），便于后续 audit
+
+### 13.2 删除枚举值
+
+`reason_tags` 是历史数据，**不要直接删** —— 已有 `generation_records.feedback_reason_tags` 列里存了这个值的行会变成"无人能解读"。grace 流程：
+
+1. **release N**：前端 `REASON_TAG_OPTIONS` 隐藏该项（用户不再能勾），后端 `ReasonTagEnum` 仍保留；现存数据照样读出
+2. **release N+1**：确认无新增数据后，后端从 `ReasonTagEnum` 移除 + 加一条 data backfill 把残存历史值 remap 到 `OTHER`（或对应的新枚举），上线后再删类型
+3. 跳过 grace 直接删的代价：差评率分析的旧数据该列变成 unknown，`/admin/analytics/intent-confusion` 端点对那些行的 Pydantic 反序列化会失败 → 500
+
+### 13.3 命名规范
+
+- `enum value`（DB 存的字面值）：`snake_case` 英文小写，如 `wrong_template` / `missing_disable_iff`
+- `label`（前端展示）：中文，放在 `REASON_TAG_OPTIONS[i].label`；若未来引入多语言，挪到 i18n bundle 后 `REASON_TAG_OPTIONS` 只保留 `value`
+- 长度：value ≤ 32 字符（与 `feedback_reason_tags` JSONB 数组元素约定），label ≤ 12 个汉字（Modal Checkbox 排版考虑）
+- 不要用 `general_issue` / `bug` 这种泛化词 —— 差评标签要够具体，否则就退化成 `other` 没有信号价值
+
+### 13.4 校验脚本
+
+新增/修改枚举后，本地至少跑：
+```bash
+docker compose exec backend pytest tests/test_feedback_api.py -v
+docker compose exec frontend npm run lint
+```
+若两侧值集不一致，前端 ESLint 不会拦（TS `as ReasonTag` 是宽松的），但运行时前端勾选新值发请求 → 后端 422 `validation_error`，前端只展示 toast 用户看不懂。**手动**比对 `ReasonTagEnum` 值集与 `REASON_TAG_OPTIONS.map(o => o.value)` 完全等价。
+
+---
+
+## 14. FEAT-11 `llm_direct` 兜底路径测试 recipe
+
+FEAT-11 Stage 2 引入 `POST /api/v1/generate/llm-fallback` 兜底端点（详 ARCHITECTURE §3.17），让用户对 `rag` 结果不满意时一键触发 LLM 自由生成。该路径由两套 pytest 守护：
+
+| 测试文件 | 用途 | 是否需要活基础设施 |
+|---|---|---|
+| `backend/tests/test_llm_direct_generation.py` | 端点级集成测试：覆盖 404 / 422 链式拒绝 / 422 无围栏 / 422 internal error / cache hit / cache miss / `parent_record_id` FK 正确写入 / `generation_mode='llm_direct'` 写入 / `/admin/analytics/*` 4 端点的 `generation_mode` filter 边界 | 否（mock DB / Redis / LLM；mock LLM 用 `AsyncMock` 桩 `generate_code_freeform`） |
+| `backend/tests/test_llm_freeform_client.py` | LLM 客户端单测：围栏 lang 兼容（` ```systemverilog ` / ` ```sv ` / ` ```verilog ` / 裸 ` ``` `）+ prose-only 响应抛 `ValueError("no_sv_code_block")` + Anthropic 与 OpenAI-compat 两实现并行 + thinking-disable 参数正确传递 | 否（mock OpenAI SDK / Anthropic SDK 响应；**不调真实 LLM**，无需 `llm_configs` 表） |
+
+### 14.1 跑法
+
+```bash
+# 在 backend 容器内（推荐，环境一致）
+docker compose exec backend pytest tests/test_llm_direct_generation.py -v
+docker compose exec backend pytest tests/test_llm_freeform_client.py -v
+
+# 一次跑两个文件
+docker compose exec backend pytest tests/test_llm_direct_generation.py tests/test_llm_freeform_client.py -v
+
+# 跑单一用例（按 pytest -k 过滤）
+docker compose exec backend pytest tests/test_llm_direct_generation.py -k "chained_not_allowed" -v
+docker compose exec backend pytest tests/test_llm_freeform_client.py -k "sv_lang_fence" -v
+
+# 主机原生（如果 venv 已激活并装好依赖）
+cd backend && pytest tests/test_llm_direct_generation.py tests/test_llm_freeform_client.py -v
+```
+
+### 14.2 不依赖 `llm_configs` 表的原因
+
+`test_llm_freeform_client.py` 不调真实 LLM——它把 `AsyncOpenAI.chat.completions.create` 与 `Anthropic.messages.create` 都 patch 成桩响应，直接测客户端代码对响应的解析逻辑。因此**无需** seed `llm_configs` 表也**无需** GPU/CPU embedding_service 在线。这让该套件可以在 CI 的最小环境（仅 Python + pytest）下运行，与 `test_offtopic_corpus_mocked.py` / `test_template_confusion_corpus_mocked.py` 处于同一档。
+
+`test_llm_direct_generation.py` 同样 mock 了 LLM、DB session 与 Redis，仅依赖 Pydantic 与 SQLAlchemy 的内存行为，不需要 PG / Redis / Qdrant 容器在线。
+
+### 14.3 新增用例的约定
+
+- 围栏 lang 新增（如未来想接受 ` ```sva ` 或 ` ```sva-system ` 等变体）→ 改 `services/llm/base.py::extract_sv_code_block` 的正则 + 同步在 `test_llm_freeform_client.py` 加正向用例 + 反向用例（不在允许列表的 lang 应仍被拒）
+- 新增 422 错误类型（未来如增 `llm_direct_token_quota_exceeded`）→ 在 `api/v1/generate.py::generate_llm_fallback` 的 try/except 追加分支 + 在 `test_llm_direct_generation.py` 加端点测 + 在 ARCHITECTURE.md §3.17.2 错误表追加一行
+- cache key canonical 字段变化（如未来要把 `protocol` 也纳入 hash）→ 改 `services/core/cache.py::_canonical_llm_direct_signature` + 在 `test_llm_direct_generation.py` 加"signal 顺序无关 / protocol 变化时 key 不同"两条用例
+- analytics filter 新增枚举值（如未来加 `generation_mode='hybrid'`）→ 改 `api/v1/admin.py` 的 `Query` Literal 类型 + 4 个端点的 SQL 分支 + `test_llm_direct_generation.py` 的 analytics filter 用例补充
+
+---
+
+## 15. FEAT-12 `improvement_reports` 测试 recipe
+
+FEAT-12 引入 `improvement_reports` 表（PRD §6.2 / ARCHITECTURE §3.18、§4.1.4）和 4+1 路由端点（详 ARCHITECTURE §5.1），由单一 pytest 文件 `backend/tests/test_improvement_reports.py` 守护。
+
+| 测试文件 | 用途 | 是否需要活基础设施 |
+|---|---|---|
+| `backend/tests/test_improvement_reports.py` | 端点级集成测试：POST happy path（含选填字段全空）/ 409 UNIQUE 冲突（含 `existing_report_id`）/ 422 FK 缺失（`invalid_record_ref`）/ 403 普通用户访问 admin 路由 / 状态机非法跳转 422（`illegal_status_transition`）/ 分页列表 status/category 过滤 / `GET /check` 单形态契约 / 详情页 PATCH `pending → in_review` 自动流转 | 否（mock DB 风格，与 `test_pipeline_preview_render.py` / `test_llm_direct_generation.py` 同档；**不**依赖 Redis / PG / Qdrant 容器在线，也**不**调真实 LLM——本路径全程纯 DB 写入） |
+
+### 15.1 跑法
+
+```bash
+# 在 backend 容器内（推荐，环境一致）
+docker compose exec backend pytest tests/test_improvement_reports.py -v
+
+# 跑单一用例（按 pytest -k 过滤）
+docker compose exec backend pytest tests/test_improvement_reports.py -k "duplicate_report" -v
+docker compose exec backend pytest tests/test_improvement_reports.py -k "illegal_status_transition" -v
+docker compose exec backend pytest tests/test_improvement_reports.py -k "all_fields_empty" -v
+
+# 主机原生（如果 venv 已激活并装好依赖）
+cd backend && pytest tests/test_improvement_reports.py -v
+```
+
+### 15.2 mock 风格说明（mock_db + factories）
+
+参照 `test_pipeline_preview_render.py` 的既有约定：
+
+- **`mock_db`**：通过 `pytest fixture` 注入 `AsyncSession` 桩，所有 `db.execute / db.add / db.get / db.commit` 都 patch 成 `AsyncMock`；`db.execute(...).scalars().first()` 与 `.unique().all()` 链按 `side_effect` 排队返回伪 row
+- **`factories`**：`make_generation_record(generation_mode='rag' or 'llm_direct', parent_record_id=...)` 与 `make_improvement_report(status=..., report_categories=[...])` 两个工厂——避免在每条用例里重复构造 ORM dummy
+- **鉴权 mock**：通过 `app.dependency_overrides[get_current_user]` 注入不同 `role` 的伪 `User`；测 403 时注入 `role='user'` 调 admin 端点，测 admin 路径时注入 `role='lib_admin'`
+- **不 mock**：Pydantic schema 校验（让 `ImprovementReportCreate` 真实跑 `model_validate`，覆盖"全选填字段空时仍能构造"这条契约）
+
+### 15.3 `ReportCategoryEnum` 4 slug ↔ 中文 label 对照
+
+测试断言 `report_categories` 列里只允许出现以下 4 个 slug 字符串；前端中文 label 不入 DB（中文映射仅前端用）：
+
+| slug（DB / API 入参） | 中文 label（前端显示） |
+|---|---|
+| `wrong_template` | 模板选错 |
+| `wrong_params` | 参数映射错 |
+| `poor_style` | 代码风格差 |
+| `other` | 其他 |
+
+新增 slug 时（如未来加 `inefficient_code`）：改 `backend/app/schemas/improvement_report.py::ReportCategoryEnum` + `frontend/src/api/improvementReports.ts` 中的标签映射 + ARCHITECTURE §4.1.4 对照表 + 本节表 + `test_improvement_reports.py` 的 happy path 用例。
+
+### 15.4 状态机非法跳转测试用例约定
+
+ARCHITECTURE §3.18.4 合法跳转链：`pending → in_review → resolved`。`test_improvement_reports.py` 至少覆盖以下 5 类非法跳转，每类一条独立用例（参数化也可，但务必断言 `detail.type == 'illegal_status_transition'` 与 422 状态码）：
+
+| 用例 ID | from | to | 期望 |
+|---|---|---|---|
+| `test_status_transition__pending_to_resolved_skip__422` | pending | resolved | 422 `illegal_status_transition`（跳过 in_review） |
+| `test_status_transition__resolved_to_pending_regress__422` | resolved | pending | 422（倒退） |
+| `test_status_transition__resolved_to_in_review_regress__422` | resolved | in_review | 422（倒退） |
+| `test_status_transition__in_review_to_pending_regress__422` | in_review | pending | 422（倒退） |
+| `test_status_transition__pending_to_in_review_legal__200` | pending | in_review | 200（合法 happy path 对照组） |
+
+**合法 no-op**（如 `pending → pending`）的行为约定：端点层接受，但不写 `reviewed_at`（避免空更新覆盖 admin 历史 timestamp）；本约定可酌情加用例验证。
+
+### 15.5 选填字段全空提交的 fixture 示例
+
+POST happy path 必须断言"`report_categories` 与 `reporter_note` **均为空**时仍 201 成功"（PRD §6.2 显式契约）。建议 fixture 形如：
+
+```python
+@pytest.fixture
+def empty_optional_payload(rag_record_id, llm_direct_record_id):
+    """全选填字段为空的最小 payload——PRD §6.2 显式契约：用户可不勾任何分类、
+    不写任何 note 直接点提交。"""
+    return {
+        "rag_record_id": rag_record_id,
+        "llm_direct_record_id": llm_direct_record_id,
+        # report_categories / reporter_note 故意不传，让 Pydantic 默认 None
+    }
+
+
+async def test_post_improvement_report__all_optional_empty__201(
+    client, empty_optional_payload, mock_db
+):
+    resp = await client.post("/api/v1/improvement-reports", json=empty_optional_payload)
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["status"] == "pending"
+    assert body.get("report_categories") in (None, [])  # 接受 NULL 或 []
+    assert body.get("reporter_note") is None
+```
+
+`report_categories` 在响应里允许返 `None` 或 `[]`（端点层一致即可）；前端 `improvementReports.ts` 类型声明应同时 narrow 两种形态。
+
+### 15.6 与其他测试套件的并发关系
+
+- 与 `test_feedback_api.py`（§3.9 L3 差评）：两者完全独立，可并行跑；测同一对 `(rag_record, llm_direct_record)` 时分别写 `generation_records.feedback_*` 与 `improvement_reports`，互不污染
+- 与 `test_admin_analytics.py`（§3.10 L4 仪表盘）：FEAT-12 不修改 4 个 KPI 端点，本套件不与之耦合；若未来 FEAT-13 把 `improvement_reports` 数据接入 analytics，需在 `test_admin_analytics.py` 加配套用例（不修改本套件）
+- 与 `test_llm_direct_generation.py`（§3.17）：本套件**依赖** §3.17 引入的 `parent_record_id` 列存在（migration 007）；新建 worktree 后跑 `alembic upgrade head` 时务必跑到 008，否则 `test_improvement_reports.py` 会 hard fail in fixture（DB schema 缺表）
+
+---
+
+## 16. FEAT-13 模板成熟度门控测试 recipe
+
+FEAT-13 引入 `templates.maturity_level` 列（PostgreSQL ENUM `template_maturity_enum`，值 `production / experimental / draft`）+ RAG 三阶段全部仅消费 production 模板 + Admin UI super_admin 升降级按钮，详 PRD §3.4/§3.7 / ARCHITECTURE §3.2/§3.4/§4.1/§5.1。本节给出**贡献流生命周期回顾 + 单测跑法 + 关键不变量**。
+
+### 16.1 贡献流生命周期（开发者视角）
+
+```
+用户在前端「我的贡献」提交         POST /api/v1/contributions
+       ↓
+admin 在「贡献审核」批准           PUT /api/v1/admin/contributions/{id}/approve
+       ↓
+模板入库（_create_template_from_contribution）  ← 此处固定写 maturity_level='experimental'
+       ↓
+（此时模板已可在「模板库」浏览，但 RAG 三阶段 Filter `maturity_level='production'` 把它过滤掉，不参与召回）
+       ↓
+super_admin 在「模板库管理」点「升级到 production」
+       ↓
+PATCH /api/v1/admin/templates/{id} { maturity_level: 'production' }
+       ↓
+模板正式进入 RAG 召回主库
+```
+
+修改贡献流代码时务必保留"通过 admin review 默认 experimental"的契约——`_create_template_from_contribution` 不要把 contribution 的 `maturity` 字段值写到 `Template.maturity_level`（两列语义独立），固定写 `'experimental'`。
+
+### 16.2 测试文件清单与跑法
+
+| 测试文件 | 用途 | 是否需要活基础设施 |
+|---|---|---|
+| `backend/tests/test_template_maturity_gating.py` | 4 场景覆盖：stage1 hybrid 召回时 Qdrant Filter 中包含 `maturity_level='production'` 条件；engine.py DB 层二次过滤正确拦截非 production 模板；PATCH maturity_level 的 super_admin 200 / lib_admin 403 / 非法值 422；migration 009 backfill 条件函数单元测试 | 否（mock Qdrant + PG，与 `test_pipeline_preview_render.py` 同档；**不**依赖 Redis / PG / Qdrant 容器在线，也**不**调真实 LLM） |
+
+```bash
+# 在 backend 容器内（推荐，环境一致）
+docker compose exec backend pytest tests/test_template_maturity_gating.py -v
+
+# 跑单一用例（按 pytest -k 过滤）
+docker compose exec backend pytest tests/test_template_maturity_gating.py -k "stage1_filter" -v
+docker compose exec backend pytest tests/test_template_maturity_gating.py -k "patch_maturity_403" -v
+docker compose exec backend pytest tests/test_template_maturity_gating.py -k "migration_009_backfill" -v
+
+# 主机原生（如果 venv 已激活并装好依赖）
+cd backend && pytest tests/test_template_maturity_gating.py -v
+```
+
+### 16.3 mock 风格说明
+
+参照 `test_pipeline_preview_render.py` / `test_improvement_reports.py` 的约定：
+
+- **Qdrant mock**：通过 `MagicMock(spec=AsyncQdrantClient)`（或 `unittest.mock.patch` 注入）截获 `client.query_points(...)` 调用，断言传入的 `query_filter.must` 列表中**至少**含一项 `FieldCondition(key='maturity_level', match=MatchValue(value='production'))`。不必断言其他 must 项的顺序，code_type Filter 与 maturity Filter 并列即可
+- **DB mock**：`mock_db.execute(...)` 拦截 `select(Template).where(...)` 语句，断言 SQL 编译后含 `maturity_level == 'production'` 谓词（或对返回 row 列表做选择性 stub，让"含一条 experimental 行 + 一条 production 行" → 只剩 production 行能被消费）
+- **PATCH 权限测试**：通过 `app.dependency_overrides[get_current_user]` 注入不同 `role` 的伪 `User`；测 403 时注入 `role='lib_admin'`，期望端点抛 `HTTPException(403, detail="仅 super_admin 可修改 maturity_level")`；测 200 时注入 `role='super_admin'`
+- **backfill 条件函数单测**：把 migration 009 中的 ID 匹配条件抽到一个纯函数（如 `is_production_seed_template(template_id: str) -> bool` 或直接用 SQL 表达式字符串比对），单测覆盖 `sva_handshake_stable_v1 → True` / `cov_value_v1 → True` / `L6_E2E_1778770719 → False` / `experimental_template → False` 四档
+
+### 16.4 关键不变量（防回归）
+
+- **L1 — 默认门控**：贡献流入库的模板恒为 `maturity_level='experimental'`；`_create_template_from_contribution` 单测必须断言 `template.maturity_level == 'experimental'`，无论 contribution.maturity 取何值
+- **L2 — RAG 召回纯净**：stage1 hybrid 召回任何场景下都**不能**返回 `maturity_level != 'production'` 的模板。单测 stub Qdrant 返回 1 条 production + 1 条 experimental 时，断言最终 candidates 仅含 production
+- **L3 — `dense_top1_score` maturity 感知**：off-topic gate 与 code_type_mismatch gate 两处调用 `dense_top1_score` 时，Qdrant 查询 Filter 都必须含 `maturity_level='production'`；单测可通过 mock_qdrant.query_points.call_args 反查
+- **L4 — PATCH 权限闸**：lib_admin PATCH 含 `maturity_level` 字段时必须 403；super_admin 同请求必须 200；非法 enum 值（如 `'released'`）必须 422
+- **L5 — 双列不混用**：修改 `maturity_level` 不能联动修改 `maturity`；反之亦然。单测可断言 `template.maturity` 在 PATCH `{maturity_level: 'production'}` 后保持原值
+
+### 16.5 与其他测试套件的关系
+
+- 与 `test_pipeline_preview_render.py`：本套件断言 stage1 Filter 含 maturity 条件，pipeline 套件已 mock 整条 RAG 链；二者并行不耦合
+- 与 `test_offtopic_corpus_mocked.py` / `test_template_selection_corpus_mocked.py`：上线后这两份套件的 mock 不需要修改（它们 mock 的是 RAG 返回结果，不关心底层 Filter），但**真实回归套件** `--real-llm` / `--real-embedding` 跑法在 `OFFTOPIC_DENSE_THRESHOLD` 重新校准前可能出现边界样本误差，注意区分"模型问题"与"阈值需重校"
+- 与 `lib_manager.py` 手测：本套件不覆盖 Qdrant payload 写入（`_sync_to_qdrant` 的真实行为），需手测确认 `docker compose exec backend python lib_manager.py rebuild` 后 Qdrant points 的 payload 含 `maturity_level` 字段（详 docs/test-manual.md §7.5）
+
+---
+
+## 17. FEAT-16 新增 code_type 时 template 自动同步
+
+FEAT-16 的批量生成模板下载端点 `GET /api/v1/batch/template`（详 ARCHITECTURE §3.7.1、§5.1）由 `backend/app/services/parser/template_writer.py::build_template_workbook(registry)` 实现，遍历 `CodeTypeRegistry.all()` 动态构造 sheet。本节给出**新增 code_type 时模板自动扩展的工作机制**与**schema 字段顺序变化时必须重跑的回归测试**。
+
+### 17.1 新增 code_type：模板自动扩展，无需改 Python
+
+新增一个 code_type（按 ARCHITECTURE §3.14 "代码类型注册表（Code Type Registry）" 的"3 个 YAML 零 Python"约定）需要落地：
+
+1. `backend/data/code_types/<new_type>.yaml` — 声明 `id` / `excel_sheet_name` / `excel_schema_file` / `signal_roles` / `sentence_pattern` / 子分类等
+2. `backend/data/schemas/<new_type>_schema.yaml` — `fields` + 可选 `signals` 块
+3. `backend/data/scenarios/<new_type>_scenarios.yaml` — 意图构建器场景描述
+
+落地完成 + 后端重启 + （如需）`python lib_manager.py import` 后：
+
+- **模板下载端点自动新增一个 sheet**：`build_template_workbook` 遍历 `registry.all()`，新 code_type 的 `excel_sheet_name` 自动成为新 sheet 名，表头来源新 schema yaml 的 `fields`（跳过 `output: true` 字段）+ `signals` 块展开。**`template_writer.py` 完全不动**——这是 "registry 驱动" 设计的红利。
+- **维护成本为 0**：不需要追加新行/新列的 Python 分支，不需要在 `build_template_workbook` 写 `if code_type == "...":`；这与 §3.9 `excel_parser.py` 的解析层是同一份 schema 的两端使用，由此保证下载→填→上传的列结构闭环兼容。
+
+### 17.2 schema `col` 字段顺序变化时：必须重跑闭环回归
+
+模板下载端点和解析层共用 `data/schemas/*.yaml` 的 `col` 字段（`A` / `B` / `G` …）确定列绝对位置。当**已有 code_type** 的 schema yaml 出现以下任一变化时：
+
+- 调整字段的 `col`（如 `所属模块: B` 改 `所属模块: C`）
+- 调整 `signals` 块的 `start_col` / `cols_per_signal` / `max_count` / `sub_fields[*].suffix`
+- 切换 `output: true` 标记（让某列从"系统回填"变成"用户输入"或反向）
+- 增删非 output 字段（影响列序）
+
+**必须执行**：
+
+```bash
+# 在 backend 容器内（或 host venv）
+docker compose exec backend pytest tests/test_batch_template_download.py::test_download_template_then_upload_roundtrip -v
+```
+
+该用例把 `build_template_workbook()` 产物经 `BytesIO` 直接喂给 `excel_parser.parse_excel()`：
+
+- ✅ 通过 → 下载→填→上传闭环兼容，本次 schema 改动安全
+- ❌ 报错（`ValueError: 缺少必填列` / `KeyError: 'XXX'` / row 解析失败）→ schema 改动**破坏了模板下载与上传解析的列对齐**，必须修正 schema 或同步修正 `excel_parser.py`
+
+附加用例（可单独跑）：
+
+```bash
+# 验证 SVA 表头顺序与 sva_schema.yaml 一致
+docker compose exec backend pytest tests/test_batch_template_download.py::test_assertion_sheet_headers_match_schema -v
+# 验证 Coverage 表头顺序与 coverage_schema.yaml 一致
+docker compose exec backend pytest tests/test_batch_template_download.py::test_coverage_sheet_headers_match_schema -v
+```
+
+### 17.3 不变量回顾
+
+- **L1 — sheet 名来源单一**：sheet 名**只能**来自 `data/code_types/*.yaml` 的 `excel_sheet_name`，不允许在 `template_writer.py` 硬编码字符串
+- **L2 — 表头来源单一**：列名**只能**来自 `data/schemas/*.yaml` 的 `fields[*].name`，不允许在 `template_writer.py` 硬编码列名
+- **L3 — 列顺序**：`col` 字段（`A` / `B` / …）是唯一权威，与 `excel_parser._col_to_idx` 同源；任何"按 fields 出现顺序排列"的简化实现都会在 SVA 表 G–R 信号块上踩坑（fields 与 signals 不连续）
+- **L4 — output 字段过滤**：标注为 `output: true` 的"系统回填"列**不应**出现在下载模板中（用户不填这些列）；如需调整哪些列对用户可见，在 schema yaml 改 `output` 标记，**不要**改 `template_writer.py` 的过滤逻辑
+- **L5 — 闭环兼容**：任何 schema yaml 改动必须不破坏 `test_download_template_then_upload_roundtrip`；这是 schema 演化的**回归红线**
+
+### 17.4 与其他套件的关系
+
+- 与 `excel_parser.py` 单测：本套件断言的是"模板下载内容与 parser 期望对齐"，parser 自身的健壮性（中文列名、合并单元格、空行）由 §3.9 解析层既有单测覆盖
+- 与 `test_batch_preflight.py` / Celery 集成测试：本套件**不**覆盖批量任务执行（参见 §3.7），仅守护"用户拿到的空白模板"与 `parse_excel` 输入契约一致
+- 与 `lib_manager.py`：模板下载端点**完全不读 templates 表**，与 Qdrant / PG / Redis 无关，本套件不依赖任何活基础设施
 
 ---
 

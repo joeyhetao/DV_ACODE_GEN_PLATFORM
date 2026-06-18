@@ -52,7 +52,7 @@ def _build_system_prompt(
     """
     if rag_candidates:
         candidates_block = "\n\n".join(
-            f"候选 {i+1}：{c['template_id']} — {c['name']}\n"
+            f"候选 {i+1}（相似度 {c['score']:.2f}）：{c['template_id']} — {c['name']}\n"
             f"  描述：{c['description']}\n"
             f"  必填参数：{_format_params(c.get('template'))}"
             for i, c in enumerate(rag_candidates)
@@ -75,9 +75,16 @@ def _build_system_prompt(
         "4. 不要替用户编造他没说过的信号名或状态名——所有具体名字必须来自用户输入\n\n"
         "### 输出格式（必须严格遵守）\n"
         "你的每次回复**末尾**必须包含一段：\n"
-        "<<intent>>累计到目前的标准化意图<<end>>\n"
-        "如果用户信息还不够，<<intent>>...<<end>> 段就放当前最准确的近似（可以包含 ?? 表示缺失字段）。\n"
-        "前端会解析这一段做「试运行」按钮的 prefill。\n\n"
+        "<<intent>>自然语言描述当前已收集到的验证需求<<end>>\n"
+        "格式要求（违反即视为格式错误）：\n"
+        "  - 必须是自然语言，例：'为 FSM 状态机 status 信号（5bit）生成转换覆盖率，合法状态为 IDLE、ACTIVE、DONE'\n"
+        "  - 禁止使用模板参数格式（如 cov_xxx_v1[param=value|...]），前端会把这段作为意图输入直接送流水线\n"
+        "  - 有合理默认值的参数（clk、rst_n 等）用默认名填入，不要写 ??\n"
+        "  - 用户未提供且无默认值的必填参数才用 ?? 标记\n"
+        "当你判断所有必填参数已从用户确认（或有合理默认值），在正文给出结果摘要，例：\n"
+        "  '好的，信息已收集完整！\\n\\n**收集结果**：覆盖 status 信号（5bit），合法状态 IDLE、ACTIVE、DONE。\\n\\n"
+        "请确认无误后点击「用这条意图回去生成」。'\n"
+        "  不要只说'信息已收集完整'——用户需要看到收集到的内容才能确认是否准确。\n\n"
         f"{accumulated_block}"
         "### 当前可对齐候选\n"
         f"{candidates_block}\n"

@@ -15,7 +15,17 @@ keywords:
   - integrity
   - stable
 description: |
-  验证在使能信号无效期间，受保护的数据信号不被意外修改，适用于寄存器写保护、数据锁存等场景。
+  做什么：当使能信号 enable 拉低（无效）时，断言被保护的数据信号 data 必须 $stable（不发生变化），用于"无授权不写入"约束的形式化验证。
+  典型场景：寄存器写保护场景 wr_en=0 时 reg_data 不能变；data 锁存器在 lat_en 无效时输出保持；shadow register 在 update_en=0 期间值不更新。
+  边界：请勿用于"valid/ready 握手等待期间 data $stable"（语义不同：握手等待 vs 写使能保护）—— 那是 sva_handshake_stable_v1；也不要用于"复位释放后数据归零"—— 那是 sva_reset_behavior_v1。
+differentiators:
+  - 触发条件是 `!enable`（写使能无效态），非握手等待态 `valid && !ready`
+  - 必填 enable 参数（高有效写使能），sva_handshake_stable_v1 用 valid/ready
+  - 不关心数据值是否归零或匹配某常量，只关心"无授权时不能变"
+non_use_cases:
+  - 验证 AXI valid/ready 握手等待期间 data 稳定（应用 sva_handshake_stable_v1）
+  - 验证复位释放后 data 等于初始值（应用 sva_reset_behavior_v1）
+  - 验证两信号互斥（如 cpu_req / dma_req 不能同时为 1）—— 库内暂无该类模板，应建议贡献
 parameters:
   - name: module_name
     type: string

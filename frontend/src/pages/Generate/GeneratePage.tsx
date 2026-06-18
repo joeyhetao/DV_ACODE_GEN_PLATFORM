@@ -2,14 +2,20 @@ import { useState, useEffect } from 'react'
 import { useNavigate, NavigateFunction, useLocation, useSearchParams } from 'react-router-dom'
 import {
   Card, Form, Input, Select, Button, Row, Col, Space, Tag,
-  Statistic, Divider, Typography, Table, Collapse, message, Modal, Spin,
+  Statistic, Divider, Typography, Table, Collapse, message, Modal, Spin, Checkbox,
 } from 'antd'
 import {
   ThunderboltOutlined, CopyOutlined, SendOutlined, PlusOutlined, DeleteOutlined,
-  LoadingOutlined,
+  LoadingOutlined, LikeOutlined, MehOutlined, DislikeOutlined,
 } from '@ant-design/icons'
 import Editor from '@monaco-editor/react'
-import { generateApi, PreviewResponse, SignalInfo } from '../../api/generate'
+import { generateApi, GenerationMode, PreviewResponse, SignalInfo } from '../../api/generate'
+import { feedbackApi, ReasonTag, REASON_TAG_OPTIONS } from '../../api/feedback'
+import {
+  improvementReportsApi,
+  REPORT_CATEGORY_OPTIONS,
+  ReportCategory,
+} from '../../api/improvementReports'
 import ConfirmationPanel from '../../components/ConfirmationPanel'
 
 const { TextArea } = Input
@@ -37,6 +43,11 @@ interface ResultDisplay {
   confidence: number
   confidence_source: string
   rag_candidates: Array<{ template_id: string; name: string; score: number }>
+  generation_record_id?: string | null
+  // FEAT-11 Stage 2：'rag'（默认）显示 LLM fallback 按钮；'llm_direct' 隐藏按钮 + 显示非确定性标签
+  generation_mode: GenerationMode
+  // FEAT-12：仅 generation_mode='llm_direct' 的 result 才有；指向触发本次 fallback 的源 RAG record id
+  parent_record_id?: string | null
 }
 
 interface IntentBuilderReturnState {
@@ -61,6 +72,21 @@ export default function GeneratePage() {
   // v3.0：source 用于区分 direct vs intent_builder 回流（仅用于上报 PipelineInput.source 字段）
   const [requestSource, setRequestSource] = useState<string>(initialSource)
   const [signals, setSignals] = useState<SignalRow[]>([])
+  // L3 feedback：每个 result.generation_record_id 独立 lock，重新生成时归零
+  const [feedbackSubmitted, setFeedbackSubmitted] = useState(false)
+  const [badRatingModalOpen, setBadRatingModalOpen] = useState(false)
+  const [badReasonTags, setBadReasonTags] = useState<ReasonTag[]>([])
+  const [badComment, setBadComment] = useState('')
+  const [feedbackSubmitting, setFeedbackSubmitting] = useState(false)
+  // FEAT-11 Stage 2：用户点 LLM fallback 时单独 loading（与 isBusy 分离，避免覆盖左侧 submit 按钮文案）
+  const [llmFallbackLoading, setLlmFallbackLoading] = useState(false)
+  // FEAT-12：用户对比报告 modal & 已提交状态
+  const [reportExists, setReportExists] = useState<boolean>(false)
+  const [reportSubmitted, setReportSubmitted] = useState<boolean>(false)
+  const [reportModalOpen, setReportModalOpen] = useState<boolean>(false)
+  const [reportCategories, setReportCategories] = useState<ReportCategory[]>([])
+  const [reportNote, setReportNote] = useState<string>('')
+  const [reportSubmitting, setReportSubmitting] = useState<boolean>(false)
 
   useEffect(() => {
     generateApi.codeTypes().then(setCodeTypes).catch(() => {})
@@ -169,6 +195,9 @@ export default function GeneratePage() {
           rag_candidates: preview.rag_candidates.map((c) => ({
             template_id: c.template_id, name: c.name, score: c.score,
           })),
+          generation_record_id: res.generation_record_id ?? null,
+          // /render 始终走 RAG 路径；后端漏返时也默认 'rag'，避免老接口透传成 undefined
+          generation_mode: res.generation_mode ?? 'rag',
         },
       })
     } catch (e: unknown) {
@@ -178,7 +207,137 @@ export default function GeneratePage() {
   }
 
   const handleCancel = () => setState({ phase: 'idle' })
-  const handleReset = () => setState({ phase: 'idle' })
+  const handleReset = () => {
+    setState({ phase: 'idle' })
+    setFeedbackSubmitted(false)
+    setBadReasonTags([])
+    setBadComment('')
+    setReportExists(false)
+    setReportSubmitted(false)
+    setReportCategories([])
+    setReportNote('')
+  }
+
+  // ── L3 反馈提交（rating 1=好 / 2=一般 / 3=差）────────────────────────
+  const submitFeedback = async (rating: 1 | 2 | 3, reason_tags?: ReasonTag[], comment?: string) => {
+    if (state.phase !== 'result') return
+    const recordId = state.result.generation_record_id
+    if (!recordId) {
+      message.warning('当前结果缓存命中或来自旧版本接口，暂不支持反馈')
+      return
+    }
+    setFeedbackSubmitting(true)
+    try {
+      await feedbackApi.submit(recordId, { rating, reason_tags, comment: comment || undefined })
+      message.success('感谢反馈')
+      setFeedbackSubmitted(true)
+      setBadRatingModalOpen(false)
+      setBadReasonTags([])
+      setBadComment('')
+    } catch (e: unknown) {
+      const err = e as { response?: { status?: number; data?: { detail?: unknown } } }
+      const detail = err.response?.data?.detail
+      const detailStr = typeof detail === 'string' ? detail : detail ? JSON.stringify(detail).slice(0, 200) : ''
+      message.error(`反馈提交失败${err.response?.status ? `（HTTP ${err.response.status}）` : ''}${detailStr ? `: ${detailStr}` : ''}`)
+    } finally {
+      setFeedbackSubmitting(false)
+    }
+  }
+
+  const handleGoodRating = () => { void submitFeedback(1) }
+  const handleNeutralRating = () => { void submitFeedback(2) }
+  const handleBadRatingOpen = () => setBadRatingModalOpen(true)
+  const handleBadRatingSubmit = async () => {
+    if (badReasonTags.length === 0) {
+      message.warning('请至少选择一个差评原因')
+      return
+    }
+    await submitFeedback(3, badReasonTags, badComment)
+  }
+
+  // FEAT-11 Stage 2：用户对 RAG 结果不满意 → 调 /generate/llm-fallback 拿 LLM 直接生成代码
+  const handleLLMFallback = async () => {
+    if (state.phase !== 'result') return
+    const recordId = state.result.generation_record_id
+    if (!recordId) {
+      message.warning('当前结果未关联生成记录，无法触发 LLM 兜底')
+      return
+    }
+    setLlmFallbackLoading(true)
+    try {
+      const res = await generateApi.llmFallback(recordId)
+      // FEAT-12：fallback 前 recordId 是 RAG 记录，作为 parent_record_id 留存——
+      //          fallback 后 generation_record_id 替换为 llm_direct 记录，让前端
+      //          能在用户点"提交对比报告"时同时拿到这一对。
+      setState({
+        phase: 'result',
+        result: {
+          ...state.result,
+          code: res.code,
+          cache_hit: res.cache_hit,
+          generation_record_id: res.generation_record_id,
+          generation_mode: res.generation_mode,
+          parent_record_id: recordId,
+        },
+      })
+      // 新记录 → 反馈状态归零，让用户给 llm_direct 结果独立评分
+      setFeedbackSubmitted(false)
+      setBadReasonTags([])
+      setBadComment('')
+      // FEAT-12：切换到 llm_direct 后查询是否已有对比报告
+      setReportSubmitted(false)
+      setReportCategories([])
+      setReportNote('')
+      try {
+        const check = await improvementReportsApi.check(recordId, res.generation_record_id)
+        setReportExists(check.exists)
+      } catch {
+        setReportExists(false)
+      }
+      message.success('已切换为 LLM 直接生成')
+    } catch (e: unknown) {
+      handleApiError(e, 'LLM 直接生成失败，请稍后重试', navigate)
+    } finally {
+      setLlmFallbackLoading(false)
+    }
+  }
+
+  // FEAT-12：提交对比报告
+  const handleReportSubmit = async () => {
+    if (state.phase !== 'result') return
+    const llmDirectId = state.result.generation_record_id
+    const ragId = state.result.parent_record_id
+    if (!llmDirectId || !ragId) {
+      message.warning('当前结果不是 LLM 直接生成兜底，无法提交对比报告')
+      return
+    }
+    setReportSubmitting(true)
+    try {
+      await improvementReportsApi.create({
+        rag_record_id: ragId,
+        llm_direct_record_id: llmDirectId,
+        report_categories: reportCategories.length ? reportCategories : undefined,
+        reporter_note: reportNote.trim() || undefined,
+      })
+      setReportSubmitted(true)
+      setReportExists(true)
+      setReportModalOpen(false)
+      message.success('已提交对比报告')
+    } catch (e: unknown) {
+      const err = e as {
+        response?: { status?: number; data?: { detail?: { type?: string; existing_report_id?: string } } }
+      }
+      if (err.response?.status === 409 && err.response.data?.detail?.type === 'duplicate_report') {
+        setReportExists(true)
+        setReportModalOpen(false)
+        message.info('已有人提交对比报告，admin 处理中')
+      } else {
+        message.error('提交失败，请稍后重试')
+      }
+    } finally {
+      setReportSubmitting(false)
+    }
+  }
 
   const copyCode = () => {
     if (state.phase === 'result' && state.result.code) {
@@ -336,7 +495,19 @@ export default function GeneratePage() {
             </Card>
 
             <Card
-              title={<>生成代码 <Text type="secondary" style={{ fontSize: 12, fontWeight: 'normal' }}>— {state.result.template_name}</Text></>}
+              title={
+                <>
+                  生成代码{' '}
+                  <Text type="secondary" style={{ fontSize: 12, fontWeight: 'normal' }}>
+                    — {state.result.template_name}
+                  </Text>
+                  {state.result.generation_mode === 'llm_direct' && (
+                    <Tag color="orange" style={{ marginLeft: 8 }}>
+                      LLM 直接生成 · 非确定性
+                    </Tag>
+                  )}
+                </>
+              }
               extra={
                 <Space>
                   <Button icon={<CopyOutlined />} onClick={copyCode}>复制</Button>
@@ -353,7 +524,136 @@ export default function GeneratePage() {
                   theme="vs"
                 />
               </div>
+              <Divider style={{ marginTop: 16, marginBottom: 12 }} />
+              <Space size="small">
+                <Text type="secondary" style={{ fontSize: 13 }}>对生成结果的评价：</Text>
+                <Button
+                  size="small"
+                  icon={<LikeOutlined />}
+                  disabled={feedbackSubmitted || !state.result.generation_record_id}
+                  loading={feedbackSubmitting}
+                  onClick={handleGoodRating}
+                >好</Button>
+                <Button
+                  size="small"
+                  icon={<MehOutlined />}
+                  disabled={feedbackSubmitted || !state.result.generation_record_id}
+                  loading={feedbackSubmitting}
+                  onClick={handleNeutralRating}
+                >一般</Button>
+                <Button
+                  size="small"
+                  icon={<DislikeOutlined />}
+                  danger
+                  disabled={feedbackSubmitted || !state.result.generation_record_id}
+                  loading={feedbackSubmitting}
+                  onClick={handleBadRatingOpen}
+                >差</Button>
+                {feedbackSubmitted && <Text type="success" style={{ fontSize: 12 }}>已提交反馈</Text>}
+                {/* FEAT-12：仅 llm_direct + parent_record_id 非空时显示提交对比报告按钮 */}
+                {state.result.generation_mode === 'llm_direct' && state.result.parent_record_id && (
+                  <Button
+                    size="small"
+                    type="dashed"
+                    disabled={reportExists || reportSubmitted}
+                    onClick={() => setReportModalOpen(true)}
+                  >
+                    {reportSubmitted
+                      ? '已提交'
+                      : reportExists
+                        ? '已有人提交对比报告，admin 处理中'
+                        : '提交对比报告'}
+                  </Button>
+                )}
+              </Space>
+              {/* FEAT-11 Stage 2：仅 'rag' 结果显示兜底按钮——已经是 llm_direct 不允许再链式 fallback */}
+              {state.result.generation_mode === 'rag' && (
+                <>
+                  <Divider style={{ marginTop: 12, marginBottom: 12 }} />
+                  <Space direction="vertical" size="small" style={{ width: '100%' }}>
+                    <Text type="secondary" style={{ fontSize: 12 }}>
+                      RAG 结果不符合预期？可以让 LLM 直接生成（结果是非确定性的，每次可能不同）。
+                    </Text>
+                    <Button
+                      type="default"
+                      loading={llmFallbackLoading}
+                      disabled={!state.result.generation_record_id}
+                      onClick={handleLLMFallback}
+                    >
+                      对生成结果不满意？尝试 LLM 直接生成
+                    </Button>
+                  </Space>
+                </>
+              )}
             </Card>
+
+            <Modal
+              title="差评反馈"
+              open={badRatingModalOpen}
+              onCancel={() => setBadRatingModalOpen(false)}
+              onOk={handleBadRatingSubmit}
+              confirmLoading={feedbackSubmitting}
+              okText="提交"
+              cancelText="取消"
+              width={520}
+            >
+              <div style={{ marginBottom: 12 }}>
+                <Text>请选择差评原因（至少一项，可多选）：</Text>
+              </div>
+              <Checkbox.Group
+                options={REASON_TAG_OPTIONS.map((o) => ({ label: o.label, value: o.value }))}
+                value={badReasonTags}
+                onChange={(v) => setBadReasonTags(v as ReasonTag[])}
+                style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+              />
+              <div style={{ marginTop: 16, marginBottom: 8 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>补充说明（可选，2KB 以内）：</Text>
+              </div>
+              <Input.TextArea
+                rows={3}
+                maxLength={2048}
+                value={badComment}
+                onChange={(e) => setBadComment(e.target.value)}
+                placeholder="例如：生成代码缺少 disable iff，或将 wr_en 误写为 wren。"
+              />
+            </Modal>
+
+            {/* FEAT-12：用户对比报告 Modal */}
+            <Modal
+              title="提交对比报告"
+              open={reportModalOpen}
+              onCancel={() => setReportModalOpen(false)}
+              onOk={handleReportSubmit}
+              confirmLoading={reportSubmitting}
+              okText="提交"
+              cancelText="取消"
+              width={520}
+            >
+              <div style={{ marginBottom: 12 }}>
+                <Text type="secondary" style={{ fontSize: 13 }}>
+                  将当前 RAG 结果 + LLM 直接生成结果一并提交给 admin 审阅。所有字段均可选填，直接提交也可。
+                </Text>
+              </div>
+              <div style={{ marginBottom: 12 }}>
+                <Text>问题分类（可选，多选）：</Text>
+              </div>
+              <Checkbox.Group
+                options={REPORT_CATEGORY_OPTIONS.map((o) => ({ label: o.label, value: o.value }))}
+                value={reportCategories}
+                onChange={(v) => setReportCategories(v as ReportCategory[])}
+                style={{ display: 'flex', flexDirection: 'column', gap: 8 }}
+              />
+              <div style={{ marginTop: 16, marginBottom: 8 }}>
+                <Text type="secondary" style={{ fontSize: 12 }}>补充说明（可选）：</Text>
+              </div>
+              <Input.TextArea
+                rows={3}
+                maxLength={4096}
+                value={reportNote}
+                onChange={(e) => setReportNote(e.target.value)}
+                placeholder="可选：如果有具体观察，写在这里。直接提交也可。"
+              />
+            </Modal>
 
             {state.result.rag_candidates.length > 0 && (
               <Collapse size="small" items={[{
@@ -424,12 +724,25 @@ type UnderSpecifiedDetail = {
   missing_params: MissingParam[]
   redirect_to?: string | null
 }
-type ApiErrorDetail = string | OffTopicDetail | CodeTypeMismatchDetail | UnderSpecifiedDetail | undefined
+type NoMatchingTemplateDetail = {
+  type: 'no_matching_template'
+  message: string
+  top_score: number
+  redirect_to: string
+}
+type ApiErrorDetail = string | OffTopicDetail | CodeTypeMismatchDetail | UnderSpecifiedDetail | NoMatchingTemplateDetail | undefined
 
 function handleApiError(e: unknown, fallbackMsg: string, navigate?: NavigateFunction): void {
   const err = e as { response?: { status?: number; data?: { detail?: ApiErrorDetail } } }
   const detail = err.response?.data?.detail
   const status = err.response?.status
+
+  // 第五道闸：库内无匹配模板，先提示再跳贡献页（在通用 redirect_to 检查之前处理，以便显示 toast）
+  if (detail && typeof detail === 'object' && detail.type === 'no_matching_template') {
+    message.info('库内暂无匹配模板，跳转至贡献页面帮助完善模板库')
+    if (navigate && 'redirect_to' in detail && detail.redirect_to) navigate(detail.redirect_to)
+    return
+  }
 
   // v3.0：detail.redirect_to 优先于一切——后端明示前端应跳转的路由，前端无脑 router.push
   // off_topic / code_type_mismatch / empty_retrieval 三种 detail.redirect_to=null 不触发本分支

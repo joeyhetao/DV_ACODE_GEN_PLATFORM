@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 架构设计文档（ARCHITECTURE）
 
-**版本**：v2.19  
+**版本**：v2.30  
 **状态**：已确认  
-**日期**：2026-05-16  
+**日期**：2026-06-17  
 **变更**：
 - v1.0 → v2.0：引入完整 RAG 方案，向量检索由 pgvector 替换为 bge-m3 + Qdrant 三阶段检索链路
 - v2.0 → v2.1：新增 Windows / Linux 双系统支持说明
@@ -37,6 +37,92 @@
   - §3.10.1 贡献提交流补齐 v3.0 LLM 反推路径的三道**校验闸**（`_validate_parameter_defs` 参数命名合法 / `_validate_jinja_rendering` 占位值能渲染 / `_validate_keywords` 形态）与**dedup 预扫**（提交时调 `check_semantic_duplicate` 把 top-3 相似已入库模板塞 `original_row_json["similar_templates"]`，失败非阻塞仅 WARN），任一校验失败抛 `ContributionParseError → 422 contribution_parse_failed`；同步列出三个入口点（批量低置信行 / IntentBuilder 5 轮无候选 / 我的贡献页"+ 新贡献"）
   - §3.11.5 IntentBuilder 补齐**5 轮对话上限**与 `suggest_contribute` 信号：每轮把 top-1 RAG score 记入 session；5 轮全 < 0.5 → 响应携 `suggest_contribute=True`，前端展示"我们的库似乎不覆盖这个场景"+ §3.10 贡献入口；LLM system prompt 强制约束输出末尾用 `<<intent>>...<<end>>` 包裹累积标准化意图供前端 prefill；并强制 RAG-priority（每轮 LLM 调用前必先跑 RAG 注入 top-3 候选 description，不允许 LLM 凭空想象新场景）
   - §3.11.3 上传预检在 v3.0 **缩水**：仅展示低置信行的"最近似模板"，不再引导逐行修改；批量场景下"低质量行"由 v3.0 `under_specified` 闸在逐行 `run_pipeline` 时 422，前端标红展示
+- v2.19 → v2.20：**FEAT-10 贡献流程二次简化为 2 字段必填 + intent-only LLM 生成**——
+  - §3.10.1 新增 `generate_from_intent(original_intent, code_type, llm) → ExtractedFull` 函数（`services/platform/parameter_extractor.py`），LLM 一次性生成 `template_name + description + demo_code + parameter_defs + jinja_body + keywords + subcategory + protocol`；在原 3 道校验闸（参数命名 / Jinja2 沙箱 / keywords 形态）之外新增 `_validate_template_name` 第 4 道校验，强制 `^(sva|cov)_[a-z][a-z0-9_]*_v\d+$` 命名规范，违规抛 `ContributionParseError(stage="template_name")`
+  - §3.10.1 `POST /api/v1/contributions` 重构为 3 分支并存（按顺序判断）：(1) 缺关键字段（`template_name` 或 `demo_code`）→ 触发 `generate_from_intent`；(2) 显式传 `parameter_defs` → v2 批量路径不调 LLM；(3) 4 字段齐全 → 原 `derive_parameters_from_demo` demo 反推路径；分支 1 同样跑 dedup 预扫与 name 精确查重
+  - §5.1 端点表新增 `POST /api/v1/contributions/preview`（仅基于 `original_intent + code_type` 让 LLM 生成完整模板预览，**不入库**），返回 `{template_name, description, demo_code, parameter_defs, keywords, name_conflict}`；`name_conflict` 由 `check_name_duplicate` 计算，**非阻塞**——前端展示 Warning Alert 让用户改名后再调 submit；解析失败统一走 `422 contribution_parse_failed`（与现 submit 端点同结构 `detail.type / detail.stage / detail.reason`）
+  - §5.1 `POST /api/v1/contributions` 响应 schema `ContributionOut` 新增 `use_immediately_available: bool = True` 字段（前端用于条件渲染"立即使用"按钮）
+  - §3.10.1 「立即使用」路径定型为**在 Step 2 Modal 内展示可复制代码框**（`<pre>` monospace + 「复制代码」按钮 + 提示文案"代码已就绪，可直接复制使用。模板已提交审核，审核通过后将加入模板库。"），**不跳转 `/generate`**——`pending_review` 贡献不在 Qdrant 中，跳过去只会触发第五道闸 `no_matching_template` 进入循环；该贡献仍以 `status=pending_review` 进审核队列
+  - 双层审核机制成型：第一层是 Step 2 用户对 LLM 输出的语义级校对（编辑或接受 `template_name / description / demo_code`），第二层是管理员三栏审核（不变）
+  - schema 变更：`ContributionCreate.original_intent` 升必填（去掉 `Optional`），`template_name / description / demo_code` 改为 `Optional`；新增 `ContributionPreviewRequest / ContributionPreviewResponse`；`ContributionOut` 增 `use_immediately_available`
+  - 前端：`MyContributionsPage` 提交 Modal 改为 Ant Design 两步 Steps；`contributions.ts` 新增 `contributionsApi.preview()` 方法与 `ContributionPreview` 接口
+- v2.20 → v2.21：**Step1 模板选择精度提升 — 候选渲染扩容 + description audit + 混淆语料 + 二次验证 + reranker score gate**——
+  - §3.15.3 Step 5a：`_step1_select_id` 候选渲染由单行字符串改为 Markdown 多行块（`### {i}. {template_id}  {name}\n描述：...`）；description 截断阈值由 60 char 扩到 **1000 char**（spec 中先记的 300 在 review NEW-1 后改为 1000，原因是 `lib_manager.py import` 在描述末尾追加合成的"区别要点："/"不适用场景："两段，合成总长实测最长达 812 char，需余量避免末项被切）；`_step1_select_id` 的 `max_tokens` **保持 64 不变**（仅输入侧扩容，输出仍是 `template_id` 或 `"none"`）；GLM-4.7 实测 step1 延迟增幅 < 1s
+  - §3.15.3 Step 5a：新增 **A8 step1 二次验证**——`pipeline.py` 在 step1 选中且 `confidence_source == "llm_step1"` 时，调用 `llm.verify_step1_selection(normalized_intent, selected_id, candidates)` 发一条 yes/no 问询；LLM 答 `no` → 把 `confidence_source` 降级为 `"rag_fallback"` 并把 `template` 置空，让后续 fallback 链按 `rag_fallback` 走 RAG top-1，可被第五道闸 `NoMatchingTemplateError` 接管；fail-open（LLM 调用/解析失败一律视为通过）；`STEP1_VERIFY_ENABLED` 开关，**默认 `False`**（开启前需先用 `tests/test_template_confusion_corpus_real_llm.py --real-llm` 评估 false-negative 率）；`max_tokens=16` / `thinking=disabled`
+  - §3.15.3 Step 5a：新增 **A9 reranker score gate**（pipeline 层独立 gate）——A8 验证通过后查 `rag_candidates` 中 `template_id == selection.template_id` 那一条的 `score` 字段（即 stage3 reranker score，由 `services/rag/engine.py` enriched 写入），低于 `RERANKER_MIN_SCORE_THRESHOLD`（默认 0.30，未标定的经验占位值）→ 抛 `NoMatchingTemplateError(top_score=selected_score)`；`STEP1_RERANKER_GATE_ENABLED` 开关，**默认 `False`**（开启前需跑 `scripts/calibrate_reranker_threshold.py` 在 `template_selection_corpus.yaml + template_confusion_corpus.yaml` 上标定 `correct_p10 / wrong_p50` 中点后写回 `reranker_min_score_threshold`）
+  - §3.15.3 Step 5a：**A9 与 FIX-9 移除的 `no_match_score_threshold` 的语义区分**——FIX-9 拦的是 RAG **top-1** score（"top-1 分数低就整体否决 LLM"），cross-encoder 词汇重叠会让无关握手模板拿 1.0 分把 LLM 正确的 `none` 判断否决，已经移除；A9 拦的是 **LLM 选中的那个 template_id** 的 reranker score（"LLM 信心十足选了某 id，但该 id 客观重排得分仍偏低"），是 LLM 决策 + reranker 复核的双信号互证，触发更稀少且方向更精确。`no_match_score_threshold` 仍保留供日志/监控参考，**不参与触发判定**
+  - §6 模板 YAML 文件规范：新增 `differentiators`（list[str]，列出与最近邻模板的 2–3 条区别）与 `non_use_cases`（list[str]，列出 2–3 条不适用场景）两个可选字段；`description` 字段约定升级为"做什么 / 典型场景 / 边界（请勿用于 X 请用 Y）"三要素。`lib_manager.py import` 通过新增的 `_compose_description(base, differentiators, non_use_cases)` helper **在 import 时把两个字段拼到 `description` 列末尾**（"区别要点："/"不适用场景："标题段，每段 list 前缀 `- `），由现有列流转到 Qdrant payload + reranker text + pipeline.candidate_dicts + LLM prompt，**避免 DB schema 变更**；`lib_manager.py validate` 同步新增校验：`description` 缺失或 < 30 字节 WARN（鼓励补齐三要素），`differentiators` / `non_use_cases` 若存在必须是非空 list 否则 ERROR
+  - §8.4 环境变量新增三项：`STEP1_VERIFY_ENABLED`（默认 false）、`STEP1_RERANKER_GATE_ENABLED`（默认 false）、`RERANKER_MIN_SCORE_THRESHOLD`（默认 0.30）
+  - 新增配套测试基础设施：`backend/tests/data/template_confusion_corpus.yaml`（近邻混淆对回归语料 ≥10 条种子，涵盖 pair-A `handshake_stable` ↔ `handshake_timeout` × 4 / pair-B `timing_max_delay` ↔ `handshake_timeout` × 4 / FSM × 1 / coverage × 1）+ `test_template_confusion_corpus_mocked.py`（CI 必跑，mock RAG 把 `confusion_template` 注入为 top-1，断言 pipeline 最终选中 `correct_template`）+ `test_template_confusion_corpus_real_llm.py --real-llm`（手动套件）+ `scripts/calibrate_reranker_threshold.py`（A9 阈值标定）
+- v2.21 → v2.22：**L3 用户反馈 + L4 管理员分析仪表盘数据基础设施**——
+  - §4.1 `generation_records` 表新增 6 列（migration 006）：`feedback_rating SMALLINT`（1=好/2=一般/3=差）、`feedback_reason_tags JSONB`（7 项 `ReasonTagEnum` 枚举数组）、`feedback_comment TEXT(≤2048)`、`feedback_at TIMESTAMPTZ`、`generation_mode VARCHAR(16) DEFAULT 'rag'`（`'rag'` / `'llm_direct'` 为 L2 预留）、`gate_error_type VARCHAR(32)`（5 道闸触发标记）；全部 nullable，正常生成路径与 batch 老记录不受影响
+  - §4.1.1 新增 "feedback API 数据流" 子节：`POST /api/v1/feedback/{generation_record_id}` 写 4 个 feedback 列；权限 owner-or-admin（`record.user_id == current_user.id OR current_user.role in {lib_admin, super_admin}`），`rating=3` 必填 `reason_tags`（Pydantic `model_validator` 抛 `PydanticCustomError(type='reason_tags_required')`），成功返 204
+  - §4.1.2 新增 "admin analytics 模块" 子节：4 个 KPI 端点（`/admin/analytics/{feedback-summary, template-issues, intent-confusion, no-match-rate}`）的 SQL 聚合关键策略 + 数据源约定（`intent-confusion` 用 `rag_top3[0]` 作为 `expected_template`、`no-match-rate` 用 `gate_error_type='no_matching_template'`），全部要求 `lib_admin` / `super_admin`，`days` 窗 ∈ [1, 90] 默认 7
+  - §4.1.3 新增 "generate endpoint 422 catch 路径写 record" 子节：`api/v1/generate.py` 在 5 道闸 catch 块通过 `_record_gate_event` 写 `GenerationRecord(template_id=None, gate_error_type=<type>)`，`gate_error_type` 取值与异常一一对应（off_topic / code_type_mismatch / under_specified / no_matching_template / empty_retrieval）；**不修改 `services/core/pipeline.py` 闸判断逻辑**，仅在端点层补持久化，对确定性契约（§1.1）无影响
+  - §5.1 端点表追加 5 条：`POST /feedback/{id}`（普通用户/库管理员+） + 4 个 `/admin/analytics/*`（库管理员+）
+- v2.22 → v2.23：**FEAT-11 Stage 2 双模生成（rag + llm_direct）落地**——
+  - §1.1 确定性契约修订（v2.15 之后第二次修订）：原"LLM 在 RAG 中的职责边界 ... 不生成任何代码"约束**收窄为仅对 `generation_mode='rag'` 路径**；新增 `generation_mode='llm_direct'` 路径，明确声明为**非确定性 by design**。`llm_direct` 路径只对 `gen_llm:*` Redis 7d TTL 缓存命中呈现"伪确定性"，TTL 过期或切换 LLM 默认配置后即重新生成。`rag`/`llm_direct` 标签必须在 record / 响应 / UI 三处同时打——后端 `GenerationRecord.generation_mode` 列、`POST /generate/llm-fallback` 响应 `generation_mode: "llm_direct"` 字段、前端 result 阶段 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>` 三处同步
+  - 新增 §3.17 `llm_direct` 生成路径完整文档：`POST /api/v1/generate/llm-fallback` 端点契约、`LLMClient.generate_code_freeform` 抽象方法 + 两实现（Anthropic native messages / OpenAI-compat chat + regex 提取 `systemverilog`/`sv`/`verilog` 围栏）、`gen_llm:{llm_config_id}:{sha256(canonical(intent+code_type+signals+clk+rst))}` 7d TTL 缓存（signals 按 name 排序保证顺序无关）、`parent_record_id` FK 回链契约（`ondelete=SET NULL`）、非确定性标签三处同步约定、三类 422 错误（`llm_direct_chained_not_allowed` / `llm_direct_no_code` / `llm_direct_internal_error`）的 detail 结构
+  - §3.15.3 / §3.16 扩展 **A 子项：高置信 RAG 自动 quick_render**——`pipeline_preview` 在 `_detect_under_specified` 之后新增 `_is_high_confidence_rag(result, settings, verify_ok, selected_score, params_with_source) -> bool` 判定，四条件齐绿（`confidence_source==llm_step1` + `step1_verify_enabled` 且 `verify_ok=True` + `selected_score >= reranker_min_score_threshold` + 所有 param sources ∈ `{llm, regex, signal_list, default}`）→ `quick_render=True`，与 intent_cache 命中共用同一旗标让前端跳过 ConfirmationPanel。`selected_score` 从 A9 gate 专用计算上移到 `confidence_source==llm_step1` 通用计算，A9 与高置信判定共用同一份值
+  - §3.12.2 `LLMClient` 抽象表新增第 4 条方法 `generate_code_freeform(intent, code_type, signals, clk, rst) -> str`；OpenAI-compat 实现硬编码 `extra_body={"thinking":{"type":"disabled"}}` + `max_tokens=2048`（与 normalize_intent / step1 一致禁 thinking），Anthropic 实现走 native messages API；prose-only 响应（无 ` ```systemverilog/sv/verilog``` ` 围栏）抛 `ValueError("no_sv_code_block")` 由端点翻译为 HTTP 422 `llm_direct_no_code`
+  - §3.6 缓存键设计扩为三类（增加 `gen_llm:*`）：`gen_llm:{llm_config_id}:{sha256(canonical(intent+code_type+signals+clk+rst))}` 7d TTL 用于 `llm_direct` 兜底缓存；`invalidate_all_llm_caches()` 同步 scan-delete 三个前缀（`gen:*` / `intent_cache:*` / `gen_llm:*`），切换默认 LLM 配置后 `llm_direct` 缓存与 RAG 两层缓存一起失效
+  - §3.15.2 `/render` 端点响应 `RenderResponse` 新增 `generation_mode: Literal["rag", "llm_direct"] = "rag"` 字段（枚举值仅这两项，Pydantic 在响应序列化时拦非法值），前端据此初始化 `state.result.generation_mode` 决定是否显示 `llm_direct` fallback 按钮；正常 RAG 路径恒返 `"rag"`
+  - §4.1 `generation_records` 表 `generation_mode` 列含义升级：从"L2 预留"变为"代码来源的真实标签"，新增 `parent_record_id VARCHAR(36) NULLABLE FK→generation_records.id ondelete=SET NULL` 列（migration 007），让 `llm_direct` 子记录回链触发本次 fallback 的源 RAG 记录；源记录被 admin 删除仅清空 FK，保留 `llm_direct` 子记录与其反馈数据
+  - §4.1.2 4 个 KPI 端点 SQL 聚合策略表新增 optional `generation_mode` query 参数：`feedback-summary` / `template-issues` / `intent-confusion` / `no-match-rate` 全部支持。`template-issues` 在 `generation_mode=llm_direct` 时把 `template_id IS NULL` 行归入 `__llm_direct__` 桶不再被默认 `IS NOT NULL` filter 排除
+  - §7 项目目录结构：`migrations/versions/` 列举更新为 001 / 002 / 003 / 004 / 005 / 006 / 007 七个迁移文件（含简要功能注释），不再仅列 001
+  - §5.1 端点表追加 1 条：`POST /generate/llm-fallback`（普通用户）
+- v2.23 → v2.24：**FEAT-12 用户对比报告系统落地**——
+  - 新增 §3.18 `improvement_reports` 路径完整文档：从 GeneratePage 「提交对比报告」按钮 → `GET /improvement-reports/check` 预查（驱动按钮 disabled 态）→ `POST /improvement-reports`（用户端，写 `status='pending'`）→ admin 列表 / 详情自动 PATCH `pending → in_review` → admin 写 `admin_note` + 「标记已处理」PATCH `in_review → resolved` 的完整链路；引用 §4.1.4 表结构、§5.1 端点表
+  - §4.1 `generation_records` 表追加备注：`parent_record_id`（v2.23 引入的 `llm_direct` 子记录 → RAG 源记录 FK）同时是 `improvement_reports.rag_record_id` / `improvement_reports.llm_direct_record_id` 配对的"语义锚点"——`POST /improvement-reports` 要求 `rag_record_id == llm_direct_record.parent_record_id`（端点层显式校验或前端守门，后端容忍 user 自行构造的合法对）；删除源 RAG 记录不级联删除 `improvement_reports`（FEAT-12 不解决该清理路径）
+  - §4.1.4 新增 `improvement_reports` 表结构（migration 008）：字段 / 类型 / 约束 / UNIQUE(rag_record_id, llm_direct_record_id) / 状态 ENUM `report_status_enum('pending','in_review','resolved')` 取值 / `report_categories JSONB` 列存 4 项 `ReportCategoryEnum` slug（`wrong_template` / `wrong_params` / `poor_style` / `other`）与中文 label 双向对照表
+  - §5.1 端点表追加 5 行：`POST /improvement-reports`（登录用户+）、`GET /improvement-reports/check`（登录用户+，鉴权与 POST 同级，不限 admin）、`GET /admin/improvement-reports`（库管理员+，支持 `status`/`categories` 过滤）、`GET /admin/improvement-reports/{id}`（库管理员+，返两条 generation_record 完整对比字段）、`PATCH /admin/improvement-reports/{id}`（库管理员+，三态状态机非法跳转返 422 `illegal_status_transition`）；3 类错误 `duplicate_report`(409) / `invalid_record_ref`(422) / `illegal_status_transition`(422) 详见 PRD §6.1 错误模式表
+  - §7 目录结构追加：`backend/app/api/v1/improvement_reports.py`（4+1 路由） / `backend/app/models/improvement_report.py`（ORM）/ `backend/app/schemas/improvement_report.py`（4 个 Pydantic）/ 前端 `frontend/src/api/improvementReports.ts` / `frontend/src/pages/Admin/AdminImprovementReportsPage.tsx` / `frontend/src/pages/Admin/AdminImprovementReportDetailPage.tsx`，外加 `frontend/src/pages/Generate/GeneratePage.tsx` 与 `frontend/src/components/MainLayout.tsx` / `frontend/src/App.tsx` 增量改动
+  - §7 migrations 列表追加 `008_improvement_reports.py`（建表 + `report_status_enum` 创建 + UNIQUE 约束 + FK → generation_records.id ondelete=RESTRICT）
+  - 与 §3.17 / §1.1 确定性契约的边界：`improvement_reports` 路径是**纯 DB 写入**，不调用 LLM、不参与 RAG 检索、不影响 `generation_records.output_code`；它消费 `generation_records` 现有 FK（`parent_record_id`）作为配对锚点。对 §1.1 确定性契约（`rag` / `llm_direct` 路径）**无影响**
+- v2.24 → v2.25：**FEAT-13 模板成熟度门控（maturity_level 三档 + RAG 默认仅召回 production + admin 提升降级 UI）**——
+  - §4.1 `templates` 表新增 `maturity_level` 列（PostgreSQL ENUM `template_maturity_enum`，值 `production / experimental / draft`，NOT NULL，server_default `'experimental'`），与既有 `maturity` 列（值 `draft / validated / production`，"开发成熟度"）**并存且语义独立**——`maturity_level` 专责"生产门控"（是否进入 RAG 召回主库），`maturity` 描述"开发成熟度"（模板设计者标注的迭代位）；两列共用部分 enum 值（`draft` / `production`）纯属语义重合无关联，**不得混用**
+  - 新增 §3.2 RAG 三阶段 maturity 过滤说明：stage1 `stage1_hybrid_search` Qdrant `Filter.must` 在 `code_type` 之外追加 `FieldCondition(key='maturity_level', match=MatchValue(value='production'))`；`engine.py::rag_retrieve` 的 DB 查询 `select Template where id in template_ids and is_active==True` 追加 `and Template.maturity_level=='production'` 作为**双重防御**（应对 Qdrant payload 缺失字段的边角场景）；`dense_top1_score` 同样追加 `maturity_level='production'` Filter，影响 off-topic gate 与 code_type mismatch gate 两处调用点（两个 gate 的阈值校准基线随之变化，**spec §5 风险记录**：上线后可能需重跑 `calibrate_offtopic_threshold.py` 验证 `OFFTOPIC_DENSE_THRESHOLD` 仍合理）
+  - §3.15.3 Step 5a LLM step1 候选生成路径说明：由于 RAG 三阶段（stage1 Qdrant Filter + engine.py DB Filter）已保证返回候选列表**仅含 production 模板**，`pipeline_preview` 组装 `candidate_dicts` 之前**无需**在 pipeline 层再单独过滤 `maturity_level`，依赖链 = Qdrant payload → stage1 Filter → engine.py DB Filter → `rag_candidates` → `candidate_dicts`
+  - §3.4 Qdrant Collection payload 字段表新增 `maturity_level`（用于 stage1 Filter）；`lib_manager.py::_sync_to_qdrant` 在 `PointStruct.payload` 中加 `"maturity_level": template.maturity_level`（兼容性 `getattr(template, 'maturity_level', 'experimental')`）；**Qdrant payload 冷启动注意事项**：现有 Qdrant collection 中的 points 没有 `maturity_level` payload 字段，stage1 Filter 会把它们全部过滤掉。上线流程**必须先 `alembic upgrade head` 再 `lib_manager.py rebuild`**（或 `lib_manager.py import --force`）让所有 points 带上正确 `maturity_level` payload，否则 RAG 召回为空 → `EmptyRetrievalError` → 全量 HTTP 503
+  - §3.10 贡献流：`_create_template_from_contribution`（`templates.py`）新建模板时 `maturity_level` 固定写 `'experimental'`（无论 contribution 的 `maturity` 字段取值），admin 通过 review 后该模板仍保持 `experimental`；须 super_admin 在「模板库管理」页（`AdminTemplatesPage.tsx`）显式点「升级到 production」走 `PATCH /api/v1/admin/templates/{id} {maturity_level: 'production'}` 才进入 RAG 召回主库
+  - §3.4 Admin 模板管理页 UI：表格新增 `maturity_level` 列（带颜色 Tag：`production=green` / `experimental=orange` / `draft=blue`）；行内操作区追加「升级到 production」「降级到 experimental」两个按钮，**仅 `current_user.role=='super_admin'` 时渲染**（`lib_admin` 隐藏，不可见亦不可点）；编辑 Modal 中保留原 `maturity` 字段不变，**不得**将 `maturity_level` 与 `maturity` 合并到同一 Form.Item（避免审核员误改）
+  - §5.1 端点契约：`PATCH /api/v1/admin/templates/{id}` 在 payload 含 `maturity_level` 时新增权限校验——`current_user.role != 'super_admin'` 返 HTTP 403 `detail="仅 super_admin 可修改 maturity_level"`；非法 enum 值（非 `production/experimental/draft`）由 Pydantic schema 返 HTTP 422
+  - §7 项目目录结构 + migrations 列表追加 `009_template_maturity_level.py`（创建 `template_maturity_enum` PG ENUM + `templates.maturity_level` 列 + 全表 backfill：`id ~ '^(sva|cov)_.+_v[0-9]+$'` 命名规范的官方种子模板 UPDATE 为 `production`，其余行（含 `is_active=false`、含历史 `L6_E2E_*` 测试模板）由 `server_default='experimental'` 自动得到 `experimental` 或显式 UPDATE 兜底）；migration 009 `upgrade()` 末尾打印 `[WARN]` 提示部署方"必须紧接 `lib_manager.py rebuild` 同步 Qdrant payload"
+  - §7 新增测试文件 `backend/tests/test_template_maturity_gating.py`（mock Qdrant / PG，覆盖 4 场景：stage1 Filter 包含 `maturity_level='production'` 条件；engine.py DB 二次过滤正确拦截非 production 模板；PATCH maturity_level 的 super_admin 200 / lib_admin 403 / 非法值 422；migration 009 backfill 条件函数单元测试）
+  - **不在范围内**：FEAT-14 范畴的自动语料质量评分（`draft → experimental` 自动升级）、跨语料库 maturity 同步、`production → 退役` 流程、batch / contribution / IntentBuilder 路径的 maturity 显式 override 参数（RAG 默认生效，不开 explicit override API）、stage2 ColBERT 独立 maturity Filter（stage1 已保证输入是 production，stage2 透传即可）、修改既有 `maturity` 列 enum 值或列名（两列并存）、前端 Library 页 / Generate 页的 `maturity_level` 展示
+- v2.25 → v2.26：**FEAT-14 step1 LLM 返编号兼容 + prompt XML 化消除编号心智**——
+  - §3.12.2 `_step1_select_id` 行说明追加：候选输入由 Markdown 编号块（`### N. <id>  <name>`）改为 XML `<candidate id="..." name="...">` 块；系统提示"返回 template_id 或 none"措辞同步为"返回 `<candidate>` 标签的 id 属性值，或 none"；解析层在精确 id 匹配失败后兼容数字序号兜底——若 LLM raw 响应是纯数字 N（允许前后空白 / 尾部句号 / 引号包裹）且 `1 ≤ N ≤ len(candidates)`，将 `raw='N'` 映射到 `candidates[N-1]['template_id']` 并打印日志 `[GLM Step1] raw was integer N → resolved to <template_id>`，`confidence_source` 保持 `llm_step1`（不退化为 `rag_fallback`），下游 `no_matching_template` 闸不触发；`N=0` 或 `N > len(candidates)` 按无效处理沿原 fallback 路径返 `""`
+  - §3.15.3 Step 5a "候选渲染（v2.21，A4）"段刷新为 XML 示例（`<candidate id="sva_handshake_timeout_v1" name="握手超时">\n描述：……\n</candidate>`），并补一句"解析层在精确 id 匹配失败后检查 raw 是否为合法序号 N，兜底映射 `candidates[N-1]`，保持 `confidence_source='llm_step1'`"；description 1000 char 截断 / `max_tokens=64` / 系统提示中"区别要点 / 不适用场景"提示语均不变
+  - `anthropic_client.py::select_template` 在 tool calling 返回的 `template_id` 不在候选列表时同步追加数字兜底（安全网，tool schema 不改）
+  - 新增测试文件 `backend/tests/test_step1_numeric_fallback.py`（覆盖 raw=`'3'` / `'3.'` / `' 3 '` / `'"3"'` / `'none'` / 完整 id / 非法文字 id / `N=0` / `N=len+1` 边界 + AnthropicClient 同等兜底路径）与 `backend/tests/test_step1_prompt_xml.py`（mock LLM 调用断言 user message 含 `<candidate id="`、不含 `"### "` 编号前缀）
+  - **不在范围内**：`verify_step1_selection` yes/no 协议、`_step2_fill_params` 与 `normalize_intent` prompt、AnthropicClient `_TOOL_DEF` schema、pipeline.py 的 RAG fallback 链与 gate 顺序、`OFFTOPIC_DENSE_THRESHOLD` real-LLM 重校准、长候选列表（>5）prompt 截断策略
+- v2.26 → v2.27：**FEAT-15 off-topic 与 code_type_mismatch gate 协同——避免错选 code_type 被误判为非验证请求**——
+  - §3.15.3 Step 0a `off-topic dense 闸` 判定基准升级：由 `dense_top1_score(original_intent, selected_code_type) < OFFTOPIC_DENSE_THRESHOLD` 改为 `best_overall = max(selected_dense, max(cross_code_type_scores)) < OFFTOPIC_DENSE_THRESHOLD`。新增 helper `_compute_cross_code_type_scores(intent, selected_code_type, selected_score) -> dict[str, float]` 返回 `{code_type_id: dense_top1_score}` 全量字典（含 selected_code_type 自身），Step 0a / Step 0b 共用同一份扫描结果不重复 embedding。`OffTopicIntentError.top_dense_score` 字段语义由"所选 code_type 子集最高分"升级为"全 code_type 库最高分"，与前端 Modal "输入与**模板库**的最高相似度低于阈值" 文案语义对齐（前端文案/字段名不动）。修复场景：用户提"交叉覆盖 awsize 与 awburst 的所有合法组合" + 误选 `code_type=assertion`，老逻辑因 assertion 子集得分 0.4088 < 0.44 抛 `OffTopicIntentError` 误导"非 IC 请求"；新逻辑 `best_overall = max(0.41, 0.76) = 0.76 ≥ 0.44` 通过 Step 0a，让 Step 0b 抛 `CodeTypeMismatchError` 提示改用 `coverage`
+  - §3.15.3 Step 0b `code_type_mismatch 闸` 判定追加前置条件：原 `best_other_score - selected_score ≥ CODE_TYPE_MISMATCH_MARGIN` 升级为 `gap ≥ margin AND best_other_score ≥ OFFTOPIC_DENSE_THRESHOLD`。第二前提避免全库低分场景（如 `selected=0.30 / best_other=0.42 / gap=0.12 ≥ margin` 但 `best_other` 自身没"有把握"）仍弹"选错类型"误导；旧 `_detect_code_type_mismatch` 函数被内联删除（全 codebase grep 无外部调用），Step 0b 直调 `_compute_cross_code_type_scores` 共享 Step 0a 的扫描结果
+  - §3.15.3 `[Gate] offtopic` 日志格式扩字段：旧只记 `top_dense_score`，新格式打印 `selected_dense=<f.4> best_other_id=<id> best_other_score=<f.4> best_overall=<f.4> threshold=<f>`，便于排查"哪类高分把请求救回了 / 全库均匀低分触发 off-topic 时谁离阈值最近"。`registry 只有一个 code_type` 时 `best_other_id=None / best_other_score=-1.0` 哨兵值（日志里看到 `-1.0000` 即此情形），`best_overall` 自然退化为 `selected_dense`，Step 0b 跳过
+  - §1.1 确定性契约**不动**：本次仅闸语义调整，未引入新 LLM 调用、未改 template 选择 / param mapping / Jinja 渲染、未改缓存 key 结构；闸顺序（Step 0a → Step 0b）与异常类型不变；前端 `handleApiError` / Modal / `redirect_to` 字段约定不变
+  - 新增测试 `backend/tests/test_offtopic_codetype_priority.py` 覆盖 4 场景（错选 code_type → mismatch / 全离题 → off_topic / `best_overall ≥ threshold` 但 `gap < margin` → 两闸均不触发 / `gap ≥ margin` 但 `best_other < threshold` → off_topic 而非 mismatch）；`backend/tests/data/offtopic_corpus.yaml` 新增 4–6 条 cross-code-type 错选样本，分类为 `marginal`，新字段 `expected_gate: code_type_mismatch | off_topic | null` 由 `test_offtopic_corpus_mocked.py` 新增 `test_cross_code_type_mismatch_corpus_routing` 函数按 expected_gate 断言抛出的异常类型；既有 `test_pipeline_preview_code_type_mismatch_raises_with_suggestion` 与 marginal_ic 断言无回归
+- v2.29 → v2.30：**FEAT-19 批量 Excel schema 推倒重建为 3 列**（BREAKING）——
+  - §3.9.1 两份输入表格规范全量替换：SVA 17 列 / Coverage 19 列大表精简为 3 个用户列（A=编号、B=验证/覆盖意图、C=备注）+ 3 个系统输出列（D/E/F = 匹配模板 / 置信度 / 生成状态）；schema yaml `signals:` 键置为 `null`，`module / clk / rst / rst_polarity / protocol / signals 1~4 / 严重级别 / 覆盖类型 / 主信号 / 交叉信号 / Bin提示 / 采样条件` 共 14~16 个用户列字段全部删除
+  - §3.9.1 ParsedRow 字段策略：`ParsedRow` 保留旧字段名但改为 dataclass `field(default=...)` 落硬编码默认值（`clk="clk"` / `rst="rst_n"` / `rst_polarity="低有效"` / `module=""` / `protocol=None` / `signals=[]`），`tasks/batch_tasks.py` 中 `row.clk` / `row.rst` / `row.signals` 等引用零改动（FEAT-18 定型的 batch_tasks 不动），与 pipeline 6 级回退（step2 / regex / signal_list / default / semantic_fallback / placeholder）在用户没填信号名时落默认值的语义保持一致
+  - §3.9.1 输出列前移至 D/E/F（旧 SVA V/W/X、Coverage T/U/V）：`_write_result_zip` 当前只写 `results.json` + 单个 `.sv` 不写回 Excel，输出列纯为占位字段标记 schema 输出契约，前移安全且语义清晰
+  - §3.9.1 不兼容旧 17/19 列模板的设计声明：后端不实现运行时兼容转换层；旧模板继续上传时 `parse_excel` 不崩溃但因列错位会把旧 B 列"所属模块"内容当 intent 解析，典型表现为 top-1 模板偏向"以模块名为主题"的无关模板、置信度 < 50%；用户须重新通过 `GET /api/v1/batch/template`（§3.7.1）下载新模板
+  - §3.9.2 解析流程：`ParsedSVARow` / `ParsedCoverageRow` 双 dataclass 合并为单一 `ParsedRow`，三列从 Excel 读取，其余字段固定默认值
+  - §3.9.3 信号角色直接参数填充：批量路径下 `ParsedRow.signals` 恒为空 list，规则映射不再在批量生效，pipeline 6 级回退兜底；必填参数最终落 `semantic_fallback` / `placeholder` 由 under_specified 闸 422 拒绝（详见 §1.1 / pipeline `_detect_under_specified`）；单条页 `/generate` 表单仍保留信号角色控件，本节描述保留供历史参考
+  - §3.7.1 模板下载端点：`_collect_headers` 中 `if signals:` 守卫在 schema `signals: null` 后自动跳过 signals 块展开，下载的模板只剩 A/B/C 三列用户表头；占位提示仍写在 B2（A 列必须留空，否则 `excel_parser` 会把占位文字当 row_id 解析），列序与 `app.services.parser.utils.col_to_idx` 对齐（`excel_parser` 与 `template_writer` 共享同一 helper）
+  - §1.1 确定性契约**不动**：本次仅改 parser 输入侧（`backend/data/schemas/*.yaml` + `services/parser/excel_parser.py` + `services/parser/template_writer.py` schema 驱动跳过）；pipeline / LLM / RAG / 缓存 key 结构、5 道闸顺序、参数源优先级、`PipelineInput` dataclass 字段定义、单条页表单**全部不变**；前端批量页上传/下载 UI 由 FEAT-18 完成无需改动；无数据库迁移
+  - 测试：更新 `tests/test_batch_template_download.py` 表头断言（删除 4 个"信号N{suffix}" assert）、`tests/test_batch_multisheet_parse.py` helper 中 `column=19/18 → column=2` 列号迁移、`tests/test_batch_minimal_excel.py` 同步；新增 3 个用例覆盖：(a) A 有编号 + B 意图 + C 空备注 → ParsedRow.comment 空 / parse 正常 (b) A 有编号 + B 空意图 → ParsedRow 仍生成但 batch_tasks 走 skipped 分支 (c) 下载模板的 D/E/F 输出列不在用户表头出现
+- v2.28 → v2.29：**FEAT-18 批量页删 code_type 下拉 + sheet 自动检测多 code_type**——
+  - §3.7 batch 流程图首框 `上传 Excel` 追加 multisheet 端点签名说明：`code_type: str | None = Form(None)` 可选，缺省走 `parse_excel_multisheet` 多 sheet 路径，显式传入保留 `parse_excel` 单 sheet 兼容路径；多 sheet 路径下 `BatchJob.code_type` 写字面量 `"mixed"` sentinel
+  - §3.9 新增"多 sheet 路径"段落：`parse_excel_multisheet(file_path) -> list[ParsedRow]` 函数描述（遍历 `get_registry().all()` 的每个 `excel_sheet_name` → 复用单 sheet 解析逻辑 → 标注 `row.code_type` → 汇总按 sheet 顺序排列）；未注册 sheet 名静默跳过；全部已知 sheet 均无有效行抛 `ValueError("no_valid_rows")` → HTTP 400 `detail.type="no_valid_rows"`；`MULTISHEET_CODE_TYPE_SENTINEL = "mixed"` 常量
+  - §5.1 端点表 `POST /batch/upload` 与 `POST /batch/preflight` 行更新：`code_type` 字段标注**可选**，缺省 multisheet / 显式传入单 sheet 行为两路；`PreflightRowResult` 携带 `code_type` 字段
+  - §1.1 确定性契约**不动**：本路径未引入新 LLM 调用、未改 RAG / param mapping / Jinja 渲染、未改缓存 key 结构、未改 5 道闸顺序；`parse_excel(file_path, code_type)` 单 sheet 接口签名与行为完全不变
+- v2.27 → v2.28：**FEAT-16 批量生成 Excel 模板下载端点**——
+  - §3.7.1 新增"模板下载端点（FEAT-16）"小节：`GET /api/v1/batch/template` 登录用户+，动态遍历 `CodeTypeRegistry` 即时生成多 sheet `.xlsx`（assertion→`SVA需求` / coverage→`Coverage需求`），sheet 名 ← `data/code_types/*.yaml` 的 `excel_sheet_name`、表头 ← `data/schemas/*.yaml` 的 `fields`（跳过 `output: true`）+ `signals` 块展开；`Content-Disposition: attachment; filename=batch_template_<YYYYMMDD>.xlsx`；端点**无状态无持久化**（不写库、不计数、不缓存、不审计），构造逻辑落在 `backend/app/services/parser/template_writer.py::build_template_workbook(registry)`（纯 I/O 函数，不调 LLM、不读 Qdrant、不参与 §1.1 确定性契约）
+  - §5.1 端点表追加 `GET /api/v1/batch/template` 一行（必须先于 `GET /{job_id}/...` 参数化路由注册）
+  - **占位提示写在 B2（column=2）而非 A2**：`excel_parser` 在 A 列（`raw_row[0]`）为空时整行跳过，让"原样上传空模板"路径不会把占位文字误解析为一条 row_id，进而保证 `POST /api/v1/batch/preflight` 返 HTTP 200 + 0 行结果
+  - 新增 `backend/tests/test_batch_template_download.py` 7 个用例（详 §3.7.1 末段回归契约）；该套件不依赖任何活基础设施
+  - §1.1 确定性契约**不动**：本路径与 §3.7 Celery 异步批量任务路径互相独立——前者交付空白模板，后者消费用户填好的 Excel；未引入新 LLM 调用、未改 RAG / param mapping / Jinja 渲染、未改缓存 key 结构
 
 ---
 
@@ -70,9 +156,16 @@ LLM 本质上是概率性的，但平台要求输出是确定性的。完整 RAG
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
-**LLM 在 RAG 中的职责边界**：接收检索到的模板作为上下文，输出"选择哪个模板 + 填入哪些参数"，**不生成任何代码**。代码生成完全由 Jinja2 完成。
+**LLM 在 RAG 中的职责边界**：接收检索到的模板作为上下文，输出"选择哪个模板 + 填入哪些参数"，**不生成任何代码**。代码生成完全由 Jinja2 完成。**该约束的适用范围**：仅对 `generation_mode='rag'` 路径生效；v2.23 / FEAT-11 引入的 `generation_mode='llm_direct'` 兜底路径是 explicit 例外（详见 §3.17），明确声明为**非确定性 by design**。
 
 **契约修订（v2.15）**：原"always produce code"契约范围收窄为**仅对域内（IC 验证）输入**。无关意图（诗歌/闲聊/数学题/通用代码请求等）经 RAG 之前的 dense 余弦阈值闸（threshold=0.44，原文 embedding × Qdrant top1 < 阈值）直接 HTTP 422 拒绝，不进入 LLM 调用链。阈值由 `backend/scripts/calibrate_offtopic_threshold.py` 在 `backend/tests/data/offtopic_corpus.yaml` 上经验校准；emergency kill-switch `OFFTOPIC_GATE_ENABLED=false`。
+
+**契约修订（v2.23 / FEAT-11，双模架构）**：原"系统决定产出代码时必为字节级确定"约束**仅对 `rag` 路径成立**。`llm_direct` 路径由 `POST /generate/llm-fallback` 端点暴露，调用 `LLMClient.generate_code_freeform(intent, code_type, signals, clk, rst)`，LLM 自由生成 SystemVerilog 代码，**不经过 Jinja2 渲染层**。同一输入再次调用可能产出不同代码——这是设计内行为。`llm_direct` 路径只在 `gen_llm:{llm_config_id}:{sha256(canonical(intent+code_type+signals+clk+rst))}` 7d TTL Redis 缓存命中时呈现"伪确定性"，TTL 过期或切换 LLM 默认配置后即重新生成。非确定性标签必须在三处同时打：
+- **后端记录层**：`GenerationRecord.generation_mode='llm_direct'` + `parent_record_id` FK 回链源 RAG 记录
+- **API 响应层**：`POST /generate/llm-fallback` 响应体含 `generation_mode: "llm_direct"` 字段；`POST /generate/render`（RAG 路径）响应体含 `generation_mode: "rag"` 字段
+- **前端 UI 层**：`llm_direct` 结果代码卡片头部强制渲染 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>` 提示用户当前结果不在确定性契约保护范围内
+
+链式禁止：源记录已是 `llm_direct` 时端点返 HTTP 422 `llm_direct_chained_not_allowed`——不允许 `llm_direct → llm_direct` 累积"漂得越来越远"的代码。
 
 **四层确定性保障**：
 
@@ -434,13 +527,16 @@ client.create_collection(
 # 每条模板的 Payload（轻量，仅存索引用字段）
 # 完整模板内容存 PostgreSQL，通过 template_id 回查
 payload = {
-    "template_id": "SVA-HAND-001",
-    "code_type":   "assertion",
-    "subcategory": "handshake",
-    "protocol":    ["AXI4", "AXI4-Lite"],
-    "maturity":    "production"
+    "template_id":     "SVA-HAND-001",
+    "code_type":       "assertion",
+    "subcategory":     "handshake",
+    "protocol":        ["AXI4", "AXI4-Lite"],
+    "maturity":        "production",      # 开发成熟度，纯元数据
+    "maturity_level":  "production"       # 生产门控（FEAT-13 / v2.25，stage1 Filter 必读）
 }
 ```
+
+**stage1 Qdrant Filter（v2.25 / FEAT-13）**：`stage1_hybrid_search` 构造 `Filter.must` 时在 `code_type` 条件之外追加 `FieldCondition(key='maturity_level', match=MatchValue(value='production'))`，stage1 召回**仅返回 production 模板**；`engine.py::dense_top1_score` 同样追加此 Filter，使 off-topic / code_type_mismatch gate 的 top-1 计算也只在 production 子集上进行。`lib_manager.py::_sync_to_qdrant` 在 `payload` dict 中加 `"maturity_level": getattr(template, 'maturity_level', 'experimental')`；**冷启动**必须先 `alembic upgrade head` 再 `lib_manager.py rebuild` 让所有 points 带上 payload 字段，否则 stage1 Filter 会把缺字段的旧 points 全部过滤掉。
 
 **模板入库时的编码文本**（拼接多个字段，提升召回覆盖）：
 
@@ -462,7 +558,7 @@ payload = {
 
 ### 3.6 缓存层（Redis）
 
-**缓存键设计**（两类缓存，均按 LLM 配置分桶）：
+**缓存键设计**（三类缓存，均按 LLM 配置分桶；`gen_llm:*` 由 v2.23 / FEAT-11 引入）：
 
 ```
 # 生成结果缓存（pipeline_render 写入，TTL 90天）
@@ -471,9 +567,15 @@ gen:{llm_config_id}:{template_id}:{template_version}:{sha256(canonical_json(sort
 # 意图归一化缓存（pipeline_preview Step 2 写入，TTL 30天）
 intent_cache:{llm_config_id}:{intent_hash}
   value = JSON({template_id, params, confidence, params_fingerprint})
+
+# llm_direct 兜底缓存（POST /generate/llm-fallback 写入，TTL 7天，v2.23 / FEAT-11）
+gen_llm:{llm_config_id}:{sha256(canonical(intent + code_type + signals_sorted_by_name + clk + rst))}
+  value = LLM 生成的 SystemVerilog 代码字符串
 ```
 
 空 `llm_config_id` 用 `_` 占位（测试 mock / 早期未配置场景）。`params_hash` 拆出 `template_id` / `version` 单独是为了支持 `invalidate_template_cache(template_id)` 用 `gen:*:{template_id}:*` 通配跨所有配置桶精准失效。
+
+`gen_llm:*` 的 canonical 序列化由 `services/core/cache.py::_canonical_llm_direct_signature(intent, code_type, signals, clk, rst)` 实现，`signals` 列表按 `name` 字段排序后 JSON dumps（`ensure_ascii=False, separators=(',', ':')`），保证同一逻辑输入在 signal 列表顺序不同时仍命中同一键。TTL 短于 `gen:*` 的 90d 是因为 `llm_direct` 路径本身非确定性，缓存只是给"同一用户连续点几次 fallback 按钮"加速，长时间复用会让用户误以为得到了确定性输出。
 
 **缓存策略**：
 - 命中：直接返回，跳过检索+LLM+渲染全部环节，100% 确定性
@@ -482,7 +584,7 @@ intent_cache:{llm_config_id}:{intent_hash}
 - 失效原语：
   - `invalidate_template_cache(tid)` —— 单模板 Admin 改/停用后调用，跨所有配置桶
   - `invalidate_all_intent_cache()` —— `lib_manager.py import` 批量重导后调用（模板可能整体被替换）
-  - `invalidate_all_llm_caches()` —— Admin LLM 配置 CRUD / set-default 时全清两个前缀（不同 LLM 对同一意图可能返不同 `(template_id, params)`，复用旧缓存会让切换形同没切；分桶不是为了切换后保留旧缓存，而是支撑单模板/单意图维度的精准失效）
+  - `invalidate_all_llm_caches()` —— Admin LLM 配置 CRUD / set-default 时**全清三个前缀**（`gen:*` / `intent_cache:*` / `gen_llm:*`，v2.23 / FEAT-11 起含 `gen_llm:*`）；不同 LLM 对同一意图可能返不同 `(template_id, params)` 或不同 `llm_direct` 代码，复用旧缓存会让切换形同没切；分桶不是为了切换后保留旧缓存，而是支撑单模板/单意图维度的精准失效
 
 **Redis 内存配置**（写入 `docker-compose.yml` 的 Redis 服务 command）：
 ```
@@ -496,7 +598,10 @@ maxmemory-policy allkeys-lru
 ### 3.7 批量生成（Celery 异步任务）
 
 ```
-上传 Excel
+上传 Excel（POST /batch/upload + /batch/preflight 端点签名为 code_type: str | None = Form(None)；
+            v2.28 / FEAT-18 起前端不再传 code_type，端点缺省走 parse_excel_multisheet 多 sheet 解析路径；
+            显式传入 code_type 时保留旧 parse_excel 单 sheet 路径用于向后兼容；
+            多 sheet 路径下 BatchJob.code_type 写字面量 "mixed" sentinel（详 §3.9.2 / §5.1））
   ↓
 创建 BatchJob（PostgreSQL，status=pending）
   ↓
@@ -512,107 +617,107 @@ Celery Worker 并行处理（默认并发数 10，I/O密集型任务，通过 CE
 前端下载
 ```
 
+#### 3.7.1 模板下载端点（FEAT-16）
+
+批量生成的入口先于上传 Excel，需要用户拿到一份**符合系统格式约定**的空白模板。`GET /api/v1/batch/template`（详 §5.1）即为此而设，登录后所有角色均可访问，无 query 参数；响应是一个动态生成的 `.xlsx` 文件，`Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`，`Content-Disposition: attachment; filename=batch_template_YYYYMMDD.xlsx`（日期为请求当天 UTC）。本端点**无状态、无持久化**——不写库、不计数、不审计、不缓存，进程内每次按 registry 现状即时构造。
+
+构造逻辑落在 `backend/app/services/parser/template_writer.py::build_template_workbook(registry: CodeTypeRegistry) -> openpyxl.Workbook`，是一个纯 I/O 函数，不调 LLM、不读 Qdrant、不参与 §1.1 确定性契约。流程：
+
+```
+build_template_workbook(registry)
+  ↓
+for ct in registry.all():                              # 遍历已注册 code_type
+    ws = wb.create_sheet(ct.excel_sheet_name)          # sheet 名 ← code_type yaml
+    schema = registry.get_excel_schema(ct.id)          # 表头 ← schema yaml
+    写入 fields（跳过 output=true）                    # v2.30 / FEAT-19：仅 A/B/C 三列输出
+    首行加粗 + 居中 + 浅灰底（PatternFill D9D9D9）
+    第 2 行 B 列（column=2）写浅灰占位提示，A 列必须留空
+    （否则 excel_parser 会把占位文字当成一条 row_id 解析）
+    列宽 max(12, len(header) * 1.5)
+  ↓
+返回 openpyxl.Workbook（端点层 wb.save(BytesIO) → StreamingResponse）
+```
+
+关键解耦点：
+
+- **sheet 名 ← `data/code_types/*.yaml`**：assertion 对应 `SVA需求`、coverage 对应 `Coverage需求`，与 `excel_parser.py` 期望的 sheet 名严格一致；新增 code_type 时 yaml 落地后模板**自动**新增一个 sheet，`template_writer.py` 不动。
+- **表头 ← `data/schemas/*.yaml`**：列名与列绝对位置（`col` 字段，`A` / `B` / `C` …）从 schema 读取，跳过标注为 `output: true` 的"系统回填"列。**v2.30 / FEAT-19 起 schema `signals:` 键已置为 `null`**，`_collect_headers` 中原 `if signals:` 守卫自动跳过 signals 块展开逻辑——下载的模板只剩 A/B/C 三列用户表头，D/E/F 输出列因 `output=true` 不写出（仅在 schema 文档化输出契约）。列字母 → 1-based 列号映射由 `app.services.parser.utils.col_to_idx` 统一提供（`excel_parser.py` 解析层与 `template_writer.py` 写表头层共享 import），新 schema 与 `excel_parser.py` 解析层仍是**同一份 schema 的两端使用**，由此保证下载→填→上传的 3 列闭环兼容。
+- **路由顺序**：`batch.py` 中 `GET /{job_id}/...` 是参数化路由，`GET /template` 必须**先于**它们注册，否则 `template` 字面量会被当作 `job_id` 落入参数路由。
+- **auth**：依赖 `Depends(get_current_user)`，未携带 Bearer token 返 HTTP 401，权限粒度不细分到角色。
+- **依赖**：`openpyxl` 既有依赖（`excel_parser.py` 已用），无需新增 `requirements.txt` 行。
+
+回归契约：下载→上传闭环由 `backend/tests/test_batch_template_download.py::test_download_template_then_upload_roundtrip` 守护——`build_template_workbook()` 产物经 `BytesIO` 直接喂给 `excel_parser.parse_excel()` 必须无异常，且模板原样不修改（空数据行）走 `POST /api/v1/batch/preflight` 必须返 HTTP 200。该测试是 schema 演化（任何 `col` 字段顺序变化、`output` 标记变化、新增字段）的回归红线。
+
 ---
 
 ### 3.9 Excel 表格解析层
 
 > **架构说明**：`excel_parser.py` 是**纯通用解释器**，不含任何代码类型特定的列定义。每种代码类型的 Excel 列结构由独立 Schema YAML 文件描述（`data/schemas/sva_schema.yaml`、`data/schemas/coverage_schema.yaml`），解析器在运行时动态读取对应 Schema 完成解析。新增代码类型时只需添加 Schema YAML，无需修改 Python 代码。
 
+> **多 sheet 路径（v2.28 / FEAT-18）**：`parse_excel_multisheet(file_path: Path) -> list[ParsedRow]` 是批量入口的默认解析函数（`/batch/upload` 与 `/batch/preflight` 在 `code_type=None` 时调用）。流程：打开 workbook → 遍历 `get_registry().all()` 取每个 `ct.excel_sheet_name` → 若该 sheet 名出现在 `wb.sheetnames` 则复用现有单 sheet 解析逻辑产出 `ParsedRow` 列表并把 `row.code_type = ct.id` 标注回去 → 汇总所有非空结果按 sheet 顺序排列；不在 registry 中的 sheet 名（如用户额外加的 README sheet）**静默跳过**不报错。所有已注册 sheet 均无有效数据行时抛 `ValueError("no_valid_rows")`，由端点翻译为 HTTP 400 + `detail = {"type": "no_valid_rows", "message": "未检测到任何有效数据行…"}`，与其它 7 闸 detail 结构一致。`parse_excel(file_path, code_type)` 单 sheet 接口签名与行为完全不变，显式传入 `code_type` 时仍走旧路径——这是保留向后兼容的关键。`ParsedRow.code_type` 字段在 multisheet 路径下决定该行被路由到的 pipeline 上下文；下游 `tasks/batch_tasks.py` 逐行调 `pipeline_preview` / `run_pipeline` 时直接读 `row.code_type` 无须特殊处理（不引入任何新的 LLM 调用，不动 §1.1 确定性契约）。多 sheet 上传创建的 `BatchJob.code_type` 列写字面量 `"mixed"`（`MULTISHEET_CODE_TYPE_SENTINEL`），与单 sheet 上传写 `"assertion"` / `"coverage"` 区分。
+
 #### 3.9.1 两份输入表格规范
 
-平台接受两种固定格式的 Excel 文件（`.xlsx`），分别对应 SVA 断言需求和功能覆盖率需求。列定义分别存储于 `data/schemas/sva_schema.yaml` 和 `data/schemas/coverage_schema.yaml`，以下为 v1.0 列规范参考。
+平台接受两种固定格式的 Excel 文件（`.xlsx`），分别对应 SVA 断言需求和功能覆盖率需求。列定义分别存储于 `data/schemas/sva_schema.yaml` 和 `data/schemas/coverage_schema.yaml`。**v2.30 / FEAT-19 起** 两份 schema 均推倒重建为 3 个用户列 + 3 个系统输出列；旧 17/19 列结构不再使用，相关 `signals:` 块在 schema 中已置为 `null`。
 
 **SVA断言需求表列定义**（sheet名：`SVA需求`）：
 
-| 列索引 | 列名 | 数据类型 | 必填 | 枚举值 |
-|--------|------|---------|------|-------|
-| A | 编号 | 文本 | 是 | — |
-| B | 所属模块 | 文本 | 是 | — |
-| C | 时钟 | 文本 | 是 | — |
-| D | 复位信号 | 文本 | 是 | — |
-| E | 复位极性 | 枚举 | 是 | 高有效 / 低有效 |
-| F | 协议 | 枚举 | 否 | AXI4 / AHB / APB / 通用 |
-| G | 信号1名称 | 文本 | 是 | — |
-| H | 信号1位宽 | 整数 | 是 | — |
-| I | 信号1角色 | 枚举 | 是 | valid/ready/data/state/req/ack/start/end/enable/count/other |
-| J | 信号2名称 | 文本 | 否 | — |
-| K | 信号2位宽 | 整数 | 否 | — |
-| L | 信号2角色 | 枚举 | 否 | 同上 |
-| M | 信号3名称 | 文本 | 否 | — |
-| N | 信号3位宽 | 整数 | 否 | — |
-| O | 信号3角色 | 枚举 | 否 | 同上 |
-| P | 信号4名称 | 文本 | 否 | — |
-| Q | 信号4位宽 | 整数 | 否 | — |
-| R | 信号4角色 | 枚举 | 否 | 同上 |
-| S | 验证意图 | 长文本 | 是 | — |
-| T | 严重级别 | 枚举 | 否 | error / warning / info |
-| U | 备注 | 文本 | 否 | — |
-| V | **[输出]匹配模板** | 文本 | — | 系统回填 |
-| W | **[输出]置信度** | 数字 | — | 系统回填 |
-| X | **[输出]生成状态** | 枚举 | — | 已生成 / 需确认 / 需修改 |
+| 列索引 | 列名 | 数据类型 | 必填 | 输出列 | 枚举值 |
+|--------|------|---------|------|--------|-------|
+| A | 编号 | 文本 | 是 | ✗ | — |
+| B | 验证意图 | 长文本 | 是 | ✗ | — |
+| C | 备注 | 文本 | 否 | ✗ | — |
+| D | **[输出]匹配模板** | 文本 | — | ✓ | 系统回填 |
+| E | **[输出]置信度** | 数字 | — | ✓ | 系统回填 |
+| F | **[输出]生成状态** | 枚举 | — | ✓ | 已生成 / 需确认 / 需修改 |
 
 **功能覆盖率需求表列定义**（sheet名：`Coverage需求`）：
 
-| 列索引 | 列名 | 数据类型 | 必填 | 枚举值 |
-|--------|------|---------|------|-------|
-| A | 编号 | 文本 | 是 | — |
-| B | 所属模块 | 文本 | 是 | — |
-| C | 采样时钟 | 文本 | 是 | — |
-| D | 复位信号 | 文本 | 是 | — |
-| E | 复位极性 | 枚举 | 是 | 高有效 / 低有效 |
-| F | 覆盖类型 | 枚举 | 否 | 值覆盖 / 转移覆盖 / 交叉覆盖 |
-| G | 主信号名称 | 文本 | 是 | — |
-| H | 主信号位宽 | 整数 | 是 | — |
-| I | 主信号数据类型 | 枚举 | 是 | logic / uint / enum |
-| J | 交叉信号1名称 | 文本 | 否 | — |
-| K | 交叉信号1位宽 | 整数 | 否 | — |
-| L | 交叉信号1数据类型 | 枚举 | 否 | logic / uint / enum |
-| M | 交叉信号2名称 | 文本 | 否 | — |
-| N | 交叉信号2位宽 | 整数 | 否 | — |
-| O | 交叉信号2数据类型 | 枚举 | 否 | logic / uint / enum |
-| P | Bin提示 | 文本 | 否 | 如 `1,2,4,8,16` 或 `0-15,>15` |
-| Q | 采样条件 | 文本 | 否 | 如 `awvalid && awready` |
-| R | 覆盖意图 | 长文本 | 是 | — |
-| S | 备注 | 文本 | 否 | — |
-| T | **[输出]匹配模板** | 文本 | — | 系统回填 |
-| U | **[输出]置信度** | 数字 | — | 系统回填 |
-| V | **[输出]生成状态** | 枚举 | — | 已生成 / 需确认 / 需修改 |
+| 列索引 | 列名 | 数据类型 | 必填 | 输出列 | 枚举值 |
+|--------|------|---------|------|--------|-------|
+| A | 编号 | 文本 | 是 | ✗ | — |
+| B | 覆盖意图 | 长文本 | 是 | ✗ | — |
+| C | 备注 | 文本 | 否 | ✗ | — |
+| D | **[输出]匹配模板** | 文本 | — | ✓ | 系统回填 |
+| E | **[输出]置信度** | 数字 | — | ✓ | 系统回填 |
+| F | **[输出]生成状态** | 枚举 | — | ✓ | 已生成 / 需确认 / 需修改 |
+
+**ParsedRow 字段策略（v2.30 / FEAT-19）**：`excel_parser._parse_sheet` 不再从 Excel 读取 `module / clk / rst / rst_polarity / protocol / signals` 等 14~16 列字段，但 `ParsedRow` dataclass **保留这些字段名**并以 dataclass `field(default=...)` 落入硬编码默认值：`clk: str = "clk"`、`rst: str = "rst_n"`、`rst_polarity: str = "低有效"`、`module: str = ""`、`protocol: str | None = None`、`signals: list[SignalInfo] = field(default_factory=list)`。这样 `tasks/batch_tasks.py` 中对 `row.clk` / `row.rst` / `row.rst_polarity` / `row.protocol` / `row.signals` 的引用**零改动**（FEAT-18 定型的 batch_tasks 不动），pipeline 6 级回退在 step2/regex/signal_list/default 三个高置信源都拿不到信号名时使用上述默认值作为"用户没填"的兜底语义，与单条页表单留空的行为一致。`SignalInfo` dataclass 保留供 type hint 用，但 `signals` 实际永远是空 list。
+
+**输出列前移至 D/E/F（v2.30 / FEAT-19）**：旧 schema 中 `_out_template / _out_confidence / _out_status` 三个输出列位于 SVA V/W/X 列、Coverage T/U/V 列。新 3 列 schema 后前移至 D/E/F 共用列号。当前 `_write_result_zip`（[backend/app/tasks/batch_tasks.py](backend/app/tasks/batch_tasks.py)）只写 `results.json` + 单个 `.sv` 代码文件、**不写回 Excel**，因此输出列在模板里纯为占位字段标记 schema 输出契约，无实际写入路径；前移 D/E/F 安全且语义清晰，后续若实现 Excel 回填功能列号已对齐。
+
+**不兼容旧 17/19 列模板（v2.30 / FEAT-19）**：v3.6 (FEAT-18) 之前的 SVA 17 列 / Coverage 19 列 Excel 模板**不再向后兼容**，请用户重新通过 `GET /api/v1/batch/template`（§3.7.1）下载新模板。后端不实现运行时兼容转换层，原因：(1) 列错位的语义鉴别需要 LLM 介入，违反 §1.1 确定性契约；(2) 旧模板信号块字段（信号N名称/位宽/角色）在 pipeline 6 级回退下已可由默认值兜底，无功能性损失；(3) 强制下载新模板是更明确的设计契约边界。继续上传旧 17/19 列模板时 `parse_excel` **不会崩溃**——它会按新 3 列规范读 A/B/C 列，把旧 B 列"所属模块"内容当 intent 解析（旧 SVA 模板真实意图列在 S 列、旧 Coverage 模板在 R 列）。典型表现：top-1 模板匹配偏向"以模块名为主题"的无关模板，置信度 < 50%。**该行为是设计决策**，无运行时报错，仅由文档显式声明。
 
 #### 3.9.2 解析流程（完全确定性）
 
 ```python
-# 每行解析产出结构化对象，供 RAG 引擎和渲染引擎使用
-class ParsedSVARow:
-    row_id: str               # 编号
-    module: str               # 所属模块
-    clk: str                  # 时钟信号名
-    rst: str                  # 复位信号名
-    rst_polarity: str         # high_active / low_active
-    protocol: str | None      # 协议（可选）
-    signals: list[SignalInfo] # [{name, width, role}, ...]
-    intent: str               # 验证意图（驱动RAG）
-    severity: str             # error / warning / info
-
-class ParsedCoverageRow:
-    row_id: str
-    module: str
-    clk: str
-    rst: str
-    rst_polarity: str
-    cover_type: str | None         # 覆盖类型（辅助RAG过滤）
-    main_signal: SignalInfo        # 主信号
-    cross_signals: list[SignalInfo]# 交叉信号列表
-    bin_hint: str | None           # Bin提示
-    sample_condition: str | None   # 采样条件
-    intent: str                    # 覆盖意图（驱动RAG）
+# v2.30 / FEAT-19：ParsedRow 统一为单一 dataclass（不再按 code_type 分两种），
+# 三列从 Excel 读取，其余字段固定默认值，保持 batch_tasks.py 消费侧零改动
+@dataclass
+class ParsedRow:
+    row_id: str                                            # A 列：编号（必填）
+    code_type: str                                         # 由 sheet 名 → registry 反查得出
+    intent: str                                            # B 列：验证意图 / 覆盖意图（必填，驱动 RAG）
+    comment: str | None = None                             # C 列：备注（可选，pipeline 不消费）
+    # 以下 6 字段在 v3.6 之前由 Excel 列填写；v2.30 / FEAT-19 起一律取默认值，
+    # 与 PipelineInput 表单留空、pipeline 6 级回退兜底等价
+    module: str = ""
+    clk: str = "clk"
+    rst: str = "rst_n"
+    rst_polarity: str = "低有效"
+    protocol: str | None = None
+    signals: list[SignalInfo] = field(default_factory=list)
+    extra: dict = field(default_factory=dict)              # 历史 severity / cover_type 等字段流转位，新 schema 不再写入
 ```
 
 #### 3.9.3 信号角色直接参数填充
 
-RAG 检索并由 Claude 确认模板选择后，信号角色到模板参数的映射**直接由规则完成**，无需 LLM 二次推断：
+> **v2.30 / FEAT-19 起本节描述的"信号角色规则映射"已不在批量路径生效**——批量 Excel 不再要求用户填写信号角色表，`ParsedRow.signals` 恒为空 list，pipeline 6 级回退（step2 / regex / signal_list / default / semantic_fallback / placeholder）按默认值兜底。若 required 参数最终落在 `semantic_fallback` / `placeholder` 或 LLM trivial 值，由 under_specified 闸 422 拒绝（详见 §1.1 / pipeline `_detect_under_specified`）；这是设计折衷：批量场景下意图列承担全部信号语义，单条页 `/generate` 表单仍保留信号角色控件用于高精度场景。下述规则映射保留供历史参考与单条页流程读者建立心智模型用，**勿据此判断当前批量行为**。
+
+RAG 检索并由 Claude 确认模板选择后，单条页表单填写的信号角色到模板参数的映射**直接由规则完成**，无需 LLM 二次推断：
 
 ```
-ParsedRow.signals = [
+PipelineInput.signals = [   # 单条页表单 / v3.6 之前的批量 Excel
     {name: "awvalid", width: 1,  role: "valid"},
     {name: "awready", width: 1,  role: "ready"},
     {name: "awaddr",  width: 32, role: "data"},
@@ -770,49 +875,108 @@ Admin 提交编辑
 
 ### 3.10 模板贡献服务
 
-#### 3.10.1 贡献提交（v3.0 LLM 反推路径）
+#### 3.10.1 贡献提交（v3.1 双入口 + 3 分支并存）
 
-v3.0 把贡献向导简化为"用户只填 `name + code_type + description + 代码示例`"——v2 要求用户手填参数定义表 + Demo 编辑器里塞占位符（`{{ valid_sig }}` 等）的 Step 2/3 退役。后端由 `services/platform/parameter_extractor.py::derive_parameters_from_demo()` 调 `LLMClient.chat()` 反推 `parameter_defs` + Jinja2 化的 `template_body` + `keywords` + `subcategory` + `protocol`。
+v3.1 在 v3.0 LLM 反推路径基础上**进一步把必填字段从 4 件压到 2 件**（`original_intent + code_type`），新增预览端点供前端两步 Modal 使用；原 4 字段路径作为分支 3 完全向后兼容。
 
-**入口点**（v3.0）：(1) 批量生成结果列表低置信度（< 50%）行旁的「贡献新模板」按钮；(2) IntentBuilder 5 轮对话仍无候选高置信时自动展示的「贡献新模板」入口（详 §3.11.5）；(3) 顶部导航「我的贡献」页「+ 新贡献」直接入口。三条路径走同一 POST 端点。
+**入口点**（v3.1）：(1) 批量生成结果列表低置信度（< 50%）行旁的「贡献新模板」按钮；(2) GeneratePage 第五道闸 `no_matching_template` 直跳贡献页（`redirect_to=/contribute/new?description=...&code_type=...`）；(3) IntentBuilder 5 轮对话仍无候选高置信时自动展示的「贡献新模板」入口（详 §3.11.5）；(4) 顶部导航「我的贡献」页「+ 新贡献」直接入口。所有入口最终都进同一两步 Modal。
+
+**预览端点（FEAT-10 新增，不入库）**：
+
+```
+POST /api/v1/contributions/preview
+  ↓
+ContributionPreviewRequest Schema（Pydantic）
+  - 必填：original_intent (str, 1-4096), code_type (str)
+  ↓
+调 generate_from_intent(original_intent, code_type, llm)：
+  LLMClient.chat([{system: "你是 SV 模板生成专家 + 命名规范"},
+                  {user: <intent + code_type + contract>}])
+  → _extract_json_block：兼容 ```json``` 围栏抓首个 JSON 对象
+  → 4 道校验闸（任一失败抛 ContributionParseError → 422 contribution_parse_failed）：
+    ① _validate_template_name：匹配 ^(sva|cov)_[a-z][a-z0-9_]*_v\d+$
+      失败 → stage="template_name"
+    ② _validate_parameter_defs：name/type/required/description/expr_type 齐全；
+      name 是合法 SV 标识符；expr_type ∈ {sv_identifier, sv_identifier_list,
+      sv_boolean_expr, sv_bins_expr, integer, free_text}
+      失败 → stage ∈ {param_defs_shape, param_defs_empty, param_defs_name,
+      param_defs_expr_type}
+    ③ _validate_jinja_rendering：用占位值跑一次 SandboxedEnvironment +
+      StrictUndefined 渲染
+      失败 → stage ∈ {jinja_empty, jinja_syntax, jinja_sandbox (SSTI/不安全
+      操作), jinja_render (StrictUndefined / 参数引用失败)}
+    ④ _validate_keywords：必须是 list[str]，自动去重 / 过滤空串；非 list 即拒
+      失败 → stage="keywords_shape"
+  返回 ExtractedFull(template_name, description, demo_code, parameter_defs,
+                     jinja_body, keywords, subcategory, protocol)
+  ↓
+check_name_duplicate(extracted.template_name) → name_conflict: bool（非阻塞）
+  ↓
+返回 ContributionPreviewResponse(template_name, description, demo_code,
+                                  parameter_defs, keywords, name_conflict)
+```
+
+`demo_code` 回传 LLM 产出的**原始 SystemVerilog 代码**（含真实信号名 / 字面量），不暴露 `jinja_body`——`jinja_body` 在 submit 时由 `derive_parameters_from_demo` 用用户最终编辑过的 `demo_code` 重新生成，保证用户对代码的修改会被传递到模板体。
+
+**提交端点（3 分支并存，按顺序判断）**：
 
 ```
 POST /api/v1/contributions
   ↓
-ContributionCreate Schema 验证（Pydantic）
-  - 必填：name, code_type, description, demo_code
-  - 可选：parameter_defs（传则走旧路径，不调 LLM 反推；不传则走 v3.0 反推路径）
-  - description 非空校验（RAG 向量化依赖此字段）
+ContributionCreate Schema（Pydantic）
+  - 必填：original_intent (str, 1-4096), code_type
+  - 可选：template_name, description, demo_code, parameter_defs（v3.1 全部可选）
   ↓
-分支：
-  parameter_defs 已提供 → 沿用用户原 demo_code 作 template_body（旧路径，contributions.py 内部分支）
-  parameter_defs 未提供 → 调 derive_parameters_from_demo(demo_code, description, code_type)：
-      LLMClient.chat([{system: "你是 SV 模板反推专家"}, {user: <demo+description+contract>}])
-      → _extract_json_block：从 LLM 输出里抓第一个 JSON 对象（兼容 ```json``` 围栏）
-      → 三道校验闸（任一失败抛 ContributionParseError → 422 contribution_parse_failed，
-        前端弹"你的代码示例太复杂/有语法歧义/含太多边角逻辑"友好提示）：
-        ① _validate_parameter_defs：每项必须含 name/type/required/description/expr_type；
-          name 必须是合法 SV 标识符（无中文/无特殊字符）；expr_type 取值在
-          {sv_identifier, sv_identifier_list, sv_boolean_expr, sv_bins_expr, integer, free_text}；
-          required=True 项不能有 default 字段（语义冲突）
-        ② _validate_jinja_rendering：用所有参数的占位值（"<param>"）跑一次 Jinja2
-          StrictUndefined 渲染；语法错误 / 引用未声明变量 / 模板渲空 → 拒
-        ③ _validate_keywords：必须是 list[str]，每项非空、长度 ≤ 32、共 ≤ 10 个
-      返回 ExtractedTemplate(parameter_defs, jinja_body, keywords, subcategory, protocol)
+分支判定：need_llm_generate = not (template_name and demo_code)
+
+【分支 1 — intent-only 生成】（need_llm_generate=true）
+  调 generate_from_intent(original_intent, code_type, llm)，跑同样 4 道校验闸
+  final_template_name = payload.template_name or generated.template_name
+  final_description   = payload.description   or generated.description
+  final_user_demo     = payload.demo_code     or generated.demo_code
+  derived_param_defs  = generated.parameter_defs
+  derived_jinja_body  = generated.jinja_body  ← LLM 同时产出的 Jinja2 体
+  derived_keywords    = generated.keywords
+
+【分支 2 — v2 批量兼容】（need_llm_generate=false AND payload.parameter_defs 显式给出）
+  derived_param_defs = payload.parameter_defs（caller 已是结构化）
+  derived_jinja_body = payload.demo_code（caller 已是 Jinja2 体）
+  不调 LLM
+
+【分支 3 — v3.0 demo 反推】（need_llm_generate=false AND payload.parameter_defs 未给）
+  调 derive_parameters_from_demo(demo_code, description, code_type)
+  跑 3 道校验闸（参数命名 / Jinja2 沙箱 / keywords 形态）
   ↓
-dedup 预扫（v3.0）：调 check_semantic_duplicate(description, name, tags) 用 dense-only
-  余弦取 top-3 相似已入库模板，命中即写入 contribution.original_row_json["similar_templates"]
-  供审核员事后参考；check 失败（Qdrant 暂时不可达等）非阻塞，仅打 WARN 日志继续入队
+_validate_template_name(final_template_name)
+  分支 1 内 generate_from_intent 已校验，但分支 2/3 + 分支 1 中 payload.template_name 覆盖路径需补校验
+  失败 → 422 contribution_parse_failed(stage="template_name")
   ↓
-写入 template_contributions（status=pending_review，存反推/原始两份；
-  demo_code 字段填 LLM 反推 jinja_body，original_row_json 含用户原始 demo_code + similar_templates）
+check_name_duplicate(final_template_name) 命中 → 422 contribution_name_duplicate（阻塞）
   ↓
-返回 contribution_id + status
+dedup 预扫：check_semantic_duplicate(description, name) dense-only 取 top-3
+  命中即写入 contribution.original_row_json["similar_templates"]；
+  失败（Qdrant 暂时不可达等）非阻塞，仅打 WARN
+  ↓
+写入 template_contributions（status=pending_review）
+  - demo_code 字段填 derived_jinja_body（用户编辑过的 SV 代码经过 jinja 化）
+  - original_row_json["user_demo"] = final_user_demo（保留原始 SV 代码供审核员对比）
+  - original_row_json["similar_templates"] = dedup 预扫结果
+  ↓
+返回 ContributionOut（含 use_immediately_available: bool = True）
 ```
 
-整段同步耗时 5-15s（LLM 反推占主要）。审核员在 AdminContributionsPage 看到**三栏对照**：左栏用户原始 demo_code（只读）/ 中栏反推后的 jinja_body（Monaco 可改）/ 右栏反推后的 parameter_defs + keywords + subcategory + protocol（表单可改）+ 顶部横栏展示 dedup 预扫的 top-3 相似模板（≥ 0.90 黄色警告）；任意修改后批准走 §3.10.2 入库流水线（取审核员修改后的中右栏内容再跑一次 Jinja2 验证 + 向量化 + 写 Qdrant/PG）。
+整段同步耗时 5-15s（LLM 占主要）。审核员在 AdminContributionsPage 看到**三栏对照**：左栏用户原始 `original_row_json["user_demo"]`（只读）/ 中栏 `demo_code`（已 Jinja2 化，Monaco 可改）/ 右栏 `parameter_defs + keywords + subcategory + protocol`（表单可改）+ 顶部横栏展示 dedup 预扫的 top-3 相似模板（≥ 0.90 黄色警告）；任意修改后批准走 §3.10.2 入库流水线。
 
-重提流程：被请求修改的贡献，普通用户只能改 description + demo_code（左栏内容），重提会**重新跑一次 LLM 反推 + 三闸 + dedup 预扫**——审核员对中右栏的旧手改在重提后丢弃，避免新旧反推产物错配。
+**双层审核机制**：
+
+- **第一层（用户验证 LLM 输出）**：前端两步 Modal 的 Step 2 就是用户对 LLM 生成质量的把关——预览返回的 `template_name / description / demo_code` 三字段全部可在 Step 2 编辑后再提交；这是把"参数化脏活推给 LLM"后必须建立的反馈环
+- **第二层（管理员审批入库）**：与 §3.7.5 三栏审核完全一致，审核员独立判定质量并对中右栏改写后批准
+
+**「立即使用」路径（FEAT-10）**：Step 2 内点「立即使用」按钮 → 与「提交审核」走完全相同的 `POST /api/v1/contributions`（贡献仍以 `pending_review` 入审核队列），区别在前端**不关闭 Modal**，而是在 Step 2 页面内展示可复制代码框（`<pre>` monospace 块 + 「复制代码」按钮 + 提示文案"代码已就绪，可直接复制使用。模板已提交审核，审核通过后将加入模板库。"），用户可一键复制 LLM 生成的 SV 代码直接粘进设计。
+
+**不跳转 `/generate`**——刚提交的贡献处于 `pending_review` 不在 Qdrant 中，若跳过去走 pipeline 仍会触发第五道闸 `no_matching_template` 进入死循环；在 Step 2 内展示代码框是 FEAT-10 spec §5（"立即使用"方案 A）确定的方案，最简单且无副作用。
+
+重提流程：被请求修改的贡献，普通用户在两步 Modal 中改 `original_intent + code_type` 重新走预览/编辑流程，重提会**重新跑一次 LLM 生成 + 4 闸 + dedup 预扫**——审核员对中右栏的旧手改在重提后丢弃，避免新旧产物错配。
 
 #### 3.10.2 批准入库流水线
 
@@ -884,7 +1048,8 @@ backend/app/
 │   └── contributions.py         # 贡献者端点（提交/查看/修改）及管理员审核端点（合并单文件）
 └── services/platform/
     ├── contribution_service.py  # 贡献入库流水线（调用 create_template()）
-    └── parameter_extractor.py   # v3.0 LLM 反推 parameter_defs + Jinja2 template_body（调 LLMClient.chat）
+    ├── parameter_extractor.py   # v3.0 LLM 反推 parameter_defs + Jinja2 template_body（调 LLMClient.chat）
+    └── corpus_service.py        # FEAT-4 三层模板选择质量保障（语料生成 / 冲突检测 / LLM 根因分析）
 ```
 
 > **注**：贡献者端点与管理员审核端点合并在同一 `contributions.py` 文件中，通过 `require_role` 依赖注入区分权限。所有表结构均在 `migrations/versions/001_initial_schema.py` 初始迁移中统一建立。
@@ -1078,6 +1243,10 @@ services/llm/
 │   ├── chat(messages, max_tokens=1024, temperature=None) → str    # v3.0 通用多轮接口
 │   │   供 IntentBuilder 与贡献机制 LLM 反推共用；messages 与 OpenAI/Anthropic SDK
 │   │   原生格式一致（role: system/user/assistant），默认不打 thinking 开关
+│   ├── generate_code_freeform(intent, code_type, signals, clk, rst)
+│   │   → str  # v2.23 / FEAT-11 Stage 2：llm_direct 兜底自由生成 SystemVerilog
+│   │   prompt 强制单 ```systemverilog/sv/verilog``` 围栏；prose-only 响应抛
+│   │   ValueError("no_sv_code_block") 让端点翻译为 HTTP 422 llm_direct_no_code
 │   └── test_basic() → str                   # 连通性自检
 ├── anthropic_client.py       # Anthropic 原生 SDK 实现（tool_calling 单步返回）
 ├── openai_compat_client.py   # openai SDK + base_url 实现（两步纯文本，见下）
@@ -1091,8 +1260,9 @@ services/llm/
 | 调用 | `extra_body` | `max_tokens` | 说明 |
 |------|--------------|--------------|------|
 | `normalize_intent` | `{"thinking":{"type":"disabled"}}`（硬编码） | 512 | 句式改写，无需 chain-of-thought |
-| `_step1_select_id` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 仅返回候选列表中的 template_id；选错由 pipeline.py 的 RAG fallback 兜底 |
+| `_step1_select_id` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 仅返回候选列表中的 template_id 或字符串 `"none"`；系统提示含负向选择准则（FIX-8）——核心验证语义不匹配时禁止信号名重映射强行适配，必须返 `"none"` 让 pipeline 走 rag_fallback → 第五道闸（详见 §3.15.3 Step 5a）。**输入候选采用 XML `<candidate id="..." name="...">` 标签（v2.26 / FEAT-14）**；系统提示措辞为"返回 `<candidate>` 标签的 id 属性值，或 none"。解析层在精确 id 匹配失败后兼容数字序号兜底：raw 响应是纯数字 N（允许前后空白 / 尾部句号 / 引号包裹）且 `1 ≤ N ≤ len(candidates)` 时，映射到 `candidates[N-1]['template_id']`，`confidence_source` 保持 `llm_step1`，下游 `no_matching_template` 闸不触发；`N=0` 或 `N > len(candidates)` 走原 fallback |
 | `_step2_fill_params` | 由 `llm_configs.step2_disable_thinking` 运行时切换 | 2048（off）/ 1024（on） | 仅针对所选模板的 required 参数生成 JSON；prompt 注入示例输出，正则提取响应中第一个 JSON 对象（兼容 ` ```json``` ` 围栏） |
+| `generate_code_freeform`（v2.23 / FEAT-11） | `{"thinking":{"type":"disabled"}}`（硬编码） | 2048 | `llm_direct` 兜底完整代码生成；prompt 注入 `intent + code_type + signals + clk + rst` 并强制单 ` ```systemverilog/sv/verilog``` ` 围栏，正则提取首块。**理由**：自由生成已经够大不再额外开 thinking，且与 normalize / step1 一致禁 thinking 保稳定延迟；输出 token 较多（一段完整 SVA / coverage 代码），`max_tokens=2048` 与 step2 off-thinking 同档 |
 | `test_basic` | `{"thinking":{"type":"disabled"}}`（硬编码） | 64 | 连通性自检 |
 
 `_step2_fill_params` 的两档配置：
@@ -1376,25 +1546,55 @@ Step 2: IntentCacheLookup
   未命中 → 进入 Step 3
 
 Step 0a (preview 前置)：off-topic dense 闸（详见 §1.1）
-  dense_top1_score(original_intent, code_type) < OFFTOPIC_DENSE_THRESHOLD
-    → 抛 OffTopicIntentError → 端点映射 HTTP 422（redirect_to=None）
+  v2.27 / FEAT-15 起判定基准升级：
+    selected_dense = dense_top1_score(original_intent, code_type=inp.code_type)
+    cross_scores = _compute_cross_code_type_scores(
+                       original_intent, inp.code_type, selected_dense)
+        → 返回 {code_type_id: dense_top1_score} 全量字典（含 selected 自身），
+          供 Step 0a / Step 0b 共用同一份扫描结果不重复 embedding
+    best_other_id, best_other_score = max(
+        ((ct, s) for ct, s in cross_scores.items() if ct != inp.code_type),
+        key=lambda x: x[1], default=(None, -1.0))
+        → 哨兵 (None, -1.0)：registry 只有一个 code_type 时取不到"非选中"项，
+          best_overall 自然退化为 selected_dense（max 不会选到 -1.0）
+    best_overall = max(selected_dense, best_other_score)
+    best_overall < OFFTOPIC_DENSE_THRESHOLD
+      → 抛 OffTopicIntentError(top_dense_score=best_overall, threshold=...)
+        → 端点映射 HTTP 422（redirect_to=None）
+        → top_dense_score 字段语义自此为"全 code_type 库最高分"，与前端 Modal
+          "输入与模板库的最高相似度低于阈值" 文案语义对齐
+  日志格式：[Gate] offtopic selected_dense=... best_other_id=... best_other_score=...
+            best_overall=... threshold=...
+  注（v2.25 / FEAT-13）：dense_top1_score 内部 Qdrant 查询 Filter 已带上
+    maturity_level='production'，top-1 只在 production 子集计算；过滤后子集
+    与全量分布若有显著差异，OFFTOPIC_DENSE_THRESHOLD 可能需重新校准
+    （`backend/scripts/calibrate_offtopic_threshold.py`）。
 
 Step 0b (preview 前置, off-topic 通过后)：code_type_mismatch 闸
   当 OFFTOPIC_GATE_ENABLED && CODE_TYPE_MISMATCH_GATE_ENABLED 时启用。
-  _detect_code_type_mismatch(original_intent, current_code_type, current_score,
-                              margin=CODE_TYPE_MISMATCH_MARGIN)：
-    对所有 registry 注册的 code_type 逐一算 dense top-1，
-    若某非当前 code_type 的得分 - 当前得分 ≥ margin（默认 0.10）→ 抛
-    CodeTypeMismatchError → 端点映射 HTTP 422（redirect_to=None，
-    前端在原页面 Modal 引导切换 code_type）
+  v2.27 / FEAT-15 起判定升级（与 Step 0a 共享 cross_scores 字典）：
+    best_other_id is not None
+      AND gap = best_other_score - selected_dense >= CODE_TYPE_MISMATCH_MARGIN
+      AND best_other_score >= OFFTOPIC_DENSE_THRESHOLD     ← 新增前置条件
+      → 抛 CodeTypeMismatchError(selected_code_type, suggested_code_type=best_other_id,
+                                  selected_score=selected_dense,
+                                  suggested_score=best_other_score)
+        → 端点映射 HTTP 422（redirect_to=None，前端在原页面 Modal 引导切换 code_type）
+    第二前提避免全库低分场景（如 selected=0.30 / best_other=0.42 / gap=0.12 >= margin
+      但 best_other 自身没"有把握"，全库实际仍属离域）仍弹"选错类型"误导用户。
+    旧 _detect_code_type_mismatch 函数被内联删除（全 codebase grep 无外部调用），
+    Step 0b 直调 _compute_cross_code_type_scores 共享 Step 0a 的扫描。
   无显著更优 code_type → 进入 Step 3
 
 Step 3+4: Embed + RAGRetrieve
   rag_retrieve(normalized_intent, db, code_type)
-  Stage1 Qdrant 混合检索（dense+sparse RRF，code_type 过滤）
+  Stage1 Qdrant 混合检索（dense+sparse RRF，code_type 过滤 + maturity_level='production' 过滤，v2.25 / FEAT-13）
   Stage2 ColBERT MaxSim 精排（注：当前实际 bypass——main.py:_init_qdrant_collection 只 provisions
-    dense+sparse 命名向量，stage1 读 r.vector.get("colbert") 永远为 None，stage2 见 None 透传 RRF 分数）
+    dense+sparse 命名向量，stage1 读 r.vector.get("colbert") 永远为 None，stage2 见 None 透传 RRF 分数；
+    v2.25 / FEAT-13 起 stage1 已保证输入仅含 production 模板，stage2 无需独立 maturity Filter）
   Stage3 bge-reranker 精排
+  engine.py DB 二次过滤：select Template where id in template_ids and is_active==True
+    AND Template.maturity_level=='production'（v2.25 / FEAT-13，双重防御）
   对返回结果按 template_id 去重（Qdrant 可能返回同一模板的多个 point）
   进入 Step 4b（关键词补充召回）
 
@@ -1414,7 +1614,81 @@ Step 5a: TemplateSelect（LLM Step1）
   → 内部依次调用 _step1_select_id（选模板 ID）+ _step2_fill_params（填参数）
   返回 TemplateSelectionOutput(template_id, param_mapping, confidence)
   若 template_id 为空 / "none" / 不在候选 → 退化为 rag_candidates[0]
-    （此时 confidence 重写为该候选的 RAG 分数）
+    （此时 confidence 重写为该候选的 RAG 分数，confidence_source = "rag_fallback"）
+
+  【候选渲染（v2.21 A4 → v2.26 FEAT-14 XML 化）】_step1_select_id 的 candidates_text
+  由单行串接改为多行块；description 截断 60 → 1000 char（lib_manager.py import 时已把
+  differentiators / non_use_cases 拼到 description 末尾形成"区别要点："/"不适用场景："
+  两段，合成总长实测最长 812 char，截断设到 1000 留余量避免 non_use_cases 末项被切；
+  review NEW-1 后由 spec 中的 300 改为当前值）。`max_tokens=64` **保持不变**（输出仅
+  ~10 token 的 template_id，仅 input 侧扩容；GLM-4.7 实测 step1 延迟增幅 < 1s）。
+  系统提示新增提示语"候选描述末尾可能附『区别要点』/『不适用场景』段，请优先用于
+  区分判断"。此项仅影响 openai_compat_client；anthropic_client 的 select_template
+  候选渲染保持不变。
+
+  **v2.26 / FEAT-14 候选渲染由 Markdown 编号块改为 XML `<candidate>` 标签**——示例：
+
+  ```
+  <candidate id="sva_handshake_timeout_v1" name="握手超时检测">
+  描述：valid 拉高后 N 周期内 ready 必须响应，否则触发超时断言。区别要点：……
+  </candidate>
+  <candidate id="sva_stability_v1" name="信号稳定性">
+  描述：信号在使能窗口内保持稳定……
+  </candidate>
+  ```
+
+  目的：从视觉上**消除序号**（Markdown 块的 `### N.` 前缀会让 LLM 学到"返序号也行"
+  的习惯，使其偶发返回 `'3'` 而非 `template_id`，pipeline 解析层不认导致正确候选被丢弃
+  → `rag_fallback` → `no_matching_template` 闸误触发）。系统提示中"只返回 template_id
+  或 none"措辞同步为"返回 `<candidate>` 标签的 id 属性值，或 none"。
+
+  **解析层数字序号兜底（v2.26 / FEAT-14 安全网）**：尽管 XML 化已从视觉上消除编号
+  心智，`_step1_select_id` 解析层仍在精确 id 匹配失败后检查 raw 是否为合法序号 N
+  （允许前后空白 / 尾部句号 / 引号包裹）。若 `1 ≤ N ≤ len(candidates)`，
+  兜底映射 `candidates[N-1]['template_id']` 并打印日志
+  `[GLM Step1] raw was integer N → resolved to <template_id>`，`confidence_source`
+  保持 `llm_step1`（不退化为 `rag_fallback`），下游 `no_matching_template` 闸不触发；
+  `N=0` 或 `N > len(candidates)` 沿原 fallback 路径返 `""`。`anthropic_client.py::
+  select_template` 在 tool calling 返回的 `template_id` 不在候选列表时同步追加同一
+  数字兜底，tool schema 不改。
+
+  【负向选择准则（FIX-8）】_step1_select_id 与 anthropic_client.select_template 的系统提示
+  显式约束：当候选模板的**核心验证语义**与用户意图不匹配（例如意图是"两信号互斥 /
+  one-hot / 竞争检测"，但候选均为握手 / 稳定性 / 延迟 / FSM / 值域），
+  禁止通过将用户信号名重命名为模板参数名（如 cpu_req/dma_req → valid/ready）
+  来强行匹配；此类场景必须返回字符串 "none"（Anthropic 路径在 tool_choice 强制调用下
+  于 template_id 字段填 "none"），交由本层 rag_fallback 路径继续走第五道闸
+  （pipeline.py NoMatchingTemplateError，post-Step 5a 闸：LLM step1 返回 none
+  即触发，score 值记入日志供监控 → HTTP 422
+  no_matching_template + detail.redirect_to=/contribute/new?...）。
+  即：模板覆盖空白由"贡献页"修复，不由 LLM 在 step1 强行掩盖。
+
+  【A8 step1 二次验证（v2.21）】当 confidence_source == "llm_step1" 且
+  settings.step1_verify_enabled == True 时，pipeline 调用
+  llm.verify_step1_selection(normalized_intent, selected_template_id, candidates)
+  发一条 yes/no 问询确认核心验证语义是否一致。LLM 答 "no" → 把 confidence_source
+  降级为 "rag_fallback" 并把 template 置空，让后续 fallback 链按 rag_fallback 走
+  RAG top-1，可被第五道闸 NoMatchingTemplateError 接管。fail-open 原则：LLM 调用
+  失败 / 解析失败 / first-token 非 "no" 一律视为通过——避免新加这条验证反成误拒来源。
+  STEP1_VERIFY_ENABLED **默认 False**：开启前需用 confusion corpus 的 real-llm 套件
+  评估 false-negative 率。keyword_supplement 路径不验（已经是补救路径，不再加压）。
+  LLM 调用参数：max_tokens=16 / temperature=0 / thinking=disabled。
+
+  【A9 reranker score gate（v2.21，pipeline 层独立 gate）】A8 验证通过后再查
+  selection.template_id 在 rag_candidates 中的 score 字段（即 stage3 reranker score，
+  由 services/rag/engine.py enriched 写入）：若 selected_score < settings.
+  reranker_min_score_threshold（默认 0.30 经验占位值）且 settings.
+  step1_reranker_gate_enabled == True → 抛 NoMatchingTemplateError(top_score=
+  selected_score)，直跳贡献页。STEP1_RERANKER_GATE_ENABLED **默认 False**：开启前需
+  跑 scripts/calibrate_reranker_threshold.py 在 selection + confusion corpus 上标定
+  correct_p10 / wrong_p50 中点写入 reranker_min_score_threshold；未标定就上生产会
+  误拒 marginal 真请求。
+
+  【A9 与 FIX-9 移除的 no_match_score_threshold 的语义区分】FIX-9 拦的是 RAG **top-1**
+  score（"top-1 分数低就整体否决 LLM 决策"），cross-encoder 词汇重叠会让无关握手模板
+  拿 1.0 分把 LLM 正确的 none 判断否决，已经移除；A9 拦的是"LLM **选中** 的那个
+  template_id"的 reranker score，是 LLM 决策 + reranker 复核的双信号互证，触发条件
+  更稀少且方向更精确。no_match_score_threshold 字段保留供日志/监控，**不参与**触发判定。
 
 Step 5b: GenerationCacheLookup
   从意图正则提取 + LLM param_mapping 合并后查 get_generation_cache
@@ -1452,6 +1726,17 @@ Step 8: CacheWrite
 **置信度记录**：合并 LLM/RAG 结果时按来源分别记录真实分数 (`confidence_source ∈ {llm_step1, rag_fallback, keyword_supplement, intent_cache}`)。
 
 **Env 关闸**：`UNDER_SPECIFIED_GATE_ENABLED=false` 临时退回到 v2.12 之前的"始终产出"行为，仅用于线上误拦应急。
+
+**Step 8a：高置信 RAG 自动 quick_render（v2.23 / FEAT-11 A 子项）**：
+
+`pipeline_preview` 在 `_detect_under_specified` 通过后、构造 `PreviewResult` 之前，调用 `_is_high_confidence_rag(confidence_source: str, verify_ok: bool | None, selected_score: float | None, params_with_source: dict[str, dict], settings) -> bool` 判定是否四条件齐绿：
+
+1. `result.confidence_source == "llm_step1"`（LLM 主动选中模板，未走 `rag_fallback`/`keyword_supplement`/`intent_cache`）
+2. `settings.step1_verify_enabled == True` AND `verify_ok == True`（A8 二次验证通过；A8 disabled 时 `verify_ok=None` 视为不达标，保守不自动 render）
+3. `selected_score >= settings.reranker_min_score_threshold`（默认 0.30；`selected_score` 已在 Step 5a A9 gate 阶段无条件计算并向下游透传，与 A9 共用同一份值）
+4. `all(p["source"] in {"llm", "regex", "signal_list", "default"} for p in params_with_source.values())`（不含 `semantic_fallback` / `placeholder`，与 under_specified 闸的低置信源集合互补）
+
+四条件齐绿 → `PreviewResult.quick_render=True`，与 intent_cache 命中走的 `quick_render=True` 用同一面板旗标，前端 `GeneratePage.handlePreviewSuccess` 透明承接（已有逻辑：`if (res.quick_render) → callRender()`）。任一条件不达标即保留默认 `quick_render=False`（ConfirmationPanel 流程，无回归）。日志格式：`[Pipeline] high_confidence_rag: tid=<id> score=<x.xxxx> → quick_render=True`。本判定不引入新 env 关闸——直接受 `STEP1_VERIFY_ENABLED` 与 `STEP1_RERANKER_GATE_ENABLED` 控制（两者关闭时条件 2/3 自然不成立，行为退回 ConfirmationPanel）。
 
 #### 3.15.4 端点层变薄
 
@@ -1497,7 +1782,240 @@ backend/app/services/core/
 - **validation_error** → 红色错误条 + 错误原文（来自 expr_validator）
 - **候选模板切换**：`rag_candidates[]` 每项含 `parameters` 子段，用户切换候选时前端直接套用对应模板的参数预填，无需再调后端
 
-**quick_render 短路**：意图缓存命中时 preview 返回 `quick_render=true`，前端跳过确认面板直接调 `/render` 输出代码；其余情况一律展示确认面板，用户编辑后再调 `/render`。
+**quick_render 短路**（两条来源）：
+1. **意图缓存命中**（v2.13 起）：preview 返回 `quick_render=true`，前端跳过确认面板直接调 `/render` 输出代码
+2. **高置信 RAG 自动渲染**（v2.23 / FEAT-11 A）：preview 满足四条件齐绿（详 §3.15.3 Step 8a）时同样 `quick_render=true`；前端逻辑透明承接——`handlePreviewSuccess` 不区分来源，只看旗标。两种来源的差异仅在 `confidence_source` 字段（`intent_cache` vs `llm_step1`）与对应的置信徽标颜色
+
+其余情况一律展示确认面板，用户编辑后再调 `/render`。
+
+**LLM 直接生成兜底按钮（v2.23 / FEAT-11 B）**：result 阶段在代码卡片下方展示「对生成结果不满意？尝试 LLM 直接生成」secondary 按钮，**仅在 `state.result.generation_mode === 'rag'` 时显示**——已经是 `llm_direct` 的记录不再展示按钮（前端守门，禁止链式 fallback；后端再次防御于 §3.17）。点击 → 调 `generateApi.llmFallback(recordId)` → spinner → 收到新 record 后替换代码区 + `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>` + 反馈状态归零。详 §3.17。
+
+---
+
+### 3.17 LLM 直接生成兜底路径（FEAT-11 Stage 2）
+
+#### 3.17.1 设计动机
+
+§1.1 确定性契约把"系统总能产出代码"约束到 `rag` 路径——库内有可用模板时按确定性流水线产出 SVA / coverage 代码。但库覆盖度不可能 100%：意图通过五道闸（off-topic / code_type_mismatch / no_matching_template / under_specified / empty_retrieval）后仍可能因 RAG top-1 与意图实际语义偏差而产出"看似合理但用户不满意"的代码。v2.22 之前用户除了"重写意图 + 重新走流水线"没有自助路径，体验断裂。
+
+FEAT-11 Stage 2 引入 `llm_direct` 兜底路径：用户对 `rag` 结果不满意时一键触发 LLM 自由生成。该路径放弃确定性、放弃模板复用、放弃 Jinja2 渲染，**用 LLM 的语义理解能力换更贴合意图的代码**，代价是 (1) 同一输入可能产出不同代码 (2) 不参与模板库知识沉淀 (3) 无法做严格的语法 / 结构 校验。该取舍由用户在 result 阶段显式触发，前端 UI 与后端 record 双重打标提醒。
+
+#### 3.17.2 端点契约
+
+```
+POST /api/v1/generate/llm-fallback
+Authorization: Bearer <jwt>
+Content-Type: application/json
+{
+  "generation_record_id": "<source RAG record uuid>"
+}
+
+→ HTTP 200
+{
+  "code": "<完整 SystemVerilog 代码>",
+  "generation_record_id": "<新建的 llm_direct child record uuid>",
+  "generation_mode": "llm_direct",
+  "cache_hit": false | true
+}
+```
+
+**5 类错误响应**（由端点独立返回，不参与五道闸 except 链）：
+
+| HTTP | `detail.type` | 触发条件 |
+|---|---|---|
+| 404 | —（详 §3.17.2 注 1） | `generation_record_id` 在 DB 中不存在或不属于当前用户；`detail` 是纯字符串 `"源生成记录不存在"`，不带结构化 `type` 字段 |
+| 422 | `llm_direct_chained_not_allowed` | 源记录 `generation_mode == 'llm_direct'`——禁止 `llm_direct → llm_direct` 累积漂移 |
+| 422 | `llm_direct_no_code` | `LLMClient.generate_code_freeform` 抛 `ValueError("no_sv_code_block")`（LLM 返纯文字无 ` ```systemverilog/sv/verilog``` ` 围栏） |
+| 422 | `llm_direct_internal_error` | 非 `no_sv_code_block` 类 `ValueError`（LLM 返回结构异常 / Pydantic 校验失败等）；`detail.message` 是固定文案，**不**回写 `str(e)` / `type(e).__name__`，避免泄漏内部 repr |
+| 500 | `llm_direct_internal_error` | `except Exception` 兜底（非 ValueError：DB 写入失败 / 网络超时 / LLM SDK 内部错误等）；与 422 同名 `type`，靠 HTTP 状态区分语义——422 = LLM 输出可解析但内容异常（用户重试可能解决），500 = 平台基础设施失败（用户重试可能仍败，需 SRE 介入） |
+
+#### 3.17.3 端点流程
+
+```
+1. db.get(GenerationRecord, generation_record_id) → 不存在 → 404
+2. record.generation_mode == 'llm_direct' → 422 chained_not_allowed（前端已守门，本步是 API 直调防线）
+3. signature = canonical(record.original_intent + code_type + record.params_used.signals + clk + rst)
+4. cached_code = await get_llm_direct_cache(signature, llm_config_id)
+   命中 → 跳到 step 6 with cache_hit=True
+5. miss → code = await llm.generate_code_freeform(intent, code_type, signals, clk, rst)
+   ValueError("no_sv_code_block") → 422 llm_direct_no_code
+   其他 ValueError → 422 llm_direct_internal_error（结构化 detail，不泄漏 repr）
+   await set_llm_direct_cache(signature, llm_config_id, code, ttl=7d)
+6. 新建 GenerationRecord:
+     user_id = current_user.id
+     original_intent = source.original_intent
+     code_type = source.code_type
+     template_id = None
+     output_code = code
+     confidence = None
+     cache_hit = cache_hit_from_step4
+     intent_cache_hit = False
+     generation_mode = 'llm_direct'
+     parent_record_id = source.id
+     created_at = now()
+7. db.commit() → 返 200 {code, generation_record_id=new.id, generation_mode, cache_hit}
+```
+
+源 record 的 `clk` / `rst` 通过 `params_used` JSONB 字段反序列化获得（pipeline_render 写入时已固化，缺则回落到 `"clk"` / `"rst_n"` 默认值）。`signals` 不在 `GenerationRecord` 落盘——`generate_code_freeform` 不强依赖结构化信号列表，prompt 会从 intent 文本直接提取，所以端点向 LLM 调用恒传 `signals=[]`（让 `build_freeform_prompt` 走"未提供信号列表"分支）。`code_type` 唯一可信来源是 `source.template_id` → `templates.code_type`；模板缺失（理论上 RAG 路径不应发生）回落 `"assertion"` 并打 WARN 日志。
+
+#### 3.17.4 缓存与 invalidation
+
+- 键结构：`gen_llm:{llm_config_id}:{sha256(canonical(intent + code_type + signals_sorted_by_name + clk + rst))}`
+- TTL：7 天（详 §3.6 缓存层；理由：`llm_direct` 路径本身非确定性，缓存只是给"同一用户连续点几次 fallback 按钮"加速，长时间复用会让用户误以为得到了确定性输出）
+- canonical：`services/core/cache.py::_canonical_llm_direct_signature` 把 `signals` 列表按 `name` 字段排序后做 JSON dumps（`ensure_ascii=False, separators=(',', ':')`），保证 signal 顺序无关
+- invalidation：`invalidate_all_llm_caches()` 在 admin LLM 配置 CRUD / set-default 时 scan-delete `gen_llm:*` 与 `gen:*` / `intent_cache:*` 同步清空（详 §3.12.6）
+
+#### 3.17.5 DB schema 与回链契约
+
+`generation_records` 表（v2.22 起含 `generation_mode` 列）在 migration 007 追加 `parent_record_id` FK：
+
+| 字段 | 类型 | 说明 |
+|---|---|---|
+| parent_record_id | VARCHAR(36) NULLABLE FK → generation_records.id | `ondelete=SET NULL`；仅 `generation_mode='llm_direct'` 的记录会有非 None 值，`'rag'` 默认 NULL |
+
+`ondelete=SET NULL` 而非 `CASCADE` / `RESTRICT` 的设计：源 RAG 记录被 admin 删除时（如批量清理误测数据）保留 `llm_direct` 子记录与其反馈数据——子记录的 `feedback_rating` / `output_code` 仍是有意义的质量信号，不应级联消失；FK 清空后子记录 `parent_record_id IS NULL` 仅意味着"无法追溯触发源"，不影响 analytics 聚合（`feedback-summary` / `template-issues` 不依赖 FK）。
+
+#### 3.17.6 非确定性标签三处同步契约
+
+| 位置 | 写入 | 读出 |
+|---|---|---|
+| 后端记录层 | `GenerationRecord.generation_mode='llm_direct'` + `parent_record_id` FK | admin analytics 4 个端点的 `generation_mode` query filter |
+| API 响应层 | `POST /generate/llm-fallback` 响应 `generation_mode: "llm_direct"` 字段；`POST /generate/render`（RAG）响应 `generation_mode: "rag"` 字段 | 前端 `state.result.generation_mode` 初始化与切换 |
+| 前端 UI 层 | result 阶段代码卡片头部 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>` | 用户视觉感知；同时按 `generation_mode === 'rag'` 决定是否显示 LLM fallback 按钮 |
+
+三处任何一处缺打标签都是 bug——回归测试 `tests/test_llm_direct_generation.py` 与 `tests/test_pipeline_preview_render.py` 同时守护"`generation_mode` 字段在响应体存在 + 值正确"两条不变量。
+
+#### 3.17.7 服务层实现位置
+
+```
+backend/app/api/v1/generate.py                 # POST /generate/llm-fallback 端点 +
+                                                 5 道闸 catch 链（独立路径，不与五闸合并）
+backend/app/services/llm/base.py               # LLMClient.generate_code_freeform 抽象方法 +
+                                                 build_freeform_prompt / extract_sv_code_block helper
+backend/app/services/llm/anthropic_client.py   # native messages API 实现
+backend/app/services/llm/openai_compat_client.py # chat.completions + 围栏正则提取，
+                                                 硬编码 thinking=disabled / max_tokens=2048
+backend/app/services/core/cache.py             # get_llm_direct_cache / set_llm_direct_cache /
+                                                 _canonical_llm_direct_signature 三函数
+backend/app/models/generation_record.py        # parent_record_id Mapped 列声明
+backend/migrations/versions/007_llm_direct_parent_fk.py  # ALTER TABLE ADD COLUMN + FK
+backend/tests/test_llm_direct_generation.py    # 端点级集成测试（mock LLM/DB/Redis）
+backend/tests/test_llm_freeform_client.py      # 围栏 lang 兼容 + prose 拒绝单测（mock LLM 不依赖活基础设施）
+frontend/src/api/generate.ts                   # llmFallback API + GenerationMode 类型
+frontend/src/pages/Generate/GeneratePage.tsx   # result 阶段 fallback 按钮 + Tag 渲染
+```
+
+#### 3.17.8 与 5 道闸的关系
+
+5 道闸（OffTopic / CodeTypeMismatch / UnderSpecified / NoMatchingTemplate / EmptyRetrieval）仅守 `pipeline_preview` 路径（即 RAG 链路）。`POST /generate/llm-fallback` **绕过五闸**：它的输入是已经通过五闸的 `rag` record 的 `original_intent` / `code_type` / `signals` / `clk` / `rst`，意图本身一定是域内（否则源 record 不会存在）。这是 v2.15 引入 off-topic 闸时的隐含前提，本路径继续遵循。
+
+`llm_direct` 路径自身的失败（无围栏 / LLM 调不通 / DB 写不进）由 §3.17.2 的三类 422 错误处理，不复用五闸的 detail.type。
+
+---
+
+### 3.18 用户对比报告路径（FEAT-12）
+
+#### 3.18.1 设计动机
+
+§3.17 引入 `llm_direct` 兜底后，用户能在 `rag` 不满意时一键拿到 LLM 自由生成的代码。但平台缺少一条**结构化采集"哪些 RAG vs LLM 直接生成的差异值得 admin 关注"**的通道：§3.9 L3 差评（`generation_records.feedback_*`）按记录评质量分，颗粒度是单条结果；模板库改进需要的颗粒度是"成对（RAG 源 + LLM 直接生成子记录）"。FEAT-12 新建独立的 `improvement_reports` 表（§4.1.4）+ 用户一键提交按钮 + admin 三态审阅工作流，作为质量信号采集链路的新一环（上游：用户观察成对差异；下游：FEAT-13 把 resolved 报告语料回流到 `template_corpus_cases`，**本票不做**）。
+
+设计原则：
+- **不与 §3.9 L3 差评互斥**：FeedbackBar 与「提交对比报告」按钮在 result 阶段并存（互相独立锁定），允许同一对记录同时存在差评 + 对比报告
+- **不接入 §1.1 确定性契约**：`improvement_reports` 是纯 DB 写入，不调用 LLM、不读 Qdrant、不影响 `generation_records.output_code`
+- **不接入 §3.10 L4 仪表盘**：FEAT-12 不修改 4 个 KPI 端点，`improvement_reports` 数据消费留 FEAT-13
+
+#### 3.18.2 完整链路
+
+```
+GeneratePage result 阶段（generation_mode === 'llm_direct' && parent_record_id != null）
+  ├─ FeedbackBar（§3.9 L3 差评，独立通道）
+  └─ [提交对比报告] 按钮（§3.18 本路径）
+       │
+       │ mount/聚焦时：GET /api/v1/improvement-reports/check?rag_record_id=&llm_direct_record_id=
+       │   ↓ 200 {exists:true, report_id} → 按钮 disabled「已有人提交对比报告，admin 处理中」
+       │   ↓ 200 {exists:false} 或 404      → 按钮 enabled
+       │
+       │ 用户点击 → Modal（Checkbox.Group + TextArea，全选填均允许空）
+       │
+       ↓ POST /api/v1/improvement-reports
+          body: {rag_record_id, llm_direct_record_id, report_categories?, reporter_note?}
+       │
+       ├─ rag_record_id / llm_direct_record_id 不在 generation_records → 422 invalid_record_ref
+       ├─ UNIQUE(rag_record_id, llm_direct_record_id) 冲突 → 409 duplicate_report
+       │   detail.existing_report_id = <已存在记录 UUID>
+       └─ 成功 → 201 {id, status: 'pending', created_at, ...}
+          按钮置灰文案改「已提交」
+
+admin 侧边栏「管理」→「对比报告」（仅 lib_admin / super_admin 可见）
+  ├─ /admin/improvement-reports（列表页）
+  │   ↓ GET /api/v1/admin/improvement-reports?status=&categories=&page=&page_size=
+  │   ↓ 返回分页 + status Tag + 提交用户名 + RAG 模板名 + 分类 Tag 组 + 提交时间
+  │
+  └─ /admin/improvement-reports/:id（详情页）
+      ↓ mount: GET /api/v1/admin/improvement-reports/{id}
+      ↓        → 三列对比字段：[RAG record / LLM Direct record / 用户提交]
+      ↓ if status === 'pending'
+      ↓    自动 PATCH /api/v1/admin/improvement-reports/{id} {status: 'in_review'}
+      ↓ admin 填 admin_note + 点「标记已处理」
+      ↓    PATCH /api/v1/admin/improvement-reports/{id} {status: 'resolved', admin_note}
+      ↓ 非法跳转（pending→resolved 跳过 in_review、resolved→pending 倒退等）
+      ↓    → 422 illegal_status_transition
+```
+
+#### 3.18.3 端点契约总览
+
+| 方法 | 路径 | 鉴权 | 关键行为 |
+|---|---|---|---|
+| `POST` | `/api/v1/improvement-reports` | 登录用户+ | 写 `status='pending'`；categories/note 全空合法；FK 缺失 422 `invalid_record_ref`；UNIQUE 冲突 409 `duplicate_report` |
+| `GET` | `/api/v1/improvement-reports/check` | 登录用户+（与 POST 同级，不限 admin） | 查询 `(rag_record_id, llm_direct_record_id)` 对是否已有报告；契约 200 `{exists, report_id?}` 单形态（前端只需判 `exists` bool；详 §5.1） |
+| `GET` | `/api/v1/admin/improvement-reports` | 库管理员+ | 分页列表，支持 `status` 单选 + `categories` 多选过滤，默认 `created_at DESC`；普通用户 403 |
+| `GET` | `/api/v1/admin/improvement-reports/{id}` | 库管理员+ | 详情，返两条 `generation_record` 完整对比字段（`output_code` / `template_id` / `template_name`（join templates 取 name）/ `params_used` / `original_intent` / `generation_mode` / `cache_hit`） + 用户提交字段；普通用户 403 |
+| `PATCH` | `/api/v1/admin/improvement-reports/{id}` | 库管理员+ | 更新 `status` 与 `admin_note`；三态状态机校验在端点层做（不依赖 DB CHECK）；非法跳转 422 `illegal_status_transition` |
+
+`check` 端点契约选 **200 `{exists, report_id?}` 单形态**（spec §5 Open Question 中的方案 B）：前端只看 `exists` bool 即可分支按钮 disabled 态，不依赖 HTTP 状态码做控制流（404 会污染浏览器 devtools 红条）。
+
+#### 3.18.4 三态状态机（合法跳转表）
+
+```
+pending ──admin 打开详情页（mount 自动 PATCH）──► in_review ──admin 「标记已处理」──► resolved
+```
+
+| from / to | pending | in_review | resolved |
+|---|---|---|---|
+| **pending** | ✗（no-op）| ✓ | **✗（跳过 in_review）→ 422 `illegal_status_transition`** |
+| **in_review** | ✗ 倒退 → 422 | ✗（no-op）| ✓ |
+| **resolved** | **✗ 倒退 → 422** | **✗ 倒退 → 422** | ✗（no-op）|
+
+`detail.message` 在非法跳转时返"非法状态跳转：{current} → {target}；合法跳转链：pending → in_review → resolved"，前端 `message.error` 透传文案。
+
+**并发**：多 admin 并发进入 `in_review` 不做认领锁（last-write-wins），FEAT-12 不解决该并发问题。
+
+#### 3.18.5 服务层实现位置
+
+```
+backend/app/api/v1/improvement_reports.py    # 4+1 路由（POST 用户端 + check + GET 列表/详情 + PATCH admin）
+                                              # router.py 注册 prefix /improvement-reports + /admin/improvement-reports
+backend/app/models/improvement_report.py     # ImprovementReport ORM（含 report_categories JSONB + status PG ENUM）
+backend/app/schemas/improvement_report.py    # ImprovementReportCreate / ImprovementReportAdminListItem /
+                                              # ImprovementReportDetail / ImprovementReportPatch / ReportCategoryEnum
+backend/migrations/versions/008_improvement_reports.py
+                                              # report_status_enum 创建 + improvement_reports 表 +
+                                              # UNIQUE(rag_record_id, llm_direct_record_id) + FK → generation_records.id
+backend/tests/test_improvement_reports.py    # 端点级集成测试（mock DB；POST happy / 409 / 422 / 403 / 状态机非法跳转 / 分页过滤）
+frontend/src/api/improvementReports.ts       # 4 条 axios 封装 + 类型定义
+frontend/src/pages/Generate/GeneratePage.tsx  # result 阶段「提交对比报告」按钮 + Modal +
+                                              # check 端点 mount 调用驱动按钮态
+frontend/src/pages/Admin/AdminImprovementReportsPage.tsx        # 列表页（Table + Filter Bar）
+frontend/src/pages/Admin/AdminImprovementReportDetailPage.tsx   # 详情页（三列 Card + mount 自动 PATCH in_review）
+frontend/src/components/MainLayout.tsx        # 侧边栏 admin children 新增「对比报告」菜单项
+frontend/src/App.tsx                          # 新增两条 RequireAdmin 路由（列表 + 详情）
+```
+
+#### 3.18.6 与 §3.17 / §3.9 / §3.10 的关系
+
+- **§3.17（`llm_direct`）**：`improvement_reports` 路径**依赖** `parent_record_id` FK（v2.23 / FEAT-11 引入）作为成对锚点；本路径不修改 §3.17 任何端点
+- **§3.9（L3 差评）**：两条独立通道，写入互不耦合（一条写 `generation_records.feedback_*` 4 列，一条写 `improvement_reports` 新表）
+- **§3.10（L4 仪表盘）**：FEAT-12 不修改 4 个 KPI 端点；`improvement_reports` 数据消费 / 趋势图 / CSV 导出留 FEAT-13
 
 ---
 
@@ -1632,7 +2150,8 @@ lib_manager.py import template_library/ --dry-run
 | description | TEXT | 详细描述 |
 | parameters | JSONB | 参数定义列表 |
 | template_body | TEXT | Jinja2 模板代码 |
-| maturity | ENUM | `draft` / `validated` / `production` |
+| maturity | ENUM | `draft` / `validated` / `production`（**开发成熟度**——模板设计者标注的迭代位，纯元数据，不参与 RAG 召回判定。与 `maturity_level` 列独立） |
+| **maturity_level** | ENUM `template_maturity_enum` | `production` / `experimental` / `draft`；**NOT NULL，server_default `'experimental'`**（migration 009 / FEAT-13 / v2.25）；**生产门控**——RAG stage1 Qdrant Filter + engine.py DB 二次过滤 + `dense_top1_score` 三处均**仅消费 `production`** 档；贡献流入库默认 `experimental`，须 super_admin 显式 PATCH 升至 `production` 才进入 RAG 召回主库；与 `maturity` 列**语义独立、不得混用**（详 §3.2 / §3.4 / §3.10 / §5.1） |
 | is_active | BOOLEAN | 是否启用 |
 | related_ids | VARCHAR[] | 关联模板 ID 列表 |
 | qdrant_point_id | UUID | 对应 Qdrant 中的 point ID（用于向量更新/删除） |
@@ -1641,7 +2160,7 @@ lib_manager.py import template_library/ --dry-run
 | updated_at | TIMESTAMP | 最后更新时间 |
 | created_by | UUID | 创建者用户 ID |
 
-> **注**：不再有 `embedding VECTOR` 字段，向量数据存于 Qdrant，通过 `qdrant_point_id` 关联。`sync_status` 用于检测 PostgreSQL 与 Qdrant 之间的数据一致性异常。
+> **注**：不再有 `embedding VECTOR` 字段，向量数据存于 Qdrant，通过 `qdrant_point_id` 关联。`sync_status` 用于检测 PostgreSQL 与 Qdrant 之间的数据一致性异常。`maturity` 与 `maturity_level` 两列并存且语义独立——前者描述"开发成熟度"，后者承担"生产门控"职责；migration 009 backfill 仅写 `maturity_level`，不触碰 `maturity`。
 
 **template_versions（模板版本历史表）**
 
@@ -1673,8 +2192,153 @@ lib_manager.py import template_library/ --dry-run
 | cache_hit | BOOLEAN | 是否命中 Redis 缓存（含历史意图库命中） |
 | intent_cache_hit | BOOLEAN | 是否命中历史意图知识库（区分普通缓存） |
 | created_at | TIMESTAMP | 生成时间 |
+| **feedback_rating** | SMALLINT NULL | L3 用户反馈评分：`1=好` / `2=一般` / `3=差`；NULL=未反馈（migration 006） |
+| **feedback_reason_tags** | JSONB NULL | 差评原因标签数组，元素来自 `ReasonTagEnum` 7 项枚举（`wrong_template` / `hallucinated_signal` / `syntax_error` / `semantic_error` / `style_bad` / `missing_disable_iff` / `other`）；rating=3 必填 |
+| **feedback_comment** | TEXT NULL | 反馈自由文本（≤ 2048 字符），所有评分档均可选填 |
+| **feedback_at** | TIMESTAMPTZ NULL | 反馈提交时间（UTC） |
+| **generation_mode** | VARCHAR(16) NULL DEFAULT 'rag' | 代码来源：`'rag'`（默认，走 RAG + 模板渲染）/ `'llm_direct'`（v2.23 / FEAT-11 启用，由 `POST /generate/llm-fallback` 端点写入，详 §3.17）；`cache_hit` 路径仍标 `'rag'`——含义为"代码来源"，与 `cache_hit` 的"是否命中"语义正交 |
+| **gate_error_type** | VARCHAR(32) NULL | 5 道闸触发记录标记：`'no_matching_template'` / `'off_topic'` / `'under_specified'` / `'code_type_mismatch'` / `'empty_retrieval'`；正常生成路径为 NULL；analytics `/no-match-rate` 端点的核心数据源 |
+| **parent_record_id** | VARCHAR(36) NULL FK → generation_records.id | `ondelete=SET NULL`（migration 007）；仅 `generation_mode='llm_direct'` 的记录有非 NULL 值，回链触发本次 fallback 的源 RAG 记录。源记录被 admin 删除时仅清空 FK，保留 `llm_direct` 子记录及其反馈数据，详 §3.17.5。**FEAT-12 / v2.24 起，本列同时是 `improvement_reports` 的配对锚点**——`POST /improvement-reports` 要求 `rag_record_id == llm_direct_record.parent_record_id`（端点层校验，DB 不加 CHECK）；详 §3.18.2 / §4.1.4。注意：`improvement_reports` 表对 `generation_records.id` 的两个 FK 是 `ondelete=RESTRICT`，与本列 `SET NULL` 行为相反——存在 `improvement_reports` 引用时禁止删除 source / child record |
 
 索引：`intent_hash`（历史意图库查询）、`user_id`（用户历史查询）
+
+> **L3/L4 数据基础设施说明（migration 006）**：以上 6 列由 L3 用户反馈 + L4 分析仪表盘特性引入。`feedback_*` 4 列由 `POST /feedback/{id}` 写入（见下文"feedback API 数据流"）；`generation_mode` 默认 `'rag'`，正常生成与闸触发路径都写；`gate_error_type` 仅在 `api/v1/generate.py` 的 5 道闸 catch 块由 `_record_gate_event` 写入（见下文"generate endpoint 422 catch 路径写 record"）。**本 PR 不修改 `services/core/pipeline.py` 闸判断逻辑**，仅在端点层补持久化。
+
+#### 4.1.1 feedback API 数据流
+
+`POST /api/v1/feedback/{generation_record_id}` 唯一职责：把用户对单条 `generation_record` 的反馈写到上表 4 个 feedback 列。流程：
+
+```
+前端 GeneratePage result 阶段（FeedbackBar）
+  ↓ POST /api/v1/feedback/{record_id}  body: {rating, reason_tags?, comment?}
+api/v1/feedback.py::submit_feedback
+  ↓ 1. db.get(GenerationRecord, id) → 不存在则 404
+  ↓ 2. 权限校验：record.user_id == current_user.id OR current_user.role in {lib_admin, super_admin}
+  ↓    不满足 → 403
+  ↓ 3. Pydantic FeedbackCreate 已在端点入参校验：rating ∈ {1,2,3}（其他值 422），
+  ↓    rating=3 且 reason_tags 空 → 422 PydanticCustomError(type='reason_tags_required')
+  ↓ 4. 写 4 列：feedback_rating / feedback_reason_tags（[t.value for t in tags]）/
+  ↓    feedback_comment / feedback_at（datetime.now(timezone.utc)）
+  ↓ 5. 若原 record.generation_mode 为 NULL → 回填 'rag'（防 batch 老记录穿透）；
+  ↓    显式 'rag' / 'llm_direct' 值**不**回写（FEAT-11 起 llm_direct 子记录由
+  ↓    /generate/llm-fallback 端点显式写入，feedback 端点无需也不应覆盖）
+  ↓ 6. db.commit()
+返 HTTP 204 No Content
+```
+
+**幂等性**：未做去重——同一 `record_id` 重复 POST 会覆盖先前值（前端按钮已置灰防误操作）。如需历史保留改 L4 议题。
+
+**适用范围**：自 v2.23 / FEAT-11 起，FeedbackBar 对 `rag` 与 `llm_direct` 两种 record 同等可用——前端按 `generation_record_id` 独立 lock，触发一次 `llm-fallback` 后产生新 record 即 `feedbackSubmitted` 归零，让用户分别为 `rag` 与 `llm_direct` 两条产出独立打分，分别进入 L4 analytics 桶。
+
+**测试位置**：`backend/tests/test_feedback_api.py` 覆盖 422（rating=3 无 reason_tags）/ 403（user_id 不匹配） / 204（合法）三分支，全部 mock DB。
+
+#### 4.1.2 admin analytics 模块
+
+4 个端点全部在 `backend/app/api/v1/admin.py` 的 `# ── L4 analytics` 区块；时间窗 `days` 参数 `Query(7, ge=1, le=90)` 强制上限防全表扫；`require_role("lib_admin", "super_admin")` 守门。
+
+**关键 SQL 聚合**：
+
+| 端点 | 关键 SQL / 聚合策略 |
+|---|---|
+| `/feedback-summary` | 4 个并行 `count(*)`：`total_generations` / `total_feedbacks`（`feedback_rating IS NOT NULL`） / `bad_feedbacks`（`feedback_rating=3`） / `no_match_count`（`gate_error_type='no_matching_template'`）；`bad_rate` 分母用 `total_feedbacks` 避免 NaN |
+| `/template-issues` | 单 `group_by(template_id)`，`case((feedback_rating==3, 1), else_=0)` 累加 `bad_count`；Python 侧按 `(bad_rate, bad_count) DESC` 排序后切片，避免 SQL 方言差异 |
+| `/intent-confusion` | SQL 拉 `(original_intent, template_id, rag_top3)` where `feedback_rating=3 AND rag_top3 IS NOT NULL`；**Python 侧**对 `rag_top3[0]` 做 JSONB 路径访问、过滤 `expected != actual`、按 `(expected, actual)` 二元组聚合（不用用户原文做 key，脱敏 + 防基数爆炸）；末尾对桶内 `template_id` 集合做单次 `templates` 表反查拿 `code_type`（避免 N+1） |
+| `/no-match-rate` | `GenerationRecord.created_at.cast(Date)` 作为分桶 key（UTC 日界）；`func.sum(case((gate_error_type=='no_matching_template', 1), else_=0))` 算当日 `no_match_count`；不补零行——只返实际有数据的天数 |
+
+**数据源约定**：
+- `intent-confusion` 的 `expected_template` = `rag_top3[0].template_id`——视 RAG top-1 为"用户期望"的近似。语义弱于"用户补填期望模板"方案，但用户零负担、全自动，ROI 更高
+- `no-match-rate` 依赖 `gate_error_type` 列，**前提是 generate endpoint 422 catch 路径写 record**（见 §4.1.3）；否则该端点恒返 0
+- `rag_top3` 为空数组的边界（empty_retrieval 触发时）：Python 聚合 `if not isinstance(rag, list) or not rag: continue` 兜底
+
+**`generation_mode` filter（v2.23 / FEAT-11 起）**：4 个端点全部新增 optional `generation_mode: str | None = Query(None)` 参数，值域 `{"rag", "llm_direct"}`，omit = 全量。filter 作用 = 在 SQL where 子句追加 `GenerationRecord.generation_mode == :mode`。三类边界处理：
+
+| 端点 | filter 行为 |
+|---|---|
+| `/feedback-summary` | 直接 where 过滤；`total_*` 与 `*_rate` 按所选模式重新聚合 |
+| `/template-issues` | `generation_mode='llm_direct'` 时**移除默认的 `template_id IS NOT NULL` filter**，把 NULL 行归入 `__llm_direct__` 桶——LLM 直接生成的代码没有对应 template_id，这是设计内行为 |
+| `/intent-confusion` | `generation_mode='llm_direct'` 时 `expected_template = rag_top3[0]` 仍指向源 RAG 记录的 top-1（语义：用户期望 vs LLM 实际给的代码差距），桶 key 仍按 `(expected, actual_or_llm_direct_marker)` 聚合 |
+| `/no-match-rate` | 直接 where 过滤；`llm_direct` 模式下因 `gate_error_type` 恒为 NULL，端点恒返 `no_match_rate=0` 行——正常行为（`llm_direct` 路径绕过五闸） |
+
+**测试位置**：`backend/tests/test_admin_analytics.py` 覆盖 4 端点的空数据 + 有数据两分支，mock DB。
+
+#### 4.1.3 generate endpoint 422 catch 路径写 record（gate persistence）
+
+L4 `/no-match-rate` 与 `/feedback-summary` 的 `no_match_rate` 字段都依赖"闸触发时也有 `generation_records` 行"这条不变量。本 PR 在 `api/v1/generate.py` 的 5 道闸 catch 块补写：
+
+```python
+async def _record_gate_event(db, user_id, original_intent, gate_error_type):
+    # 1. 先 db.rollback()——pipeline 抛闸异常前可能往 session add 过中间对象
+    #    （intent_cache 之类），不清洁就直接 commit 会把脏对象一并持久化
+    # 2. db.add(GenerationRecord(user_id, original_intent,
+    #          template_id=None, output_code=None, confidence=None,
+    #          cache_hit=False, intent_cache_hit=False,
+    #          generation_mode='rag', gate_error_type=<type>))
+    # 3. db.commit()
+    # 失败兜底：logger.exception + rollback（不抛，闸响应优先于 analytics 持久化）
+```
+
+`gate_error_type` 取值与 pipeline 抛出的异常一一对应：
+
+| pipeline 异常 | `gate_error_type` 字面值 | HTTP 状态 |
+|---|---|---|
+| `OffTopicIntentError` | `off_topic` | 422 |
+| `CodeTypeMismatchError` | `code_type_mismatch` | 422 |
+| `UnderSpecifiedIntentError` | `under_specified` | 422 |
+| `NoMatchingTemplateError` | `no_matching_template` | 422 |
+| `EmptyRetrievalError` | `empty_retrieval` | 503 |
+
+**只在 `/generate` 与 `/generate/preview` 端点做**，`/generate/render` 不参与（renderer 自身不抛闸异常，且 record 在 preview 阶段已写）。**不改 pipeline 闸判断本身**——本 PR 是闸事件持久化的基础设施扩展，对确定性契约（§1.1）无影响。
+
+**与正常路径 record 的区分**：`gate_error_type IS NOT NULL` 即闸触发记录；`template_id` / `output_code` / `confidence` 均 NULL。`/template-issues` 端点 SQL where 加 `template_id IS NOT NULL` 自然排除这些行。
+
+#### 4.1.4 improvement_reports（用户对比报告表，FEAT-12 / v2.24）
+
+migration 008 新建独立表 + `report_status_enum` PG ENUM 类型；与 `generation_records.feedback_*` 4 列**互相独立**——L3 差评和对比报告是两条不同颗粒度的质量信号采集通道（详 §3.18.6）。
+
+**报告分类枚举（`ReportCategoryEnum`，slug ↔ 中文 label 双向对照）**：
+
+| slug | 中文 label | 含义 |
+|---|---|---|
+| `wrong_template` | 模板选错 | RAG 选中的模板与意图不符（语义错配） |
+| `wrong_params` | 参数映射错 | 模板正确但参数填充错误（信号名 / 状态列表 / 表达式映射错） |
+| `poor_style` | 代码风格差 | 模板正确、参数正确，但生成风格不符合团队规范（命名 / 缩进 / 注释） |
+| `other` | 其他 | 上述 3 类无法归纳的差异 |
+
+**状态枚举（PG ENUM `report_status_enum`，与 `ReportStatusEnum` Python 枚举一一对应）**：
+
+| 值 | 含义 | 合法跳转（详 §3.18.4） |
+|---|---|---|
+| `pending` | 用户提交后默认状态，等待 admin 处理 | → `in_review`（admin 打开详情页时前端自动 PATCH） |
+| `in_review` | admin 已查阅，处理中 | → `resolved`（admin 写完 admin_note 后「标记已处理」） |
+| `resolved` | admin 已处理完毕（无论是否产生模板库改进） | 终止态（不允许倒退） |
+
+**`improvement_reports` 表结构**：
+
+| 字段 | 类型 | 约束 | 说明 |
+|---|---|---|---|
+| id | UUID | PK | 报告主键 |
+| reporter_id | UUID | NOT NULL, FK → users.id ondelete=RESTRICT | 提交用户 ID（提交后用户被删除时禁止级联——保留报告作为审计） |
+| rag_record_id | VARCHAR(36) | NOT NULL, FK → generation_records.id ondelete=RESTRICT | RAG 源记录 ID；与 `llm_direct_record.parent_record_id` 配对 |
+| llm_direct_record_id | VARCHAR(36) | NOT NULL, FK → generation_records.id ondelete=RESTRICT | LLM 直接生成子记录 ID（该记录 `generation_mode='llm_direct'`） |
+| report_categories | JSONB | NULL | 用户勾选的 `ReportCategoryEnum` slug 数组；全空合法（前端可不勾任何分类） |
+| reporter_note | TEXT | NULL | 用户自由文本描述差异；全空合法；无 DB 层长度 CHECK |
+| status | report_status_enum | NOT NULL DEFAULT 'pending' | 三态状态机；非法跳转校验在端点层（详 §3.18.4） |
+| admin_note | TEXT | NULL | admin 审阅时填写的处理说明；状态变 `resolved` 时建议填写但不强制 |
+| reviewed_by | UUID | NULL, FK → users.id ondelete=SET NULL | 最后一次 PATCH 该报告的 admin id（多 admin 进入 in_review 时按 last-write-wins 覆盖） |
+| reviewed_at | TIMESTAMPTZ | NULL | 最后一次 PATCH 时间（UTC） |
+| created_at | TIMESTAMPTZ | NOT NULL DEFAULT now() | 提交时间 |
+
+**约束**：
+- `UNIQUE(rag_record_id, llm_direct_record_id)`：同一对生成记录只允许一份报告；冲突时 `POST` 端点返 409 `duplicate_report` + `detail.existing_report_id`
+- **不**强制要求 `llm_direct_record.parent_record_id == rag_record_id`（端点层校验，DB 层不加 CHECK）；理由：DB CHECK 跨行依赖性能差且部署期 migration 风险高
+
+**索引**：
+- `idx_improvement_reports_status_created`（status, created_at DESC）：列表页过滤 + 默认排序
+- `idx_improvement_reports_reporter_created`（reporter_id, created_at DESC）：用户视角"我提交的报告"（FEAT-12 不实现该端点，但索引提前布好留 FEAT-13）
+
+**与 `generation_records` 的关系**：
+- 上游：消费 `parent_record_id`（v2.23 / FEAT-11 引入）作为成对锚点；如 RAG 源记录被 admin 删除，由于 FK `ondelete=RESTRICT`，DB 层拒绝删除并报错——admin 需先删除对应 `improvement_reports` 才能删 source record（FEAT-12 不在 UI 暴露该清理路径，admin 走 SQL 直执）。`llm_direct` 子记录侧同样 RESTRICT
+- 与 `feedback_*` 4 列正交：同一对 (RAG, llm_direct) 既可有 L3 差评（写 `generation_records.feedback_*`）也可有对比报告（写 `improvement_reports`），两条数据互不影响
 
 **users（用户表）**
 
@@ -1783,6 +2447,29 @@ WHERE is_default = true;
 
 > 审计日志只写不改，不支持删除，保证操作轨迹完整性。
 
+**template_corpus_cases（模板选择质量语料表，FEAT-4）**
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| id | UUID | 主键 |
+| intent | TEXT | 意图文本（用于 RAG 检索验证） |
+| code_type | VARCHAR(16) | `assertion` / `coverage` |
+| expected_template_id | VARCHAR(32) | 期望命中的模板 ID（FK → templates.id） |
+| source | VARCHAR(32) | `auto_generated`（管理员审核时 LLM 生成）/ `manual`（人工添加）/ `user_report`（用户报告误判） |
+| auto_generated_from | VARCHAR(64) | 来源 contribution_id（仅 `auto_generated` 时填充） |
+| note | TEXT | 备注（可空，说明该用例的添加原因） |
+| is_active | BOOLEAN | 是否参与 CI 回归（默认 true） |
+| created_at | TIMESTAMPTZ | 创建时间 |
+
+与 `backend/tests/data/template_selection_corpus.yaml`（静态语料库）共同构成回归测试基线：
+- 静态 YAML：版本控制，FIX-3 等已知 bug 的种子用例
+- DB 动态表：每次管理员审核新模板时自动生成，持续积累
+
+`corpus_service.py` 三个核心函数：
+- `generate_corpus_cases(contribution, llm, existing_templates)`：LLM 为新模板生成 3 条正例意图 + 每个语义近邻各 1 条反例意图
+- `detect_conflicts(new_template_text, corpus_cases, embedding_client, rag_fn)`：对每条现有语料，比较新模板 embedding 与当前 RAG top-1 分数；若新模板得分更高则标记冲突
+- `generate_llm_analysis(new_template, conflicts, llm)`：生成业务友好的根因分析 + 字段修改建议（不向管理员暴露 embedding 分数）
+
 ### 4.2 Qdrant Collection 结构
 
 | Collection | 用途 |
@@ -1793,7 +2480,7 @@ WHERE is_default = true;
 - **id**：UUID（与 PostgreSQL `templates.qdrant_point_id` 对应）
 - **vectors**：dense（1024维）+ colbert（N×1024维）
 - **sparse_vectors**：sparse（词汇权重字典）
-- **payload**：template_id、code_type、subcategory、protocol、maturity（用于过滤；原 `category` 字段已重命名为 `code_type` 与 CodeTypeRegistry 对齐）
+- **payload**：template_id、code_type、subcategory、protocol、maturity（开发成熟度，纯元数据）、**maturity_level（生产门控，v2.25 / FEAT-13，stage1 Filter 必读字段）**；原 `category` 字段已重命名为 `code_type` 与 CodeTypeRegistry 对齐
 
 ---
 
@@ -1806,9 +2493,11 @@ WHERE is_default = true;
 | GET | `/api/v1/generate/code-types` | 获取已注册代码类型列表（前端动态读取，无需硬编码） | 普通用户+ |
 | POST | `/api/v1/generate` | 单条代码生成（legacy 一步式，内部串行调 preview+render） | 普通用户+ |
 | POST | `/api/v1/generate/preview` | 两步式第一步：返回模板候选 + 参数预填（含 5 类源标识与 sanitized/validation_error） | 普通用户+ |
-| POST | `/api/v1/generate/render` | 两步式第二步：用户确认参数后渲染 + 写代码缓存（`intent_hash` 非空时也写 GenerationRecord） | 普通用户+ |
-| POST | `/api/v1/batch/upload` | 上传 Excel 创建批量任务 | 普通用户+ |
-| POST | `/api/v1/batch/preflight` | 上传后前置信度预检（轻量，仅Stage1） | 普通用户+ |
+| POST | `/api/v1/generate/render` | 两步式第二步：用户确认参数后渲染 + 写代码缓存（`intent_hash` 非空时也写 GenerationRecord）；响应体含 `generation_mode: "rag"` 字段（v2.23 / FEAT-11） | 普通用户+ |
+| POST | `/api/v1/generate/llm-fallback` | **v2.23 / FEAT-11 Stage 2**：用户对 `rag` 结果不满意时触发 LLM 自由生成兜底；入参 `{generation_record_id}`，写新 `GenerationRecord(generation_mode='llm_direct', parent_record_id=source.id)`；响应 `{code, generation_record_id, generation_mode: "llm_direct", cache_hit}`；5 类错误：404（detail 为纯字符串）/ 422 `llm_direct_chained_not_allowed` / 422 `llm_direct_no_code` / 422 `llm_direct_internal_error`（ValueError 分支）/ 500 `llm_direct_internal_error`（Exception 分支）（详 §3.17） | 普通用户+ |
+| GET | `/api/v1/batch/template` | **v2.27 / FEAT-16**：下载批量生成空白 Excel 模板（多 sheet 按 code_type 分页），sheet 名 ← `data/code_types/*.yaml`、表头 ← `data/schemas/*.yaml`，无状态、不写库；响应 `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` + `Content-Disposition: attachment; filename=batch_template_<YYYYMMDD>.xlsx`；路由必须先于 `/{job_id}/...` 注册（详 §3.7.1） | 登录用户+ |
+| POST | `/api/v1/batch/upload` | 上传 Excel 创建批量任务；`code_type: str \| None = Form(None)` **可选**（v2.28 / FEAT-18），缺省时按 Excel sheet 名自动识别每行 code_type（multisheet 路径，`BatchJob.code_type="mixed"`），显式传入时走单 sheet 兼容路径；所有 sheet 均无有效行返 HTTP 400 `detail.type="no_valid_rows"` | 普通用户+ |
+| POST | `/api/v1/batch/preflight` | 上传后前置信度预检（轻量，仅Stage1）；`code_type` 同 `/upload` 端点**可选**（v2.28 / FEAT-18）；`PreflightResponse.results[*]` 携带 `code_type` 字段供前端按行展示 | 普通用户+ |
 | GET | `/api/v1/batch/{job_id}` | 查询批量任务状态 | 普通用户+ |
 | GET | `/api/v1/batch/{job_id}/download` | 下载批量生成结果 | 普通用户+ |
 | POST | `/api/v1/intent-builder/chat` | v3.0 多轮 RAG-grounded 对话；首轮 `session_id=""` 由后端 mint，TTL 24h | 登录用户+ |
@@ -1817,7 +2506,7 @@ WHERE is_default = true;
 | GET | `/api/v1/templates` | 模板列表（支持搜索/筛选/分页） | 普通用户+ |
 | GET | `/api/v1/templates/{id}` | 模板详情 | 普通用户+ |
 | POST | `/api/v1/admin/templates` | 新建模板（同步写 PG + Qdrant）；先执行查重，相似度 ≥ 阈值返回 `duplicate_warning`；附加 `?force=true` 跳过语义查重 | 库管理员+ |
-| PUT | `/api/v1/admin/templates/{id}` | 更新模板（同步更新 PG + Qdrant） | 库管理员+ |
+| PATCH | `/api/v1/admin/templates/{id}` | 更新模板（同步更新 PG + Qdrant）；**v2.25 / FEAT-13** 起 payload 含 `maturity_level` 时新增权限闸：`current_user.role != 'super_admin'` 返 HTTP 403 `detail="仅 super_admin 可修改 maturity_level"`；非法 enum 值（非 `production`/`experimental`/`draft`）由 Pydantic schema 返 HTTP 422 | 库管理员+（修改 `maturity_level` 字段仅 super_admin） |
 | DELETE | `/api/v1/admin/templates/{id}` | 停用模板（软删除，Qdrant 同步删除向量） | 库管理员+ |
 | POST | `/api/v1/admin/templates/import` | 批量导入 YAML（批量写 PG + Qdrant） | 库管理员+ |
 | GET | `/api/v1/admin/users` | 用户列表 | 超管 |
@@ -1832,18 +2521,30 @@ WHERE is_default = true;
 | DELETE | `/api/v1/admin/llm/configs/{id}` | 删除配置（默认模型不可删） | 超管 |
 | PUT | `/api/v1/admin/llm/configs/{id}/set-default` | 设为默认（自动清空相关 Redis 缓存） | 超管 |
 | POST | `/api/v1/admin/llm/configs/{id}/test` | 执行模型测试（basic/normalization/template_selection） | 超管 |
-| POST | `/api/v1/contributions` | 提交模板贡献 | 登录用户+ |
+| POST | `/api/v1/contributions/preview` | **FEAT-10**：仅基于 `original_intent + code_type` 让 LLM 生成完整模板预览（**不入库**）；返回 `{template_name, description, demo_code, parameter_defs, keywords, name_conflict}`；`name_conflict` 由 `check_name_duplicate` 计算非阻塞；解析失败统一 422 `contribution_parse_failed`（含 `detail.stage` / `detail.reason`） | 登录用户+ |
+| POST | `/api/v1/contributions` | 提交模板贡献；v3.1 必填降至 `original_intent + code_type`，`template_name / description / demo_code` 全部可选；按顺序 3 分支判定（intent-only LLM 生成 / 显式 parameter_defs 走 v2 批量路径 / 4 字段齐全走 demo 反推）；响应 `ContributionOut` 新增 `use_immediately_available: bool = True` | 登录用户+ |
 | GET | `/api/v1/contributions/mine` | 查看我的贡献列表 | 登录用户+ |
 | GET | `/api/v1/contributions/{id}` | 查看贡献详情 | 贡献者本人 |
 | PUT | `/api/v1/contributions/{id}` | 修改贡献（仅 needs_revision 状态） | 贡献者本人 |
 | GET | `/api/v1/admin/contributions` | 贡献列表（支持 status/type 过滤） | 库管理员+ |
 | GET | `/api/v1/admin/contributions/{id}` | 贡献详情（含 Excel 行快照 + 查重结果 Top-3） | 库管理员+ |
-| PUT | `/api/v1/admin/contributions/{id}/approve` | 批准并触发入库流水线 | 库管理员+ |
+| POST | `/api/v1/admin/contributions/{id}/pre-approve-analysis` | 批准前分析（非破坏性）：冲突检测 + 语料生成 + LLM 根因分析 | 库管理员+ |
+| PUT | `/api/v1/admin/contributions/{id}/approve` | 批准并触发入库流水线（同时激活 pre-approve 阶段生成的语料） | 库管理员+ |
 | PUT | `/api/v1/admin/contributions/{id}/reject` | 退回，body：`{comment}` | 库管理员+ |
 | PUT | `/api/v1/admin/contributions/{id}/request-revision` | 请求修改，body：`{comment}` | 库管理员+ |
 | GET | `/api/v1/notifications` | 获取当前用户通知列表 | 登录用户+ |
 | PUT | `/api/v1/notifications/{id}/read` | 标记通知已读 | 登录用户+ |
 | GET | `/api/v1/admin/audit-logs` | 查询管理员操作审计日志（按 action/operator/时间范围过滤，分页） | 超管 |
+| POST | `/api/v1/feedback/{generation_record_id}` | L3 用户反馈：写 `generation_records` 的 4 个 feedback 列；rating ∈ {1,2,3}（其他 422）；rating=3 必填 `reason_tags`（否则 422 `reason_tags_required`）；非 owner 且非 admin 返 403；成功 204 | 登录用户+（自己记录）/ 库管理员+（任意记录） |
+| GET | `/api/v1/admin/analytics/feedback-summary` | L4 KPI：`{days, total_generations, total_feedbacks, feedback_rate, bad_rate, no_match_rate}`；空数据各率返 0.0；`days` ∈ [1, 90] 默认 7 | 库管理员+ |
+| GET | `/api/v1/admin/analytics/template-issues` | L4 差评模板 top-N：`[{template_id, total_count, bad_count, bad_rate}]`，按 `bad_rate DESC, bad_count DESC` 排序；`limit` ∈ [1, 100] 默认 10 | 库管理员+ |
+| GET | `/api/v1/admin/analytics/intent-confusion` | L4 意图-模板混淆：`[{intent, expected_template, actual_template, code_type, count}]`；数据源仅 `feedback_rating=3 AND template_id != rag_top3[0].template_id`；`code_type` 由后端 join `templates` 表填好供前端复制 corpus 条目 | 库管理员+ |
+| GET | `/api/v1/admin/analytics/no-match-rate` | L4 按 UTC 日界聚合：`[{date, total, no_match_count, no_match_rate}]`；不补零行；依赖 `gate_error_type='no_matching_template'` 数据源 | 库管理员+ |
+| POST | `/api/v1/improvement-reports` | **FEAT-12 / v2.24** 用户对比报告提交：入参 `{rag_record_id, llm_direct_record_id, report_categories?, reporter_note?}`；categories/note 全空合法；写 `improvement_reports.status='pending'`；FK 缺失 422 `invalid_record_ref`；UNIQUE 冲突 409 `duplicate_report` + `detail.existing_report_id`；未登录 401（详 §3.18） | 登录用户+ |
+| GET | `/api/v1/improvement-reports/check` | **FEAT-12** 轻查询端点：查询 `(rag_record_id, llm_direct_record_id)` 对是否已有报告；契约 200 `{exists: bool, report_id?: UUID}` 单形态（前端按 `exists` bool 分支按钮 disabled 态）；鉴权与 POST 同级，不限 admin | 登录用户+ |
+| GET | `/api/v1/admin/improvement-reports` | **FEAT-12** admin 列表：分页 + 支持 `status`（单选）+ `categories`（多选）过滤，默认 `created_at DESC`；返回 join 摘要（reporter username / RAG template_name / categories Tag / created_at）；非 admin 403 | 库管理员+ |
+| GET | `/api/v1/admin/improvement-reports/{id}` | **FEAT-12** admin 详情：返两条 `generation_record` 完整对比字段（`output_code` / `template_id` / `template_name`（join templates 取 name）/ `params_used` / `original_intent` / `generation_mode` / `cache_hit`）+ 用户提交字段（categories / reporter_note）+ 当前 status / admin_note / reviewed_by / reviewed_at；非 admin 403 | 库管理员+ |
+| PATCH | `/api/v1/admin/improvement-reports/{id}` | **FEAT-12** admin 状态机更新：可单独或同时更新 `status` 与 `admin_note`；三态状态机（pending → in_review → resolved）校验在端点层；非法跳转返 422 `illegal_status_transition`（`pending → resolved` 跳过 in_review、`resolved → pending` / `resolved → in_review` / `in_review → pending` 倒退均拒绝）；同时写 `reviewed_by = current_user.id` + `reviewed_at = now()`；非 admin 403 | 库管理员+ |
 
 ### 5.2 生成接口请求/响应示例
 
@@ -1943,8 +2644,28 @@ keywords:
   - ready
   - 保持
 
-# 描述
-description: "当valid信号拉高且ready信号未到来时，数据信号必须在整个等待期间保持稳定，防止握手期间数据被意外修改"
+# 描述（三要素：做什么 / 典型场景 / 边界）
+# 约定（v2.21 / A10）：`description` 应同时覆盖"本模板做什么"+"典型场景"+
+# "边界：请勿用于 X 请用 Y"三要素；< 30 字节会被 lib_manager validate 标 WARN。
+description: |
+  做什么：当 valid 拉高且 ready 尚未响应（握手等待期间），断言数据/payload 信号必须保持稳定（$stable），关注的是"等待期间数据不变"。
+  典型场景：wvalid=1 但 wready=0 期间 wdata 不能改变；arvalid 期间 araddr 必须保持稳定。
+  边界：请勿用于"ready 必须在 N 周期内响应"（超时检测）—— 那是 sva_handshake_timeout_v1；也不要用于"req → ack 响应时间上限"（通用两事件时序）—— 那是 sva_timing_max_delay_v1。
+
+# 与最近邻模板的区别要点（v2.21 / A10，可选）
+# lib_manager.py import 时通过 _compose_description 拼到 description 列末尾形成
+# "区别要点：" 段（每项 `- ` 前缀），由现有列流转到 Qdrant payload / reranker text /
+# pipeline.candidate_dicts / LLM step1 prompt。声明此键即必须是非空 list（validate ERROR）。
+differentiators:
+  - 关注的是 valid 等待期间 data/payload 的 $stable 稳定性，不数等待周期、不抛超时
+  - 触发条件是 `valid && !ready`（握手未完成态），不关心首次 valid 上升沿后等多久 ready 才到
+
+# 不适用场景（v2.21 / A10，可选）
+# 同上：lib_manager.py import 时拼成 "不适用场景：" 段；声明此键即必须是非空 list。
+non_use_cases:
+  - 验证 ready 必须在 N 周期内响应（应用 sva_handshake_timeout_v1）
+  - 验证 FSM 状态转换或复位行为
+
 severity: error            # error | warning | info（仅断言使用）
 maturity: production       # draft | validated | production
 
@@ -2030,6 +2751,7 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │       ├── contributions.py             # 贡献者端点 + 管理员审核端点（合并单文件）
 │   │   │       ├── notifications.py             # 站内通知端点
 │   │   │       ├── intent_builder.py            # 场景构建器端点
+│   │   │       ├── improvement_reports.py      # FEAT-12 用户对比报告 4+1 路由（POST + check + GET 列表/详情 + PATCH）
 │   │   │       └── auth.py                      # 认证端点
 │   │   ├── core/
 │   │   │   ├── config.py                 # 环境配置（从环境变量读取）
@@ -2045,6 +2767,7 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   ├── llm_config.py             # LLM 配置模型
 │   │   │   ├── contribution.py           # 模板贡献模型
 │   │   │   ├── notification.py           # 站内通知模型
+│   │   │   ├── improvement_report.py     # FEAT-12 用户对比报告 ORM（report_categories JSONB + status PG ENUM）
 │   │   │   └── audit_log.py              # 管理员操作审计日志模型
 │   │   ├── schemas/
 │   │   │   ├── generate.py               # 生成请求/响应 Schema
@@ -2053,6 +2776,7 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   ├── user.py                   # 用户 Schema
 │   │   │   ├── llm_config.py             # LLM 配置请求/响应 Schema（新增）
 │   │   │   ├── contribution.py           # 贡献请求/响应 Schema
+│   │   │   ├── improvement_report.py     # FEAT-12 ImprovementReportCreate / AdminListItem / Detail / Patch + ReportCategoryEnum
 │   │   │   └── notification.py           # 通知响应 Schema
 │   │   ├── services/
 │   │   │   │                             # ── 三层服务子包结构 ──
@@ -2083,7 +2807,8 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   ├── platform/                 # 平台功能层（与生成核心完全解耦）
 │   │   │   │   ├── contribution_service.py  # 贡献入库流水线（复用 create_template()）
 │   │   │   │   ├── audit_service.py      # 审计日志写入服务（新增）
-│   │   │   │   └── backup_service.py     # 备份管理服务（新增）
+│   │   │   │   ├── backup_service.py     # 备份管理服务（新增）
+│   │   │   │   └── corpus_service.py     # FEAT-4：语料自动生成 + 冲突检测 + LLM 根因分析
 │   │   │   ├── registry.py               # CodeTypeRegistry（启动时加载 data/code_types/*.yaml，运行时只读）
 │   │   │   └── embedding_client.py       # Embedding Service HTTP 客户端
 │   │   ├── tasks/
@@ -2128,8 +2853,18 @@ DV_ACODE_GEN_PLATFORM/
 │   │   ├── env.py
 │   │   ├── script.py.mako
 │   │   └── versions/
-│   │       └── 001_initial_schema.py     # 初始全量建表（含所有表结构）
+│   │       ├── 001_initial_schema.py     # 初始全量建表（含所有表结构）
+│   │       ├── 002_step2_disable_thinking.py  # llm_configs.step2_disable_thinking BOOL 列
+│   │       ├── 003_align_sync_status_enum.py  # sync_status enum 值与 ORM 对齐（幂等）
+│   │       ├── 004_unique_default_llm.py      # llm_configs.is_default 部分唯一索引
+│   │       ├── 005_template_corpus_cases.py   # template_corpus_cases 表（FEAT-4 回归语料）
+│   │       ├── 006_feedback_columns.py        # generation_records 加 6 列（L3 反馈 / generation_mode / gate_error_type）
+│   │       ├── 007_llm_direct_parent_fk.py    # generation_records.parent_record_id FK（FEAT-11 Stage 2）
+│   │       ├── 008_improvement_reports.py     # FEAT-12：report_status_enum 创建 + improvement_reports 表 + UNIQUE(rag_record_id, llm_direct_record_id) + FK → generation_records.id ondelete=RESTRICT
+│   │       └── 009_template_maturity_level.py # FEAT-13：template_maturity_enum 创建 + templates.maturity_level 列（NOT NULL，server_default 'experimental'） + 全表 backfill（sva_*_v* / cov_*_v* → production，其余 → experimental）；upgrade() 末尾打印 WARN 提示部署方紧接 lib_manager rebuild 同步 Qdrant payload
 │   ├── tests/
+│   │   ├── test_template_maturity_gating.py   # FEAT-13：stage1 Filter 包含 maturity_level='production' / engine.py DB 二次过滤拦截非 production / PATCH maturity_level 的 super_admin 200·lib_admin 403·非法值 422 / migration 009 backfill 条件函数单测（全程 mock Qdrant + PG，无活基础设施依赖）
+│   │   └── ...                                  # 其他既有测试文件（test_pipeline_preview_render / test_offtopic_corpus_mocked / test_feedback_api / test_admin_analytics / test_llm_direct_generation / test_llm_freeform_client / test_improvement_reports 等）
 │   ├── Dockerfile
 │   └── requirements.txt
 │
@@ -2155,6 +2890,8 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   └── Admin/
 │   │   │       ├── Templates/            # 管理员模板管理
 │   │   │       ├── ContributionReview/   # 贡献审核队列
+│   │   │       ├── AdminImprovementReportsPage.tsx       # FEAT-12 admin 列表页（Table + Filter Bar）
+│   │   │       ├── AdminImprovementReportDetailPage.tsx  # FEAT-12 admin 详情页（三列 Card + mount 自动 PATCH in_review）
 │   │   │       └── LLMConfig/            # LLM 模型配置管理（新增）
 │   │   │           ├── index.tsx         # 模型列表（卡片形式）
 │   │   │           └── TestPanel.tsx     # 三类模型测试面板
@@ -2162,6 +2899,7 @@ DV_ACODE_GEN_PLATFORM/
 │   │   │   ├── client.ts                 # Axios API 调用封装
 │   │   │   ├── contributionApi.ts        # 贡献 API 封装
 │   │   │   ├── intentBuilderApi.ts       # 场景构建器 API 封装
+│   │   │   ├── improvementReports.ts     # FEAT-12 对比报告 4 条 axios 封装（user POST + check + admin 列表/详情/PATCH）
 │   │   │   └── llmConfigApi.ts           # LLM 配置管理 API 封装（新增）
 │   │   ├── utils/
 │   │   │   ├── validateParam.ts          # 参数表单基础校验（前端）
@@ -2346,6 +3084,9 @@ location ~* \.(js|css|png|jpg|ico|svg|woff2?)$ {
 | `CODE_TYPE_MISMATCH_GATE_ENABLED` | code_type 一致性闸总开关（默认 `true`）；`OFFTOPIC_GATE_ENABLED=false` 时本闸自动跳 |
 | `CODE_TYPE_MISMATCH_MARGIN` | 别类 code_type dense 得分超过当前类多少时判定 mismatch（默认 `0.10`） |
 | `UNDER_SPECIFIED_GATE_ENABLED` | under_specified 闸总开关（默认 `true`）；设 `false` 时退回 v2.12 之前"系统编参数兜底总能产出代码"行为 |
+| `STEP1_VERIFY_ENABLED` | A8 step1 二次验证开关（默认 `false`）；开启前需用 confusion corpus 的 real-llm 套件评估 false-negative 率（详 §3.15.3 Step 5a / docs/test-manual.md §2.7） |
+| `STEP1_RERANKER_GATE_ENABLED` | A9 reranker score gate 开关（默认 `false`）；开启前必须先跑 `backend/scripts/calibrate_reranker_threshold.py` 在 selection + confusion corpus 上标定阈值（详 docs/test-manual.md §2.8） |
+| `RERANKER_MIN_SCORE_THRESHOLD` | A9 step1 选中模板的 stage3 reranker score 下限（默认 `0.30`，经验占位值；标定后写入 `backend/app/core/config.py` 默认值） |
 | `BACKUP_RETAIN_DAYS` | `7` | PostgreSQL 备份文件保留天数，超期自动删除 |
 | `QDRANT_SNAPSHOT_ENABLED` | `false` | 是否启用 Qdrant 每周快照（false 时只依赖 rebuild-index 恢复） |
 

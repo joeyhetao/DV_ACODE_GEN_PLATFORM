@@ -5,7 +5,13 @@ import anthropic
 import httpx
 
 from app.schemas.intent import TemplateSelectionOutput
-from app.services.llm.base import LLMClient
+from app.services.llm.base import (
+    LLMClient,
+    build_freeform_prompt,
+    extract_sv_code_block,
+    render_step1_candidate_xml,
+    resolve_numeric_fallback,
+)
 
 
 def _anthropic_thinking_tokens(msg) -> str:
@@ -78,16 +84,26 @@ class AnthropicLLMClient(LLMClient):
         candidates: list[dict],
         original_intent: str = "",
     ) -> TemplateSelectionOutput:
-        candidates_text = "\n\n".join(
-            f"模板{i + 1}：{c['template_id']} - {c['name']}\n"
-            f"  描述：{c['description']}\n"
-            f"  参数：{self._format_params(c.get('template'))}"
-            for i, c in enumerate(candidates)
+        # FEAT-14：候选改 XML 风格与 OpenAI-compat 路径对齐，从视觉上消除序号；
+        # 同步用 render_step1_candidate_xml 走 html.escape，防 name 字段含 `"` /
+        # `</candidate>` 等字符破坏 prompt 结构。"参数：..." 行作为 extra_lines 传入。
+        candidates_text = "\n".join(
+            render_step1_candidate_xml(
+                c,
+                extra_lines=[f"参数：{self._format_params(c.get('template'))}"],
+            )
+            for c in candidates
         )
 
         system = (
             "你是资深IC验证工程师。从候选模板中选择最匹配的，并将信号角色与参数对应。\n"
-            "严格使用工具调用输出，不要输出任何其他内容。"
+            "候选以 <candidate id=\"...\" name=\"...\"> XML 块给出，每块携带描述与参数说明。\n"
+            "严格使用工具调用输出，不要输出任何其他内容。\n"
+            "template_id 字段必须填入所选 <candidate> 的 id 属性值（如 sva_handshake_timeout_v1），"
+            "禁止填入候选序号、XML 标签或属性形式。\n"
+            "负向规则：若没有任何候选模板的验证语义与用户意图匹配，在 template_id 字段填入字符串 none，"
+            "param_mapping 填空对象，confidence 填 0.0；"
+            "禁止通过信号角色重命名来强行适配语义不符的模板。"
         )
         # original_intent 保留用户原始信号名/状态枚举（normalize 可能改写），优先填参数；
         # 与 OpenAICompatLLMClient._step2_fill_params 行为对齐。
@@ -118,8 +134,19 @@ class AnthropicLLMClient(LLMClient):
         for block in msg.content:
             if block.type == "tool_use" and block.name == "select_template":
                 inp = block.input
+                template_id = inp["template_id"]
+                # FEAT-14：tool calling 把 template_id 强约束为 string，但 Claude 偶发
+                # 把候选序号当作 id 字符串塞进来（如 "3"）。若不在候选列表里，复用
+                # 共用 resolve_numeric_fallback 兜底；命中候选列表的合法 id（含 "none"）
+                # 走原路径，越界 / 非数字字符串透传给 pipeline 触发原 rag_fallback 链。
+                if template_id not in {c["template_id"] for c in candidates}:
+                    resolved = resolve_numeric_fallback(
+                        template_id, candidates, log_prefix="Anthropic Step1"
+                    )
+                    if resolved is not None:
+                        template_id = resolved
                 return TemplateSelectionOutput(
-                    template_id=inp["template_id"],
+                    template_id=template_id,
                     param_mapping=inp["param_mapping"],
                     confidence=float(inp["confidence"]),
                 )
@@ -164,6 +191,40 @@ class AnthropicLLMClient(LLMClient):
             if getattr(block, "type", None) == "text":
                 return block.text.strip()
         return ""
+
+    async def generate_code_freeform(
+        self,
+        intent: str,
+        code_type: str,
+        signals: list[dict],
+        clk: str,
+        rst: str,
+    ) -> str:
+        """FEAT-11 Stage 2 兜底：LLM 直接生成代码，绕过 RAG + Jinja2。
+
+        Anthropic 原生 messages.create，无 thinking 参数（默认即 off）。max_tokens 给 4096——
+        即便 GLM-4.7 大模板也极少超 800 tokens；Claude 大模型可能用更多 system 输出。
+        """
+        system, user = build_freeform_prompt(intent, code_type, signals, clk, rst)
+        _t = time.perf_counter()
+        msg = await self._client.messages.create(
+            model=self._model,
+            max_tokens=4096,
+            temperature=0.0,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+        )
+        print(
+            f"[Timing] llm=generate_code_freeform ms={int((time.perf_counter() - _t) * 1000)} "
+            f"reasoning_tokens={_anthropic_thinking_tokens(msg)} thinking=n/a",
+            flush=True,
+        )
+        text = ""
+        for block in msg.content:
+            if getattr(block, "type", None) == "text":
+                text = block.text
+                break
+        return extract_sv_code_block(text)
 
     async def test_basic(self) -> str:
         msg = await self._client.messages.create(

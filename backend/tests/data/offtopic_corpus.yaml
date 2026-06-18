@@ -26,15 +26,21 @@
 #   4. 实在无法修就标 flaky: true 并在 reason 里写明原因——保留历史
 #
 # ── 字段约定 ────────────────────────────────────────────────────────────────
-#   id            必填，蛇形命名，唯一
-#   input         必填，用户原文
-#   code_types    off_topic 用；列表，会对每个 code_type 跑一次
-#   code_type     marginal_ic 用；单个字符串
-#   signals       marginal_ic 可选；信号列表
-#   added         必填，添加日期 "YYYY-MM-DD"
-#   source        必填，来源（"initial seed" / "user report 2026-XX-XX" / "code_type 新增" 等）
-#   reason        必填，6 个月后能看懂"这条为啥在这"
-#   flaky         可选，true 表示真 LLM 测可能不稳定，real-llm 套件会 warn 但不 fail
+#   id                  必填，蛇形命名，唯一
+#   input               必填，用户原文
+#   code_types          off_topic 用；列表，会对每个 code_type 跑一次
+#   code_type           marginal_ic / cross_code_type_mismatch 用；单个字符串
+#                       cross_code_type_mismatch 段的 code_type 是"用户选错的那个"
+#   suggested_code_type cross_code_type_mismatch 用；该意图应当对应的正确 code_type
+#   signals             marginal_ic 可选；信号列表
+#   added               必填，添加日期 "YYYY-MM-DD"
+#   source              必填，来源（"initial seed" / "user report 2026-XX-XX" / "code_type 新增" 等）
+#   reason              必填，6 个月后能看懂"这条为啥在这"
+#   expected_gate       可选，off_topic / code_type_mismatch / null。
+#                       由 mocked 套件用于断言路由——见 test_offtopic_corpus_mocked.py。
+#                       off_topic 段默认 off_topic，marginal_ic 段默认 null，
+#                       cross_code_type_mismatch 段默认 code_type_mismatch。
+#   flaky               可选，true 表示真 LLM 测可能不稳定，real-llm 套件会 warn 但不 fail
 #
 # ── 维护准则 ────────────────────────────────────────────────────────────────
 #   - append-only 优先：除非彻底改设计契约，不要删除已有样本——它们是历史回归的疫苗
@@ -202,3 +208,47 @@ marginal_ic:
     added: "2026-05-13"
     source: initial seed
     reason: "协议握手覆盖率——明确属于 IC 验证范畴"
+
+# ── cross_code_type_mismatch：真 IC 请求但用户选错了 code_type ────────────
+# 期望路由：CodeTypeMismatchError（不是 OffTopicIntentError）
+#   - code_type           = 用户在前端选错的那个
+#   - suggested_code_type = 后端 dense 跨类比较后应当给出的建议
+# mocked 套件给 code_type 一个低分（< 阈值），给 suggested_code_type 高分，
+# 用于永久回归 FEAT-15 修复的"错选类被误判为离域"corner case。
+
+cross_code_type_mismatch:
+  - id: cov_intent_picked_as_assertion_awsize
+    input: "交叉覆盖 awsize 与 awburst 的所有合法组合"
+    code_type: assertion
+    suggested_code_type: coverage
+    expected_gate: code_type_mismatch
+    added: "2026-06-10"
+    source: "user report FEAT-15"
+    reason: "FEAT-15 复现 case：交叉覆盖率意图，用户在前端误选了 assertion，老逻辑误判为 off-topic"
+
+  - id: cov_intent_picked_as_assertion_state_value
+    input: "统计 state_reg 每个取值的覆盖率"
+    code_type: assertion
+    suggested_code_type: coverage
+    expected_gate: code_type_mismatch
+    added: "2026-06-10"
+    source: "FEAT-15 派生样本"
+    reason: "取值覆盖率意图（cov_value_coverage_v1 风格），用户错选 assertion"
+
+  - id: assert_intent_picked_as_coverage_handshake
+    input: "valid 拉高之后 ready 必须在 8 个周期内拉高，否则违反协议"
+    code_type: coverage
+    suggested_code_type: assertion
+    expected_gate: code_type_mismatch
+    added: "2026-06-10"
+    source: "FEAT-15 派生样本"
+    reason: "握手时序断言意图（sva_handshake_timeout_v1 风格），用户错选 coverage"
+
+  - id: assert_intent_picked_as_coverage_max_delay
+    input: "req 拉高到 ack 返回之间不允许超过 16 个时钟周期"
+    code_type: coverage
+    suggested_code_type: assertion
+    expected_gate: code_type_mismatch
+    added: "2026-06-10"
+    source: "FEAT-15 派生样本"
+    reason: "最大延迟断言意图（sva_timing_max_delay_v1 风格），用户错选 coverage"

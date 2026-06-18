@@ -32,6 +32,9 @@ _VALID_EXPR_TYPES = {
     "integer", "free_text",
 }
 
+# FEAT-10：LLM 反推的 template_name 命名规范——sva_*/cov_* 前缀 + 版本后缀
+_VALID_TEMPLATE_NAME_RE = re.compile(r"^(sva|cov)_[a-z][a-z0-9_]*_v\d+$")
+
 # P1-5：LLM 可能反推出 `always` / `module` 等参数名 → 通过格式检查但生成的 SV 代码非法。
 # Python 关键字（如 `class` / `for`）作参数名也可能让 Jinja2 渲染时撞 Python 内置类型导致诡异错误。
 # 黑名单合并 SV 常见关键字 + 完整 Python 关键字。
@@ -86,6 +89,20 @@ class ExtractedParameters:
     keywords: list[str]
     subcategory: str | None
     protocol: str | None
+
+
+@dataclass
+class ExtractedFull(ExtractedParameters):
+    """FEAT-10：在 ExtractedParameters 基础上加 template_name + description + demo_code。
+
+    `generate_from_intent` 仅靠 original_intent + code_type 让 LLM 一次性输出完整模板。
+    `jinja_body` 已经在 ExtractedParameters 里——是参数化后的 Jinja2 模板体，
+    `demo_code` 这里**额外**保留 LLM 产出的**未参数化原始 SystemVerilog 代码**——
+    /preview 端点把它回传前端用于"立即使用"的可复制代码框。
+    """
+    template_name: str = ""
+    description: str = ""
+    demo_code: str = ""
 
 
 def _build_extraction_prompt(demo_code: str, description: str, code_type: str) -> str:
@@ -299,4 +316,173 @@ async def derive_parameters_from_demo(
         keywords=cleaned_keywords,
         subcategory=subcategory if isinstance(subcategory, str) else None,
         protocol=protocol if isinstance(protocol, str) else None,
+    )
+
+
+# ── FEAT-10：intent-only 入口（用户只填 original_intent + code_type） ─────────
+
+def _build_generation_prompt(original_intent: str, code_type: str) -> str:
+    """FEAT-10：让 LLM 仅凭 original_intent + code_type 一次性输出完整模板。
+
+    与 _build_extraction_prompt 的差异：用户没有 demo_code，LLM 必须自己写出 SystemVerilog
+    示例代码、模板名、场景描述、参数列表与 Jinja2 模板体。
+    """
+    return (
+        "你是 IC 验证模板库管理员。下面有一段用户用自然语言表达的验证意图，"
+        "请基于此意图生成一份完整的 SystemVerilog / 覆盖率模板，并整理出参数列表。\n\n"
+        f"### 代码类型\n{code_type}\n\n"
+        f"### 用户意图\n{original_intent}\n\n"
+        "### 任务\n"
+        "1. 给该模板起一个规范的名字（template_name），格式严格遵循：\n"
+        "   - assertion 类：sva_<scenario>_v<N>（示例：sva_axi_handshake_data_stable_v1）\n"
+        "   - coverage 类：cov_<scenario>_v<N>（示例：cov_fsm_state_transition_v1）\n"
+        "   - 仅小写蛇形 + 末尾 _v1（首版默认 v1）\n"
+        "2. 用一句标准 IC 验证措辞重述场景（description，30-120 字）\n"
+        "3. 写一份**完整可读**的 SystemVerilog 示例代码（demo_code）：\n"
+        "   - 代码类型为 assertion（SVA断言）：只包含 module + property + assert property，"
+        "禁止包含 covergroup / coverpoint / cross 等覆盖率构造\n"
+        "   - 代码类型为 coverage（功能覆盖率）：只包含 module + covergroup + coverpoint，"
+        "禁止包含 assert property 等断言构造\n"
+        "4. 把 demo_code 里应该参数化的位置（信号名、状态枚举、位宽、超时周期数）"
+        "改写成 {{ snake_case_name }}，生成 jinja_body\n"
+        "5. 给每个参数填元数据：name / type / required / description / expr_type / default\n"
+        "6. 推测 keywords（中英文混合，2-5 个）/ subcategory / protocol\n\n"
+        "### 严格约束\n"
+        "- template_name 必须匹配正则 ^(sva|cov)_[a-z][a-z0-9_]*_v\\d+$\n"
+        "- 参数 name 必须是小写蛇形（[a-z][a-z0-9_]*），不允许中文 / 大写 / 特殊字符\n"
+        "- 参数名不能撞 SystemVerilog 或 Python 关键字（如 always / module / class / for）\n"
+        "- expr_type 只能是：sv_identifier / sv_identifier_list / sv_boolean_expr / sv_bins_expr / integer / free_text\n"
+        "- 时钟参数命名 clk，复位参数命名 rst_n，都设 default=参数名本身\n"
+        "- jinja_body 引用的每个 {{ var }} 都必须在 parameter_defs 里声明\n"
+        "- jinja_body 的 {{ ... }} 内部只能放参数名本身（如 {{ clk }}）；"
+        "禁止放 Python/Jinja2 表达式、字典 {key: val}、集合 {a, b}、逻辑运算符\n"
+        "- SystemVerilog 代码里的大括号（拼接运算符 {a, b}、packed literal 等）"
+        "在 jinja_body 中必须原样保留为字面量文本，不能包裹成 {{ }}\n"
+        "- 每个 {{ }} 替换位只含一个参数名：{{ signal_name }}；"
+        "不允许 {{ sig_a && sig_b }}、{{ {sig} }}、{{ sig | filter }} 等写法\n"
+        "- {{ }} 里的名字必须来自 parameter_defs[*].name；"
+        "禁止使用 JSON 顶层字段名（template_name / description / demo_code / keywords 等），"
+        "这些字段不是用户填写的参数，不能出现在 jinja_body 里\n\n"
+        "### 输出格式（必须严格遵守）\n"
+        "返回一段 JSON（**只返 JSON，不要任何解释文字**），结构如下：\n"
+        "```json\n"
+        "{\n"
+        '  "template_name": "sva_axi_handshake_data_stable_v1",\n'
+        '  "description": "检测 AXI valid-ready 握手期间数据信号必须保持稳定。",\n'
+        '  "demo_code": "module sva_axi_handshake_data_stable (input logic clk, ...);\\n  ...\\nendmodule",\n'
+        '  "parameter_defs": [\n'
+        '    {"name": "clk", "type": "string", "required": true, "description": "时钟", '
+        '"expr_type": "sv_identifier", "default": "clk"},\n'
+        '    {"name": "valid", "type": "string", "required": true, "description": "valid 信号", '
+        '"expr_type": "sv_identifier"}\n'
+        "  ],\n"
+        '  "jinja_body": "module dut (input logic {{ clk }}, input logic {{ valid }});\\n  ...\\nendmodule",\n'
+        '  "keywords": ["AXI", "握手", "handshake"],\n'
+        '  "subcategory": "handshake",\n'
+        '  "protocol": "AXI4"\n'
+        "}\n"
+        "```\n"
+    )
+
+
+def _validate_template_name(name: str) -> None:
+    """FEAT-10：template_name 命名规范校验。失败抛 ContributionParseError(stage=template_name)。"""
+    if not isinstance(name, str) or not name.strip():
+        raise ContributionParseError(
+            "LLM 未返回 template_name 或为空",
+            stage="template_name",
+        )
+    if not _VALID_TEMPLATE_NAME_RE.match(name):
+        raise ContributionParseError(
+            f"template_name {name!r} 不符合命名规范 ^(sva|cov)_[a-z][a-z0-9_]*_v\\d+$",
+            stage="template_name",
+        )
+
+
+async def generate_from_intent(
+    original_intent: str,
+    code_type: str,
+    llm: LLMClient,
+) -> ExtractedFull:
+    """FEAT-10：仅基于 original_intent + code_type 让 LLM 生成完整模板。
+
+    与 derive_parameters_from_demo 区别：用户没有 demo_code，所有 5 个字段
+    （template_name / description / demo_code / parameter_defs / keywords）全由 LLM 产出。
+
+    校验流程（与 derive_parameters_from_demo 共享 3 道校验，额外加 template_name 规范）：
+    1. template_name 匹配 ^(sva|cov)_[a-z][a-z0-9_]*_v\\d+$ 正则
+    2. parameter_defs 命名 / expr_type 合法
+    3. jinja_body 用 SandboxedEnvironment + StrictUndefined 可渲染（含 SSTI 防护）
+    4. keywords 形态合法
+
+    任一失败 → ContributionParseError，端点应转 422。
+    """
+    if not original_intent or not original_intent.strip():
+        raise ContributionParseError("original_intent 为空", stage="input")
+
+    prompt = _build_generation_prompt(original_intent, code_type)
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "你是 IC 验证模板库管理员，"
+                "专门把验证工程师的自然语言意图转换为规范化的可参数化模板。"
+            ),
+        },
+        {"role": "user", "content": prompt},
+    ]
+    raw = await llm.chat(messages, max_tokens=2048)
+    parsed = _extract_json_block(raw)
+
+    template_name = parsed.get("template_name", "")
+    description = parsed.get("description", "")
+    demo_code = parsed.get("demo_code", "")
+    parameter_defs = parsed.get("parameter_defs", [])
+    jinja_body = parsed.get("jinja_body", "")
+    keywords = parsed.get("keywords", [])
+    subcategory = parsed.get("subcategory") or None
+    protocol = parsed.get("protocol") or None
+
+    # 校验（顺序：template_name → param_defs → jinja → keywords）
+    _validate_template_name(template_name)
+    _validate_parameter_defs(parameter_defs)
+    # jinja_syntax 失败时 retry once：把错误原文反馈给 LLM 让其自修正
+    try:
+        _validate_jinja_rendering(jinja_body, parameter_defs)
+    except ContributionParseError as _jinja_err:
+        if _jinja_err.stage not in ("jinja_syntax", "jinja_render"):
+            raise
+        retry_messages = messages + [
+            {"role": "assistant", "content": raw},
+            {
+                "role": "user",
+                "content": (
+                    f"上面的 jinja_body 有 Jinja2 语法错误：{_jinja_err.reason}\n"
+                    "请修正 jinja_body，只修正语法错误，其他字段保持不变，仍返回完整 JSON。\n"
+                    "注意：{{ }} 内只放参数名（如 {{ clk }}），"
+                    "SystemVerilog 大括号 {a, b} 应原样保留在模板文本里，不要包进 {{ }}。"
+                ),
+            },
+        ]
+        raw = await llm.chat(retry_messages, max_tokens=2048)
+        parsed = _extract_json_block(raw)
+        jinja_body = parsed.get("jinja_body", jinja_body)
+        parameter_defs = parsed.get("parameter_defs", parameter_defs)
+        _validate_jinja_rendering(jinja_body, parameter_defs)
+    cleaned_keywords = _validate_keywords(keywords)
+
+    if not isinstance(description, str) or not description.strip():
+        raise ContributionParseError("LLM 未返回 description 或为空", stage="description")
+    if not isinstance(demo_code, str) or not demo_code.strip():
+        raise ContributionParseError("LLM 未返回 demo_code 或为空", stage="demo_code")
+
+    return ExtractedFull(
+        parameter_defs=parameter_defs,
+        jinja_body=jinja_body,
+        keywords=cleaned_keywords,
+        subcategory=subcategory if isinstance(subcategory, str) else None,
+        protocol=protocol if isinstance(protocol, str) else None,
+        template_name=template_name,
+        description=description,
+        demo_code=demo_code,
     )

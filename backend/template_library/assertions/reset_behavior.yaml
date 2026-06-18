@@ -8,18 +8,39 @@ tags:
   - reset
   - initialization
   - power_on
+  - fsm_reset
+  - state_initialization
 keywords:
   - 复位
   - reset
   - 初始值
   - initialization
+  - 初始状态
+  - 状态寄存器
+  - FSM复位
+  - rst_n释放
+  - 复位后初始值
+  - 上电初始化
+  - 寄存器清零
+  - 复位释放
 description: |
-  验证复位信号释放后目标信号必须在指定周期内达到初始值，确保正确的复位行为。
+  做什么：验证复位（rst_n）释放后，目标信号在 settle_cycles 周期内必须等于 init_value；同时断言复位有效期间 target 必须保持 init_value。触发是 $rose(rst_n) 边沿，不带业务 condition。
+  典型场景：cur_state 在 rst_n 释放后必须等于 IDLE；data_out 寄存器复位后归零；counter 上电复位后必须为 0；状态机复位后回到 INIT 而非任意值。
+  边界：请勿用于"在某业务条件满足时 FSM 从 A 跳到 B"（非复位触发，需要 condition 参数）—— 那是 sva_fsm_state_transition_v1；也不要用于"使能无效时数据不变"—— 那是 sva_data_integrity_v1。
+differentiators:
+  - 触发条件是 $rose(rst_n)（复位事件），不带业务 condition 参数（vs sva_fsm_state_transition_v1）
+  - 必填 init_value 参数（复位后期望值，可以是 0 / IDLE / INIT）；sva_fsm_state_transition_v1 用 to_state
+  - 同时检查复位期间 target == init_value 和复位释放后 target 重新等于 init_value 两条断言
+non_use_cases:
+  - 验证业务条件触发的 FSM 状态跳转（应用 sva_fsm_state_transition_v1）
+  - 验证使能无效时数据保持不变（应用 sva_data_integrity_v1）
+  - 验证 valid/ready 协议握手或时序延迟
 parameters:
   - name: module_name
     type: string
     required: true
     description: 模块名
+    default: dut
   - name: clk
     type: string
     required: true
@@ -33,12 +54,12 @@ parameters:
   - name: target
     type: string
     required: true
-    description: 目标信号名
+    description: 目标信号名（数据信号或状态寄存器，如 cur_state、data_out）
     role_hint: data
   - name: init_value
     type: string
     required: true
-    description: 复位后期望的初始值
+    description: 复位后期望的初始值（数值或枚举值，如 0、IDLE、INIT）
     default: "0"
   - name: settle_cycles
     type: integer

@@ -24,10 +24,21 @@ class Template(Base):
     description: Mapped[str] = mapped_column(Text, nullable=False)
     parameters: Mapped[dict] = mapped_column(JSONB, nullable=False, default=list)
     template_body: Mapped[str] = mapped_column(Text, nullable=False)
+    # 旧 `maturity` 列：开发成熟度（draft/validated/production，ORM 与 migration 001
+    # 的 enum 值存在历史漂移），与 FEAT-13 引入的生产门控 `maturity_level` 语义不同，
+    # 两列并存，绝不能混用。
     maturity: Mapped[str] = mapped_column(
         Enum("draft", "validated", "production", name="maturity_enum"),
         nullable=False,
         default="draft",
+    )
+    # FEAT-13 生产门控：production 进入 RAG 召回主库；experimental / draft 仅显示在
+    # admin 库，不参与召回。通过 review 的贡献模板固定 experimental，须 super_admin
+    # 显式 PATCH 提升。
+    maturity_level: Mapped[str] = mapped_column(
+        Enum("production", "experimental", "draft", name="template_maturity_enum"),
+        nullable=False,
+        default="experimental",
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     related_ids: Mapped[list[str]] = mapped_column(ARRAY(String), nullable=True)

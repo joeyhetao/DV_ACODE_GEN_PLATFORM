@@ -32,6 +32,7 @@ from app.core.database import AsyncSessionLocal  # noqa: E402
 from app.core.vector_store import get_qdrant  # noqa: E402
 from app.services.embedding_client import get_embedding_client  # noqa: E402
 from app.services.intent.normalizer import normalize_intent  # noqa: E402
+from app.services.registry import get_registry  # noqa: E402
 
 
 _CORPUS_PATH = Path(__file__).resolve().parent.parent / "tests" / "data" / "offtopic_corpus.yaml"
@@ -58,6 +59,20 @@ async def _dense_top1(text: str, code_type: str) -> float:
     return float(res.points[0].score) if res.points else 0.0
 
 
+async def _best_overall_dense(text: str, selected_code_type: str) -> float:
+    """FEAT-15：模拟生产 gate 1 的判定信号 `best_overall = max(selected, max(other))`。
+
+    生产侧 pipeline_preview 用 `_compute_cross_code_type_scores` 对每个 registered
+    code_type 各跑一次 dense top1，取最大值。本函数复刻同样的语义供阈值校准。
+    `selected_code_type` 仅决定结果里"选中那条"的列；最大值是跨全库取的。
+    """
+    registry = get_registry()
+    scores: list[float] = []
+    for ct in registry.all():
+        scores.append(await _dense_top1(text, ct.id))
+    return max(scores) if scores else 0.0
+
+
 def _expand_off_topic(raw: list[dict]) -> list[tuple[str, str, str]]:
     """off_topic 段每条 sample 按 code_types 列表展开为多条 case。"""
     out = []
@@ -77,13 +92,17 @@ async def main() -> None:
     marg_cases = _expand_marginal(corpus.get("marginal_ic", []))
 
     async def _measure(cases: list[tuple[str, str, str]], label: str):
-        print("=" * 100)
+        print("=" * 110)
         print(f"{label} ({len(cases)} cases)")
-        print("=" * 100)
-        print(f"{'id':<35}{'code_type':<12}{'score_orig':>12}{'score_norm':>12}  normalized")
-        print("-" * 100)
+        print("=" * 110)
+        print(
+            f"{'id':<35}{'code_type':<12}{'score_orig':>12}{'score_norm':>12}"
+            f"{'score_overall':>15}  normalized"
+        )
+        print("-" * 110)
         scores_orig: list[float] = []
         scores_norm: list[float] = []
+        scores_overall: list[float] = []
         async with AsyncSessionLocal() as db:
             for cid, ct, text in cases:
                 try:
@@ -93,15 +112,22 @@ async def main() -> None:
                     continue
                 s_orig = await _dense_top1(text, ct)
                 s_norm = await _dense_top1(normalized, ct)
+                # FEAT-15：production gate 1 实际用 best_overall（全库 max）做判定，
+                # 阈值推荐必须基于这个分布，不能用 selected-only 的 score_orig 误导。
+                s_overall = await _best_overall_dense(text, ct)
                 scores_orig.append(s_orig)
                 scores_norm.append(s_norm)
+                scores_overall.append(s_overall)
                 preview = (normalized[:48] + "…") if len(normalized) > 48 else normalized
-                print(f"{cid:<35}{ct:<12}{s_orig:>12.4f}{s_norm:>12.4f}  {preview}")
-        return scores_orig, scores_norm
+                print(
+                    f"{cid:<35}{ct:<12}{s_orig:>12.4f}{s_norm:>12.4f}"
+                    f"{s_overall:>15.4f}  {preview}"
+                )
+        return scores_orig, scores_norm, scores_overall
 
-    off_orig, off_norm = await _measure(off_cases, "OFF_TOPIC 段")
+    off_orig, off_norm, off_overall = await _measure(off_cases, "OFF_TOPIC 段")
     print()
-    marg_orig, marg_norm = await _measure(marg_cases, "MARGINAL_IC 段")
+    marg_orig, marg_norm, marg_overall = await _measure(marg_cases, "MARGINAL_IC 段")
 
     def _stats(label: str, scores: list[float]) -> dict:
         if not scores:
@@ -135,14 +161,22 @@ async def main() -> None:
     print("STATISTICS")
     print("=" * 100)
     print()
-    _print_compare("embed=ORIGINAL_INTENT (跳过 normalize)", off_orig, "...", marg_orig)
+    _print_compare("embed=ORIGINAL_INTENT, score=SELECTED_ONLY (诊断)", off_orig, "...", marg_orig)
     print()
-    _print_compare("embed=NORMALIZED (生产现状)", off_norm, "...", marg_norm)
+    _print_compare("embed=NORMALIZED, score=SELECTED_ONLY (诊断)", off_norm, "...", marg_norm)
+    print()
+    # FEAT-15：production gate 1 用 best_overall（embed=ORIGINAL，score=全库 max）。
+    # 推荐阈值必须基于这一行的分布，前两行只是排查诊断。
+    _print_compare(
+        "embed=ORIGINAL_INTENT, score=BEST_OVERALL (生产 gate 1 实际语义)",
+        off_overall, "...", marg_overall,
+    )
 
-    # 建议的 env 行：让运维直接粘贴进 .env 即可生效（无需改代码 / 重 build 镜像）
-    if off_orig and marg_orig:
-        off_max = max(off_orig)
-        marg_min = min(marg_orig)
+    # 建议的 env 行：让运维直接粘贴进 .env 即可生效（无需改代码 / 重 build 镜像）。
+    # 用 best_overall 分布做推荐——和生产 gate 1 的判定信号严格对齐。
+    if off_overall and marg_overall:
+        off_max = max(off_overall)
+        marg_min = min(marg_overall)
         gap = marg_min - off_max
         if gap > 0:
             recommended = round(off_max + gap / 2, 2)
@@ -150,7 +184,7 @@ async def main() -> None:
             recommended = round(max(0.0, marg_min - 0.02), 2)
         print()
         print("=" * 100)
-        print("写入 .env（生效需重启 backend）：")
+        print("写入 .env（生效需重启 backend）—— 基于 best_overall 分布：")
         print(f"  OFFTOPIC_DENSE_THRESHOLD={recommended}")
         print("=" * 100)
 

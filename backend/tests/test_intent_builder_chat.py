@@ -63,6 +63,7 @@ def test_build_system_prompt_includes_rag_candidates():
             "template_id": "cov_x",
             "name": "覆盖率组 X",
             "description": "测试用",
+            "score": 0.85,
             "template": MagicMock(parameters=[
                 {"name": "signal", "required": True, "description": "信号名"},
             ]),

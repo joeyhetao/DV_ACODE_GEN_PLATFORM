@@ -4,7 +4,8 @@ import { Layout, Menu, Avatar, Dropdown, Space, Typography } from 'antd'
 import {
   CodeOutlined, UploadOutlined, BookOutlined, BulbOutlined,
   ContainerOutlined, SettingOutlined, UserOutlined, LogoutOutlined,
-  ThunderboltOutlined, TeamOutlined, RobotOutlined,
+  ThunderboltOutlined, TeamOutlined, RobotOutlined, BarChartOutlined,
+  FileSearchOutlined,
 } from '@ant-design/icons'
 import { useAuthStore } from '../store/authStore'
 
@@ -26,6 +27,8 @@ const menuItems = [
       { key: '/admin/contributions', icon: <ContainerOutlined />, label: '贡献审核' },
       { key: '/admin/llm', icon: <RobotOutlined />, label: 'LLM 配置' },
       { key: '/admin/users', icon: <TeamOutlined />, label: '用户管理' },
+      { key: '/admin/analytics', icon: <BarChartOutlined />, label: '数据分析' },
+      { key: '/admin/improvement-reports', icon: <FileSearchOutlined />, label: '对比报告' },
     ],
   },
 ]

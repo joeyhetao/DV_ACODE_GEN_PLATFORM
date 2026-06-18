@@ -7,6 +7,73 @@
 
 ---
 
+## 第零步：preflight（docs 分支自动 rebase）
+
+如果当前分支匹配 `docs/*`，**先运行以下检查并自动修复**，再进入第一步：
+
+```bash
+BRANCH=$(git symbolic-ref --short HEAD)
+case "$BRANCH" in
+  docs/*)
+    git fetch origin develop --quiet
+    if ! git merge-base --is-ancestor origin/develop HEAD; then
+      echo "[preflight] '$BRANCH' is behind origin/develop — rebasing automatically..."
+      git rebase origin/develop
+      if [ $? -ne 0 ]; then
+        echo "ABORT: rebase failed with conflicts. Resolve manually, then retry /update-specs."
+        exit 1
+      fi
+      echo "[preflight] rebase complete. Proceeding with up-to-date base."
+    else
+      echo "[preflight] branch is up to date with origin/develop."
+    fi
+    ;;
+esac
+```
+
+- **自动 rebase 成功**：直接继续，无需用户干预。
+- **rebase 冲突**（极罕见，仅当 docs 和 feat 改动了同一文档行）：输出错误并终止，需要手动解决冲突后重试。
+
+非 `docs/*` 分支（master / main / develop / feature/* / hotfix/*）跳过此检查。
+
+---
+
+## 第零点五步：spec + handoff JSON 摄入（v3 multi-agent workflow）
+
+如果是 multi-agent workflow 走过来的，当前 worktree 内会有一份 spec.md，且对面 feat worktree 的 `.claude/state/<ticket>.code.md` 会有 coder 填好的 Handoff JSON。**先读这两份**，能把要打开的文档范围从 5 份压缩到 1-3 份，避免 PRD/ARCH 全文 35k+ token 读入。
+
+```bash
+BRANCH=$(git symbolic-ref --short HEAD)
+TICKET=$(echo "$BRANCH" | sed -E 's|^(feature|fix|docs|hotfix|spec)/||')
+
+# 本 worktree 的 spec
+SPEC_PATH=".claude/plans/$TICKET.spec.md"
+
+# 对面 feat worktree 的 handoff state（路径上溯）
+REPO_NAME=$(basename "$(git rev-parse --show-toplevel)" | sed -E 's|-(feat|docs)-.+$||')
+FEAT_WT="../${REPO_NAME}-feat-${TICKET}"
+HANDOFF_PATH="$FEAT_WT/.claude/state/$TICKET.code.md"
+```
+
+读取顺序：
+
+1. **若 `$SPEC_PATH` 存在**：用 Read 工具读它。提取
+   - 前 matter 的 `ticket` / `status`
+   - §6 Docs Impact（哪些文档需要碰）
+   - §8 Machine block 的 JSON（用正则 `## 8\. Machine block.*?\`\`\`json\s*\n(.*?)\n\`\`\`` 提取，json.loads 解析）
+2. **若 `$HANDOFF_PATH` 存在**：用 Read 工具读它。提取 `## Handoff JSON` 段下的 fenced json block。**handoff 与 spec §8 冲突时，handoff 胜**（反映实际改动 vs 计划）。
+3. 合并后得到这一组事实：
+   - `docs_targets`：本次实际需要更新的文档子集（ARCHITECTURE / PRD / README / CHANGELOG / CONTRIBUTING）
+   - `changelog.{type, scope}`：CHANGELOG 条目的 header
+   - `affected_paths`：ARCH §7 目录树校对范围
+   - `needs_migration`：是否要提醒文档里的 migration 相关章节
+
+**约束**：本步骤获取的 `docs_targets` 限定后续第二步/第三步的读取范围。例如 `docs_targets=["ARCHITECTURE"]` 时，**跳过 PRD.md 的读入**，直接进入 ARCH 更新流程。
+
+**若两份文件都不存在**：fall through 到下面的第一步（按 git log 推断变更），与 v2 行为完全兼容。
+
+---
+
 ## 执行步骤
 
 ### 第一步：采集变更信息

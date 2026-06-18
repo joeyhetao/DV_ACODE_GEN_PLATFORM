@@ -1,5 +1,62 @@
 根据项目当前真实进展，更新 README.md、CHANGELOG.md、CONTRIBUTING.md 三份文档。
 
+## 第零步：preflight（docs 分支自动 rebase）
+
+如果当前分支匹配 `docs/*`，**先运行以下检查并自动修复**，再进入第一步：
+
+```bash
+BRANCH=$(git symbolic-ref --short HEAD)
+case "$BRANCH" in
+  docs/*)
+    git fetch origin develop --quiet
+    if ! git merge-base --is-ancestor origin/develop HEAD; then
+      echo "[preflight] '$BRANCH' is behind origin/develop — rebasing automatically..."
+      git rebase origin/develop
+      if [ $? -ne 0 ]; then
+        echo "ABORT: rebase failed with conflicts. Resolve manually, then retry /update-docs."
+        exit 1
+      fi
+      echo "[preflight] rebase complete. Proceeding with up-to-date base."
+    else
+      echo "[preflight] branch is up to date with origin/develop."
+    fi
+    ;;
+esac
+```
+
+- **自动 rebase 成功**：直接继续，无需用户干预。
+- **rebase 冲突**（极罕见，仅当 docs 和 feat 改动了同一文档行）：输出错误并终止，需要手动解决冲突后重试。
+
+非 `docs/*` 分支跳过此检查。
+
+## 第零点五步：spec + handoff JSON 摄入（v3 multi-agent workflow）
+
+如果当前 ticket 是 multi-agent workflow 走过来的，spec.md 的 §8 Machine block 和对面 feat worktree 的 Handoff JSON 已经告诉了我们：
+
+- `docs_targets` 是否包含 `README` / `CHANGELOG` / `CONTRIBUTING`？
+- `changelog.{type, scope}` 是什么？（直接 seed CHANGELOG 条目 header）
+- `affected_paths` 改动了哪些目录？（CONTRIBUTING 目录树是否要更新）
+
+读取逻辑：
+
+```bash
+BRANCH=$(git symbolic-ref --short HEAD)
+TICKET=$(echo "$BRANCH" | sed -E 's|^(feature|fix|docs|hotfix|spec)/||')
+SPEC_PATH=".claude/plans/$TICKET.spec.md"
+REPO_NAME=$(basename "$(git rev-parse --show-toplevel)" | sed -E 's|-(feat|docs)-.+$||')
+FEAT_WT="../${REPO_NAME}-feat-${TICKET}"
+HANDOFF_PATH="$FEAT_WT/.claude/state/$TICKET.code.md"
+```
+
+1. **若 `$SPEC_PATH` 存在**：用 Read 提取 §6 Docs Impact 段 + §8 fenced JSON。
+2. **若 `$HANDOFF_PATH` 存在**：用 Read 提取 `## Handoff JSON` 下的 fenced JSON。冲突时 handoff 胜。
+3. 合并 `docs_targets`：限定本步只更新被点名的文件子集。
+   - 若 `docs_targets=["CHANGELOG"]` → 跳过 README + CONTRIBUTING 的更新
+   - 若 `docs_targets=[]` → 直接告诉用户"spec 标记本 ticket 不需要 docs 更新"并退出
+4. 用 `changelog.type` + `changelog.scope` 预填 CHANGELOG 新条目 header（仍需第三步根据 git log 校对 subject 措辞）。
+
+**若两份文件都不存在**：fall through 到下面的第一步（按 git log 推断变更），保持 v2 行为。
+
 ## 执行步骤
 
 ### 第一步：采集项目真实状态
@@ -76,13 +133,35 @@ git status
 
 不要修改 CONTRIBUTING.md 的其他章节（分支策略、提交规范等保持不变）。
 
+### 第四点五步（条件）：更新 docs/test-manual.md
+
+**仅当 `docs_targets` 包含 `"test-manual"` 时执行**，否则跳过。
+
+操作方式：
+1. 读取 handoff JSON 中的 `affected_paths`，判断涉及的功能范围（admin UI / 生成流程 / 新端点 / 新闸逻辑）
+2. 分段读取 `docs/test-manual.md`（先读目录结构，再读受影响章节，避免 token 爆炸）
+3. 在最相关的章节末尾（或新建子章节）追加新功能的测试步骤，格式与现有章节一致：
+   - 步骤编号（1. 2. 3. …）
+   - 每步写明操作 + **预期结果**
+   - 附日志验证命令（`docker compose logs -f backend | grep ...`）
+   - 附 DB 验证 SQL（如涉及新表）
+4. 如新增了 API 端点，在"附录 B：错误响应结构对照"补充新端点的响应格式
+5. 不要修改其他章节的内容和格式
+
 ### 第五步：提交
 
-完成三个文件的修改后，执行：
+完成修改后，执行（按实际修改的文件调整 git add 列表）：
 
 ```bash
-git add README.md CHANGELOG.md CONTRIBUTING.md
-git commit -m "docs: sync README/CHANGELOG/CONTRIBUTING with current project state"
+# 必选（至少有一项有变动）
+git add CHANGELOG.md
+
+# 按需追加
+# git add README.md
+# git add CONTRIBUTING.md
+# git add docs/test-manual.md
+
+git commit -m "docs: sync README/CHANGELOG/CONTRIBUTING/test-manual with current project state"
 ```
 
 ## 注意事项

@@ -61,6 +61,41 @@ class Settings(BaseSettings):
     # 关闸：UNDER_SPECIFIED_GATE_ENABLED=false 退回旧"始终返代码"行为。
     under_specified_gate_enabled: bool = True
 
+    # No-matching-template 闸（第五道闸）：LLM step1 明确拒绝所有候选（rag_fallback）
+    # 即触发，直接跳贡献页省去 5 轮无效对话。
+    # FIX-9：去掉 RAG top-1 分数阈值条件——cross-encoder 词汇重叠会给语义不相关模板
+    # 高分（如 cpu_req/dma_req 互斥意图命中含 req 关键词的握手模板得 1.0），
+    # score 阈值反而否决 LLM 正确的 none 判断。只信 LLM step1。
+    # 关闸：NO_MATCH_GATE_ENABLED=false 退回旧 rag_fallback → under_specified 流程。
+    # no_match_score_threshold 保留供日志/监控参考及潜在未来用途，不再参与闸判断。
+    no_match_gate_enabled: bool = True
+    no_match_score_threshold: float = 0.60
+
+    # A8 step1 二次验证：LLM step1 选出 template_id 后，再发一条 yes/no 问询，确认
+    # 选中的模板核心验证语义与意图一致。若 LLM 答 'no' 则把 confidence_source 从
+    # "llm_step1" 降级为 "rag_fallback"，进而被 no_matching_template 闸（若开启）
+    # 拦下引导贡献。这是 A12 confusion corpus 的辅助防线。
+    # fail-open：LLM 调用失败 / 解析失败一律视为通过（避免新加这条验证反成误拒来源）。
+    # **默认 True**（2026-05-29 启用）：fix-step1 ticket 完成 + A12 confusion corpus
+    # 上线 + reranker calibration 后开启。每次 step1 增加一次 LLM call (~1s)。若发现
+    # 误拒率异常升高，可在运行环境通过 STEP1_VERIFY_ENABLED=false 临时关闭。
+    step1_verify_enabled: bool = True
+
+    # A9 reranker score gate（pipeline 层独立 gate）：LLM step1 选出 template_id 后，
+    # 查询该 id 在 stage3 reranker 输出中的 score，低于阈值 → 抛 NoMatchingTemplateError。
+    # 与 FIX-9 移除的 no_match_score_threshold 的语义区分：
+    #   no_match_score_threshold = RAG top-1 score 的阈值（FIX-9 移除，只信 LLM）
+    #   reranker_min_score_threshold = "被 LLM 选中" 的那个模板的 reranker score
+    # 即：A9 仅在 LLM 信心十足地选了某 id，但该 id 的 cross-encoder 重排得分仍偏低
+    # 时介入；典型场景是 LLM 被误导（如 description 信息不足）+ reranker 客观打低分。
+    # **默认 False**（2026-05-29 calibration 结果：correct_p10=0.58 < wrong_p50=0.67，
+    # 两段重叠，reranker 在 confusion 对上判别力不足，任何阈值都会误拒 ≥10% correct）：
+    # 待 plan 路线图 Stage 1 观察期结束、differentiators / description 进一步优化 +
+    # 重跑 calibrate_reranker_threshold.py 产出正 gap 后再启用。强行启用会误拒 marginal
+    # 真请求或失去 gate 拦截能力（取决于阈值方向）。
+    step1_reranker_gate_enabled: bool = False
+    reranker_min_score_threshold: float = 0.30
+
     # Celery
     celery_broker_url: str = "redis://localhost:6379/1"
     celery_result_backend: str = "redis://localhost:6379/2"

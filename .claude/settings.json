@@ -50,7 +50,25 @@
       "Bash(git apply*)",
       "Bash(git format-patch*)",
       "Bash(git notes*)",
-      "Bash(git config*)"
+      "Bash(git config*)",
+      "Bash(gh pr create*)",
+      "Bash(gh pr edit*)",
+      "Bash(gh pr merge*)",
+      "Bash(gh pr close*)",
+      "Bash(gh pr reopen*)"
+    ]
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write|MultiEdit|NotebookEdit|Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python \"$CLAUDE_PROJECT_DIR/scripts/hooks/branch-scope-guard.py\""
+          }
+        ]
+      }
     ]
   }
 }

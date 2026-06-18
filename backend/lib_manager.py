@@ -96,6 +96,20 @@ async def _import(lib_dir: Path, force: bool):
                         + ", ".join(missing_expr_type)
                     )
 
+                # 把 YAML 里的 differentiators / non_use_cases 序列化进 description
+                # 末尾——spec §3 Out 明确"不修改数据库 schema"，所以这两个字段必须
+                # 借现有 description 列流转到 pipeline.candidate_dicts → LLM prompt。
+                # 拼接位置在末尾、用固定标题包裹，方便：
+                #   1) reranker（engine.py:90 拼 name + description 作为 encoded text）
+                #      也能看到区分信息，对近邻混淆对的客观打分有帮助
+                #   2) lib_manager.export 反向写回 YAML 时按标题切分恢复原结构（未实现，
+                #      当前 ticket 不做导出回写）
+                description = _compose_description(
+                    data.get("description", ""),
+                    data.get("differentiators") or [],
+                    data.get("non_use_cases") or [],
+                )
+
                 from datetime import datetime, timezone
                 template = Template(
                     id=template_id,
@@ -106,10 +120,15 @@ async def _import(lib_dir: Path, force: bool):
                     protocol=data.get("protocol"),
                     tags=data.get("tags"),
                     keywords=data.get("keywords"),
-                    description=data.get("description", ""),
+                    description=description,
                     parameters=data.get("parameters", []),
                     template_body=data["template_body"],
                     maturity=data.get("maturity", "draft"),
+                    # FEAT-13：YAML 显式声明 maturity_level（官方模板写 'production'），
+                    # 缺省时回落到 ORM default 'experimental'。这与 migration 009 backfill
+                    # 的 sva_/cov_ 规则相互独立——CLI import 只信 YAML 字面值，避免 YAML
+                    # 与 backfill 分支双向漂移。
+                    maturity_level=data.get("maturity_level", "experimental"),
                     related_ids=data.get("related_ids"),
                     created_by=None,
                     sync_status="syncing",
@@ -143,11 +162,19 @@ async def _import(lib_dir: Path, force: bool):
 @cli.command("validate")
 @click.option("--dir", "lib_dir", default=str(TEMPLATE_LIBRARY_DIR))
 def cmd_validate(lib_dir: str):
-    """验证 YAML 模板文件语法"""
+    """验证 YAML 模板文件语法 + description 完整性 + differentiators/non_use_cases 字段形态。
+
+    校验类别：
+      ERROR — 必填字段缺失 / template_body Jinja2 语法错 / differentiators / non_use_cases
+              若声明则必须是非空 list（出现这两个键且为空 list 或非 list → 视为意图缺失，按 ERROR 拦）。
+      WARN  — description 缺失 或 < 30 字节（A10 引入：要求 description 覆盖
+              "做什么 / 典型场景 / 边界"三要素，60 字以下大概率没说全）。
+    """
     from app.services.core.renderer import validate_template_syntax
 
     files = list(Path(lib_dir).rglob("*.yaml"))
     errors = 0
+    warnings = 0
     for f in files:
         try:
             data = yaml.safe_load(f.read_text(encoding="utf-8"))
@@ -156,38 +183,74 @@ def cmd_validate(lib_dir: str):
                 if key not in data:
                     raise ValueError(f"缺少必填字段: {key}")
             validate_template_syntax(data["template_body"])
+
+            # A10：description 长度 < 30 字节 WARN（鼓励补全"做什么/典型场景/边界"三要素）
+            desc = (data.get("description") or "").strip()
+            if not desc or len(desc.encode("utf-8")) < 30:
+                click.echo(
+                    f"  [WARN] {f.name}: description 缺失或过短"
+                    f"（{len(desc.encode('utf-8'))} bytes < 30），"
+                    "应覆盖「做什么 / 典型场景 / 边界（请勿用于 X 请用 Y）」三要素"
+                )
+                warnings += 1
+
+            # A10：声明了 differentiators / non_use_cases 就必须是非空 list
+            for opt_key in ("differentiators", "non_use_cases"):
+                if opt_key in data:
+                    val = data[opt_key]
+                    if not isinstance(val, list) or len(val) == 0:
+                        raise ValueError(
+                            f"{opt_key} 字段存在但不是非空 list（type={type(val).__name__}，"
+                            f"len={len(val) if isinstance(val, list) else 'n/a'}）"
+                        )
+
             click.echo(f"  [OK] {f.name}")
         except Exception as e:
             click.echo(f"  [ERROR] {f.name}: {e}", err=True)
             errors += 1
 
     if errors:
-        click.echo(f"\n{errors} 个文件验证失败", err=True)
+        click.echo(f"\n{errors} 个文件验证失败（warnings={warnings}）", err=True)
         sys.exit(1)
     else:
-        click.echo(f"\n全部 {len(files)} 个文件验证通过")
+        click.echo(f"\n全部 {len(files)} 个文件验证通过（warnings={warnings}）")
 
 
 # ─── rebuild ─────────────────────────────────────────────────────────────────
 
 @cli.command("rebuild")
 @click.option("--collection", default=None, help="Qdrant collection 名称")
-def cmd_rebuild(collection: str | None):
-    """重建 Qdrant 向量索引（同步所有 sync_status=syncing 的模板）"""
-    asyncio.run(_rebuild(collection))
+@click.option(
+    "--all",
+    "force_all",
+    is_flag=True,
+    help="不限 sync_status，全量 upsert（用于刷新 Qdrant payload，如 FEAT-13 migration 009 后）",
+)
+def cmd_rebuild(collection: str | None, force_all: bool):
+    """重建 Qdrant 向量索引。
+
+    默认仅同步 sync_status=syncing 的模板。FEAT-13 引入 --all：列新增/payload schema 改动
+    后存量行 sync_status 仍为 'ok'，按默认条件只能同步到 0 条；--all 跳过 sync_status 过滤，
+    把所有 active 模板全量 upsert 一遍，刷新 Qdrant payload。
+    """
+    asyncio.run(_rebuild(collection, force_all))
 
 
-async def _rebuild(collection: str | None):
+async def _rebuild(collection: str | None, force_all: bool = False):
     from app.core.database import AsyncSessionLocal
     from app.models.template import Template
     from sqlalchemy import select
 
     async with AsyncSessionLocal() as db:
-        result = await db.execute(
-            select(Template).where(Template.is_active == True, Template.sync_status == "syncing")
-        )
+        where_clauses = [Template.is_active == True]
+        if not force_all:
+            where_clauses.append(Template.sync_status == "syncing")
+        result = await db.execute(select(Template).where(*where_clauses))
         templates = result.scalars().all()
-        click.echo(f"待同步模板: {len(templates)}")
+        click.echo(
+            f"待同步模板: {len(templates)}"
+            + ("（--all：全量刷新 Qdrant payload）" if force_all else "")
+        )
 
         for tmpl in templates:
             try:
@@ -233,6 +296,9 @@ async def _export(out_dir: Path):
                 "parameters": tmpl.parameters or [],
                 "template_body": tmpl.template_body,
                 "maturity": tmpl.maturity,
+                # FEAT-13：必须导出，否则 export → import round-trip 会把 production 模板
+                # 静默降级为 experimental（ORM 缺省值），下次 import 后退出 RAG 召回主库。
+                "maturity_level": tmpl.maturity_level,
                 "related_ids": tmpl.related_ids or [],
             }
             sub = out_dir / tmpl.code_type
@@ -354,6 +420,31 @@ async def _dedup_check(threshold: float | None, code_type: str | None):
 
 # ─── helpers ─────────────────────────────────────────────────────────────────
 
+# 拼接 description 时使用的固定标题——_render_step1_candidate / verify_step1_selection
+# 端的 description[:N] 截断阈值要足够容纳 base + 两段。当前 description ≈ 200–300 char，
+# 区别要点 ≈ 200 char、不适用场景 ≈ 200 char，实测合成最长 812 char
+# （protocol_handshake_coverage）。LLM 候选渲染截断设为 1000 留余量，
+# 避免 non_use_cases 末项被切（review NEW-1）。
+_DESC_DIFF_HEADER = "\n\n区别要点：\n"
+_DESC_NON_HEADER = "\n\n不适用场景：\n"
+
+
+def _compose_description(base: str, differentiators: list[str], non_use_cases: list[str]) -> str:
+    """把 base description + differentiators + non_use_cases 拼成一个 description 字符串。
+
+    spec §3 Out 禁了改 DB schema，所以这两个字段必须搭 description 字段的便车送进
+    DB → Qdrant payload → pipeline.candidate_dicts → LLM step1 / verify prompt。
+    """
+    out = (base or "").rstrip()
+    if differentiators:
+        out += _DESC_DIFF_HEADER + "\n".join(f"- {d}" for d in differentiators)
+    if non_use_cases:
+        out += _DESC_NON_HEADER + "\n".join(f"- {n}" for n in non_use_cases)
+    return out
+
+
+
+
 async def _sync_to_qdrant(db, template, collection: str | None = None):
     from app.core.config import get_settings
     from app.core.vector_store import get_qdrant
@@ -392,6 +483,9 @@ async def _sync_to_qdrant(db, template, collection: str | None = None):
                     "template_id": template.id,
                     "name": template.name,
                     "code_type": template.code_type,
+                    # FEAT-13 maturity 门控：stage1 Filter 依赖此字段，必须随 upsert 写入。
+                    # getattr 兜底兼容旧 ORM 对象（不该出现，但防御性）。
+                    "maturity_level": getattr(template, "maturity_level", "experimental"),
                 },
             )
         ],

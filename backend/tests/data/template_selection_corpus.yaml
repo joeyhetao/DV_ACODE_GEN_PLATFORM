@@ -1,0 +1,297 @@
+# ============================================================================
+# 模板选择回归语料库
+# ----------------------------------------------------------------------------
+# 本文件是系统对"哪条意图应命中哪个模板"的契约声明。
+# 由 test_template_selection_corpus_mocked.py（CI，每次 PR）和
+# test_template_selection_corpus_real.py（手动，--real-embedding 触发）共同消费。
+#
+# ── 增长流程（必读）─────────────────────────────────────────────────────────
+#
+# 触发点 A：发现误判（最高频）
+#   1. 复现原始意图 + 错误命中的模板
+#   2. 把意图加入 correct_mapping，写明 expected_template + note
+#   3. 先跑 mocked 测（red → green 确认逻辑修复）
+#   4. 跑 real-embedding 测（--real-embedding）确认 RAG 排名已恢复
+#   5. PR → CI 永守
+#
+# 触发点 B：新模板上线后（管理员 approve 时自动生成，见 Layer 3b）
+#   平台自动写入 template_corpus_cases DB 表；本文件保留人工标注/历史 bug 语料。
+#
+# ── 字段约定 ────────────────────────────────────────────────────────────────
+#   id               必填，蛇形命名，唯一
+#   intent           必填，用户原始意图文本
+#   code_type        必填，"assertion" | "coverage"
+#   expected_template 必填，应命中的 template_id
+#   added            必填，添加日期 "YYYY-MM-DD"
+#   source           必填，来源（"FIX-N bug report" / "initial seed" / "admin review"）
+#   note             必填，6 个月后能看懂"这条为啥在这"
+#
+# ── 维护准则 ────────────────────────────────────────────────────────────────
+#   - append-only 优先：不删已有样本，它们是历史回归的疫苗
+#   - correct_mapping 每个模板至少保持 2 条用例（覆盖正例 + 区分最近邻的负例场景）
+# ============================================================================
+
+correct_mapping:
+
+  # ── sva_reset_behavior_v1 ────────────────────────────────────────────────
+  - id: reset_cur_state_idle
+    added: "2026-05-23"
+    source: "FIX-3 bug report"
+    note: "状态寄存器复位初始值；曾被误判为 fsm_state_transition（FIX-3）"
+    intent: "复位释放后 cur_state 必须等于 IDLE"
+    code_type: assertion
+    expected_template: sva_reset_behavior_v1
+
+  - id: reset_data_out_zero
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "纯数据寄存器复位初始值，与状态机无关"
+    intent: "rst_n 拉低后 data_out 寄存器必须归零"
+    code_type: assertion
+    expected_template: sva_reset_behavior_v1
+
+  - id: reset_counter_init
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "计数器复位初始值"
+    intent: "复位完成后 counter 应等于 0，不能有残留值"
+    code_type: assertion
+    expected_template: sva_reset_behavior_v1
+
+  # ── sva_fsm_state_transition_v1 ─────────────────────────────────────────
+  - id: fsm_idle_to_active_on_valid
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "有条件触发的状态跳转，不是复位后初始值"
+    intent: "状态机在 IDLE 且 valid 拉高时必须跳转到 ACTIVE"
+    code_type: assertion
+    expected_template: sva_fsm_state_transition_v1
+
+  - id: fsm_active_to_done_on_last
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "数据传输完成后的 FSM 跳转"
+    intent: "当 last_beat 置高时，state 必须从 ACTIVE 跳转到 DONE"
+    code_type: assertion
+    expected_template: sva_fsm_state_transition_v1
+
+  - id: fsm_illegal_transition_blocked
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "非法状态跳转不允许，区别于复位场景"
+    intent: "state 不能从 BUSY 直接跳到 IDLE，必须经过 DRAIN"
+    code_type: assertion
+    expected_template: sva_fsm_state_transition_v1
+
+  # ── sva_data_integrity_v1 ────────────────────────────────────────────────
+  - id: data_integrity_rdata_stable
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "读数据路径无损坏，与握手/复位无关"
+    intent: "rdata 在 rvalid 拉高期间不能被修改"
+    code_type: assertion
+    expected_template: sva_data_integrity_v1
+
+  - id: data_integrity_fifo_no_corruption
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "FIFO 写入读出数据一致性"
+    intent: "FIFO 写入的数据在读出时必须保持不变，验证数据无损坏"
+    code_type: assertion
+    expected_template: sva_data_integrity_v1
+
+  # ── sva_handshake_stable_v1 ──────────────────────────────────────────────
+  - id: handshake_wdata_stable
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "AXI 握手期间数据稳定性"
+    intent: "wvalid 拉高后在 wready 之前 wdata 必须保持稳定"
+    code_type: assertion
+    expected_template: sva_handshake_stable_v1
+
+  - id: handshake_valid_not_drop
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "Valid 信号不能在握手完成前撤销"
+    intent: "awvalid 一旦置高，在 awready 收到之前不能拉低"
+    code_type: assertion
+    expected_template: sva_handshake_stable_v1
+
+  # ── sva_handshake_timeout_v1 ─────────────────────────────────────────────
+  - id: handshake_timeout_ready
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "握手超时检测，区别于数据稳定性"
+    intent: "arvalid 拉高后 64 个周期内必须收到 arready，否则超时"
+    code_type: assertion
+    expected_template: sva_handshake_timeout_v1
+
+  - id: handshake_timeout_response
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "响应超时场景"
+    intent: "发出请求后 128 拍内必须收到响应，超时视为错误"
+    code_type: assertion
+    expected_template: sva_handshake_timeout_v1
+
+  # ── sva_timing_max_delay_v1 ──────────────────────────────────────────────
+  - id: timing_req_to_ack
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "从请求到确认的最大延迟约束"
+    intent: "req 拉高后最多 4 个时钟周期内 ack 必须响应"
+    code_type: assertion
+    expected_template: sva_timing_max_delay_v1
+
+  - id: timing_req_ack_max_delay_8
+    added: "2026-05-23"
+    source: "FIX-4 bug report"
+    note: "曾被误判为 sva_handshake_timeout_v1；req→ack 是通用时序约束，不是 AXI valid/ready 协议"
+    intent: "从 req 拉高到 ack 拉高的最大延迟不超过 8 个时钟周期"
+    code_type: assertion
+    expected_template: sva_timing_max_delay_v1
+
+  - id: timing_start_to_done_pipeline
+    added: "2026-05-23"
+    source: "FIX-4 seed"
+    note: "流水线 start→done 时序，与握手协议无关"
+    intent: "start 信号置高后 done 必须在 16 个时钟内拉高，验证流水线最大延迟"
+    code_type: assertion
+    expected_template: sva_timing_max_delay_v1
+
+  - id: timing_din_to_dout
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "流水线延迟约束"
+    intent: "din_valid 置高后 dout_valid 必须在 3 拍内拉高，不超过最大流水级数"
+    code_type: assertion
+    expected_template: sva_timing_max_delay_v1
+
+  # ── cov_value_coverage_v1 ────────────────────────────────────────────────
+  - id: cov_status_values
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "信号值域覆盖"
+    intent: "统计 status 寄存器所有可能取值的覆盖率"
+    code_type: coverage
+    expected_template: cov_value_coverage_v1
+
+  - id: cov_error_code_range
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "错误码值覆盖"
+    intent: "error_code 信号的 0~15 每个值都必须被覆盖到"
+    code_type: coverage
+    expected_template: cov_value_coverage_v1
+
+  # ── cov_transition_coverage_v1 ───────────────────────────────────────────
+  - id: cov_state_transitions
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "FSM 状态转换覆盖率，区别于断言"
+    intent: "需要覆盖 state 在 IDLE/ACTIVE/DONE 之间所有合法转换路径"
+    code_type: coverage
+    expected_template: cov_transition_coverage_v1
+
+  - id: cov_power_state_transitions
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "电源状态机转换覆盖"
+    intent: "统计 pwr_state 从 ON 到 SLEEP 再到 OFF 的转换覆盖情况"
+    code_type: coverage
+    expected_template: cov_transition_coverage_v1
+
+  # ── cov_protocol_handshake_v1 ────────────────────────────────────────────
+  - id: cov_axi_handshake_scenarios
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "协议握手覆盖率"
+    intent: "覆盖 AXI 写通道 valid/ready 握手的各种时序组合场景"
+    code_type: coverage
+    expected_template: cov_protocol_handshake_v1
+
+  - id: cov_axi_arvalid_ready_four_states
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "AXI4 握手四状态覆盖，区别于通用交叉覆盖"
+    intent: "统计 arvalid 和 arready 握手成功、等待、预备、空闲四种场景的覆盖率"
+    code_type: coverage
+    expected_template: cov_protocol_handshake_v1
+
+  # ── 区分对（防回归）────────────────────────────────────────────────────────
+
+  # reset vs fsm: 业务条件触发跳转 → fsm_state_transition
+  - id: fsm_idle_to_active_condition
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "业务条件（valid）触发跳转，不是复位触发，区别于 reset_behavior"
+    intent: "状态机在 IDLE 状态时 valid 拉高必须跳转到 ACTIVE"
+    code_type: assertion
+    expected_template: sva_fsm_state_transition_v1
+
+  - id: fsm_busy_cannot_jump_to_idle
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "非法跳转禁止场景，条件触发，不是复位"
+    intent: "state 不能从 BUSY 直接跳到 IDLE，必须先经过 DRAIN 状态"
+    code_type: assertion
+    expected_template: sva_fsm_state_transition_v1
+
+  # handshake_stable vs handshake_timeout: 数据稳定性场景
+  - id: handshake_wdata_must_not_change
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "握手等待期间数据不变，关注数据保护而非超时"
+    intent: "wvalid 拉高后在 wready 到来前 wdata 不能发生变化"
+    code_type: assertion
+    expected_template: sva_handshake_stable_v1
+
+  - id: handshake_araddr_stable_during_wait
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "地址信号稳定性，握手等待期间 payload 保持不变"
+    intent: "arvalid=1 且 arready=0 期间 araddr 地址总线必须保持稳定"
+    code_type: assertion
+    expected_template: sva_handshake_stable_v1
+
+  # value vs transition coverage 区分
+  - id: cov_fsm_value_not_transition
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "只关注状态值覆盖（哪些状态被访问），不关注转移路径"
+    intent: "统计 pwr_state 信号取到 ON/STANDBY/SLEEP/OFF 各值的覆盖率"
+    code_type: coverage
+    expected_template: cov_value_coverage_v1
+
+  - id: cov_fsm_transition_not_value
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "关注转移路径（从A跳到B），不是单点值域覆盖"
+    intent: "需要验证 ctrl_state 从 INIT 到 READY、从 READY 到 RUN 的跳转路径都被覆盖"
+    code_type: coverage
+    expected_template: cov_transition_coverage_v1
+
+  - id: cov_req_ack_combinations
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "req/ack 握手组合覆盖"
+    intent: "统计 req 与 ack 握手时序的不同组合路径是否被测试覆盖"
+    code_type: coverage
+    expected_template: cov_protocol_handshake_v1
+
+  # ── cov_cross_coverage_v1 ────────────────────────────────────────────────
+  - id: cov_state_vs_opcode_cross
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "状态与操作码交叉覆盖"
+    intent: "需要交叉覆盖 state 和 opcode 的组合，验证所有状态下的命令都被测到"
+    code_type: coverage
+    expected_template: cov_cross_coverage_v1
+
+  - id: cov_priority_vs_channel_cross
+    added: "2026-05-23"
+    source: "initial seed"
+    note: "优先级与通道组合交叉覆盖"
+    intent: "统计 priority 级别与 channel_id 的交叉覆盖率，确保高优先级在每个通道都测到"
+    code_type: coverage
+    expected_template: cov_cross_coverage_v1

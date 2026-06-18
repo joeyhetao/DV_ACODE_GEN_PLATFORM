@@ -14,13 +14,34 @@ keywords:
   - latency
   - max_delay
   - 响应时间
+  - req
+  - ack
+  - request
+  - response
+  - 请求
+  - 应答
+  - 不超过
+  - 最大周期数
+  - start_event
+  - end_event
 description: |
-  约束起始事件发生后结束事件必须在指定最大延迟周期内发生，用于验证时序SLA。
+  做什么：约束任意起始事件（如 req、start、cmd）的 $rose 边沿之后，结束事件（如 ack、done、resp）必须在 max_delay 周期内出现，用于通用两事件时序 SLA 验证。
+  典型场景：req 上升沿到 ack 不超过 N 周期、start 到 done 的流水线延迟约束、command 到 response 的响应时间上限、interrupt 到 ack 的响应窗口。
+  边界：请勿用于"AXI valid/ready 协议握手超时"（valid 持续拉高等待 ready）—— 那是 sva_handshake_timeout_v1（语义是连续等待而非两次 $rose）；也不要用于"valid 等待期间 data 必须 $stable"—— 那是 sva_handshake_stable_v1。
+differentiators:
+  - 起始 / 结束是两个独立 $rose 边沿事件（vs sva_handshake_timeout_v1 中 valid 持续拉高的连续等待语义）
+  - 参数名 start_event / end_event（vs valid / ready），强调"通用两事件"而非协议角色
+  - 不假设任何协议；keywords 含 req / ack / start / done / response 等通用词
+non_use_cases:
+  - 验证 AXI / AXI-Stream valid-ready 协议握手超时（应用 sva_handshake_timeout_v1）
+  - 验证 valid 等待期间 data 稳定性（应用 sva_handshake_stable_v1）
+  - 验证 FSM 状态转换的触发条件
 parameters:
   - name: module_name
     type: string
     required: true
     description: 模块名
+    default: dut
   - name: clk
     type: string
     required: true

@@ -1,6 +1,11 @@
 from __future__ import annotations
 from datetime import datetime
+from typing import Literal
 from pydantic import BaseModel
+
+
+# FEAT-13 生产门控的三档枚举，与 ORM 列 `maturity_level` 一致；非法值由 Pydantic 422 拦。
+MaturityLevel = Literal["production", "experimental", "draft"]
 
 
 class ParameterDef(BaseModel):
@@ -25,6 +30,7 @@ class TemplateCreate(BaseModel):
     parameters: list[dict]
     template_body: str
     maturity: str = "draft"
+    maturity_level: MaturityLevel = "experimental"
     related_ids: list[str] | None = None
 
 
@@ -35,6 +41,9 @@ class TemplateUpdate(BaseModel):
     parameters: list[dict] | None = None
     template_body: str | None = None
     maturity: str | None = None
+    # FEAT-13 生产门控等级：仅 super_admin 可改（templates.update_template 端点校验）；
+    # 非法值由 Literal 自动 422。
+    maturity_level: MaturityLevel | None = None
     tags: list[str] | None = None
     keywords: list[str] | None = None
     related_ids: list[str] | None = None
@@ -54,6 +63,7 @@ class TemplateOut(BaseModel):
     parameters: list[dict]
     template_body: str
     maturity: str
+    maturity_level: MaturityLevel
     is_active: bool
     related_ids: list[str] | None
     sync_status: str
@@ -71,6 +81,7 @@ class TemplateListOut(BaseModel):
     protocol: list[str] | None
     description: str
     maturity: str
+    maturity_level: MaturityLevel
     is_active: bool
     updated_at: datetime
 

@@ -1,8 +1,8 @@
 # IC验证辅助代码生成平台 — 产品需求文档（PRD）
 
-**版本**：v3.0  
+**版本**：v3.7  
 **状态**：起草中  
-**日期**：2026-05-14  
+**日期**：2026-06-17  
 **变更**：
 - v1.0 → v2.0：输入方式由"自然语言+Excel信号表"调整为"双表格结构化输入"（SVA需求表 + 功能覆盖率需求表）
 - v2.0 → v2.1：新增模板贡献与审核机制，处理 RAG 置信度 < 50% 时模板缺口的知识沉淀闭环
@@ -25,6 +25,36 @@
   - `normalize_intent` 角色降级为"**弃权信号载体**"：sentinel "无法判断类型，输出原文"保留，但下游不再用它做兜底——sentinel 之后参数仍是低置信源时 under_specified 闸照常拦。同义改写本身仍跑（保 cache key 稳定），但**不**承担"我替你猜你想说什么"的职责。
   - PipelineInput 新增可选字段 `source: "intent_builder" | "direct" = "direct"`，仅供日志/统计区分入口（不影响路由逻辑）。
   - **不**加新的低 confidence 硬闸——v2.13 的 4 道闸（off-topic / code_type_mismatch / under_specified / empty_retrieval）已覆盖所有"用户问题"场景，置信度保留为信息性元数据，由前端 ConfirmationPanel 软提示「贡献新模板」入口决定后续动作
+- v3.0 → v3.1：**§3.7 模板贡献向导从 4 字段再次简化为 2 字段**（FEAT-10）——用户只填 `original_intent + code_type` 两件，`template_name / description / demo_code` 由后端 LLM 一次性生成；前端提交 Modal 改为两步 Steps：Step 1 输入意图调 `POST /api/v1/contributions/preview` 取预览；Step 2 展示并允许编辑 `template_name / description / demo_code`，提供「提交审核」与「立即使用」两个按钮。新增**双层审核**机制：第一层是用户在 Step 2 对 LLM 输出做语义级验证（编辑或接受），第二层是管理员三栏审核（不变）。「立即使用」直接在 Step 2 页面内展示可复制代码框（`<pre>` 块 + 复制按钮），**不再跳转 `/generate`**——避免 `pending_review` 贡献因不在 Qdrant 中触发 `no_matching_template` 闸进入循环。LLM 生成的 `template_name` 走 `^(sva|cov)_[a-z][a-z0-9_]*_v\d+$` 命名规范校验 + `check_name_duplicate`，重名时预览响应携带 `name_conflict: true` 非阻塞提示（前端 Warning Alert 引导改名后重提）。`ContributionOut` 新增 `use_immediately_available: bool` 恒 true 字段供前端条件渲染。原 4 字段提交路径（`template_name + description + demo_code` 全传）作为分支 3 完全向后兼容；`parameter_defs` 显式传入仍走 v2 批量路径不调 LLM。
+- v3.1 → v3.2：**新增 §3.9 L3 用户反馈机制 + §3.10 L4 管理员分析仪表盘**——
+  - §3.9 GeneratePage `result` 阶段插入 3 档评分按钮（1=好/2=一般/3=差）；差评点击弹出 reason_tags 多选 Modal（7 项固定枚举：`wrong_template` / `hallucinated_signal` / `syntax_error` / `semantic_error` / `style_bad` / `missing_disable_iff` / `other`）+ 可选 `comment` 文本框（≤ 2048 字符）；任一档提交成功后整组按钮置灰
+  - §3.9 `POST /api/v1/feedback/{generation_record_id}`：rating ∈ {1,2,3}（其他 422）、rating=3 必填 reason_tags（否则 422 `reason_tags_required`）；权限 owner-or-admin（普通用户只能评自己的记录，库管理员+ 可补评他人）；成功返 204；写入 `generation_records` 的 4 个 feedback 列 + 回填 `generation_mode='rag'`（若原 NULL）
+  - §3.10 新增 4 个 KPI 端点（`/admin/analytics/{feedback-summary, template-issues, intent-confusion, no-match-rate}`），全部要求 `lib_admin` / `super_admin`，`days` 窗 ∈ [1, 90] 默认 7；`intent-confusion` 仅从 `feedback_rating=3 AND template_id != rag_top3[0].template_id` 聚合（视 RAG top-1 为期望模板），`no-match-rate` 按 UTC 日界统计 `gate_error_type='no_matching_template'`
+  - §3.10 新建 `AdminAnalyticsPage`（`/admin/analytics`）：KPI 卡片行 + 7 天 NoMatch 趋势折线图（`@ant-design/charts` Line） + 差评模板 top-10 表 + intent confusion 表（每行含「复制为 corpus 条目」按钮，生成 `template_selection_corpus.yaml` 兼容 YAML 块写入剪贴板，闭环回归测试语料）
+  - Stage 范围（明确不做）：不发送邮件/Webhook 推送、不实现批量任务行级反馈、不允许用户修改已提交反馈、不实现 CSV 导出、不做 Redis 缓存、不做差评率突增告警（留待 L5）
+- v3.2 → v3.3：**FEAT-11 Stage 2 双模生成（rag 默认 + llm_direct 兜底）落地为 in-scope 功能**——
+  - §6.1 单条生成主流程新增 **A 子项：高置信 RAG 自动渲染**——当 preview 同时满足 `confidence_source==llm_step1` + `step1_verify_enabled` 且 verify 通过 + `selected_score >= reranker_min_score_threshold` + 所有 required 参数源 ∈ `{llm, regex, signal_list, default}` 四条件时，`pipeline_preview` 把 `quick_render=True` 与 intent_cache 命中路径走同一旗标，前端 `GeneratePage` 跳过 ConfirmationPanel 直接调 `/render` 并展示代码。任一条件未达标仍走原确认面板（无回归）
+  - §6.1 result 阶段新增 **B 子项：LLM 直接生成兜底按钮**——`generation_mode === 'rag'` 时显示「对生成结果不满意？尝试 LLM 直接生成」按钮（已为 `llm_direct` 的记录不再展示，禁止链式 fallback）。点击 → `POST /api/v1/generate/llm-fallback {generation_record_id}` → 后端载入源记录的 intent / code_type / signals / clk / rst → 调 `LLMClient.generate_code_freeform` → 返回 `{code, generation_record_id, generation_mode: "llm_direct"}` → 前端替换代码区 + `feedbackSubmitted` 归零，让用户对 `llm_direct` 结果独立评分
+  - §6.1 新增 **非确定性标签契约**：`llm_direct` 记录的代码卡片头部强制渲染 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>`；同一输入再次触发 `llm-fallback` 可能产出不同代码——这是设计内行为，与 `rag` 路径的"字节级确定性"形成对照。原"系统决定产出代码时必为确定"契约（§4.1）**收窄为仅对 `rag` 路径**；`llm_direct` 路径仅在 `gen_llm:*` Redis 7d TTL 缓存命中时呈现"伪确定性"，TTL 过期或切换 LLM 默认配置后即重新生成
+  - §6.1 错误模式表新增 `llm_direct_*` 三类错误：`llm_direct_chained_not_allowed`（源记录已是 `llm_direct`→422）/ `llm_direct_no_code`（LLM 返回无围栏代码→422）/ `llm_direct_internal_error`（LLM 调用 / DB 写入失败→422，detail 不泄漏内部 repr）。三类均不带 `redirect_to`——前端显示 `message.error` 文案后停留在 result 页让用户重试或换 LLM
+  - §3.9 用户反馈机制扩展：FeedbackBar 现在对 `rag` 与 `llm_direct` 两种 record 都可用，后端写 4 个 feedback 列不再回填 `generation_mode`（因为 `llm_direct` 子记录在写入时已经显式标 `'llm_direct'`，回填只发生在 v3.2 前的老 `'rag' or NULL` 行为，本版本保留 NULL→`'rag'` 防穿透但不再触碰显式值）
+  - §3.10 管理员分析仪表盘 4 个 KPI 端点全部新增 optional `generation_mode` query 参数（值 `rag` / `llm_direct`，omit = 全量）：`feedback-summary` 按模式分桶；`template-issues` 在 `generation_mode=llm_direct` 时把 `template_id IS NULL` 行归入 `__llm_direct__` 桶不再被默认 `IS NOT NULL` filter 排除；`intent-confusion` 与 `no-match-rate` 同样支持 filter
+  - 数据库：migration 007 `generation_records` 新增 `parent_record_id VARCHAR(36) NULLABLE FK→generation_records.id ondelete=SET NULL` 列，让 `llm_direct` 子记录回链触发本次 fallback 的源 RAG 记录；源记录被删除（admin 操作）仅清空 FK，保留 `llm_direct` 子记录与其反馈数据
+  - Stage 范围（明确不做，留待 Stage 3）：批量任务（Celery）不支持 `llm_direct` 模式；L4 仪表盘除 `generation_mode` 过滤参数外暂不做"按模式拆分的图表/趋势"；用户不可在没有源 RAG 记录前提下"冷启动"直接 `llm_direct`；管理员不可从 Admin UI 重触发 `llm_direct`；贡献向导不支持 `llm_direct` 路径；不为 `llm_direct` 结果发邮件/Webhook 推送；不做 `llm_direct` analytics 的 CSV 导出
+- v3.3 → v3.4：**FEAT-12 用户对比报告系统**——新增 §6.2「用户对比报告（FEAT-12）」小节（原 §6.2 批量生成顺延为 §6.3），描述用户在 GeneratePage result 阶段对 LLM 直接生成记录一键提交对比报告的完整链路：独立按钮（仅 `generation_mode==='llm_direct' && parent_record_id!=null` 渲染，与 §3.9 L3 差评按钮互相独立）→ Modal（4 项分类 Checkbox.Group + 自由文本 TextArea，**全选填均允许空提交**）→ `POST /api/v1/improvement-reports` → 后端写入新建 `improvement_reports` 表（独立于 `generation_records.feedback_*` 列）。引入分类枚举 `ReportCategoryEnum`（4 项 slug ↔ 中文 label：`wrong_template`/模板选错、`wrong_params`/参数映射错、`poor_style`/代码风格差、`other`/其他），并定义 admin 三态状态机 `pending → in_review → resolved`（详见 ARCH §3.18 / §4.1.4）；已有报告时按钮 disabled 文案"已有人提交对比报告，admin 处理中"。§6.1 错误模式表新增 3 行 `duplicate_report` (409) / `invalid_record_ref` (422) / `illegal_status_transition` (422)，前两条用于 `POST /improvement-reports`，第三条用于 `PATCH /admin/improvement-reports/{id}` 非法状态跳转（如 pending→resolved 跳过 in_review、resolved→pending 倒退），三者均不带 `redirect_to`。§3.9 L3 差评机制与本对比报告系统在 result 阶段并存——前者按记录评质量分（写 `generation_records.feedback_*`），后者按 RAG/LLM 直接生成对比（写 `improvement_reports`），用户可同时使用。**Out of scope（留 FEAT-13）**：resolved 报告语料回流到 `template_corpus_cases`（半自动或自动）、admin CSV 导出、报告邮件/Webhook 推送、admin↔用户对话、跨 admin 认领锁、用户撤回、批量任务行级对比报告
+- v3.6 → v3.7：**FEAT-19 批量 Excel schema 推倒重建为 3 列**（BREAKING）——§3.1.1 两份输入表格规范从 v3.6 的 SVA 17 列 / Coverage 19 列大表精简为 3 列（A=编号、B=验证/覆盖意图、C=备注）+ 3 个系统输出列（D=匹配模板、E=置信度、F=生成状态）。删除 `所属模块 / 时钟 / 复位信号 / 复位极性 / 协议 / 信号1~4 (名称+位宽+角色) / 严重级别 / 覆盖类型 / 主信号 / 交叉信号 / Bin提示 / 采样条件` 共 14~16 列用户手填字段，这些字段在批量场景下已与单条页 `/generate` 表单 / pipeline 6 级回退（`clk="clk"` / `rst="rst_n"` / `signals=[]`）语义重复。§3.1.2 处理流程图同步更新："填写需求行"动作描述删除"模块/时钟/复位/信号"枚举，简化为"按 3 列格式填写（编号 + 意图 + 备注）"；§6.3 批量主流程步骤 2 同步从"填写Excel（描述列 + 信号列）"改为"按 3 列格式填写 A/B/C 三列"。**旧 17/19 列模板不向后兼容**——继续上传旧模板时 parse_excel 不会崩溃，但因列错位会把"所属模块"列内容解析成 intent 字段（典型表现：top-1 匹配模板偏向"以模块名为主题"的无关模板），用户须重新通过 `GET /api/v1/batch/template` 下载新模板。本次仅改 parser 输入侧（`backend/data/schemas/*.yaml` + `excel_parser.py`），pipeline / LLM / RAG / 缓存 key 结构与确定性契约**完全不受影响**。
+- v3.5 → v3.6：**FEAT-18 批量页删 code_type 下拉 + sheet 自动检测多 code_type**——§3.1.1 两份输入表格描述补"前端不再要求用户在上传前选择 code_type，系统按 Excel 各 sheet 名（`SVA需求` / `Coverage需求`）自动识别每行对应的 code_type"；§3.1.2 处理流程框图"上传表格"步骤追加"系统检视 workbook.sheetnames → CodeTypeRegistry 反查 → 每个匹配 sheet 独立解析；未注册 sheet 名静默跳过；所有已知 sheet 均无有效数据行时返 HTTP 400 detail.type=no_valid_rows"注解；同一份 Excel 中两个 sheet 均填了数据时，系统在一次上传里混合生成两类代码。本版本**不**修改 §6 用户交互流程详述的单条生成 / IntentBuilder / 贡献向导任何文案——code_type 选择动作仅在批量生成页移除，单条生成页仍保留 code_type 选择控件。详细实现层影响（端点签名 / 解析函数 / 前端组件 / 测试覆盖）见 ARCHITECTURE v2.28→v2.29 与 CHANGELOG。
+- v3.4 → v3.5：**FEAT-13 模板成熟度门控（maturity_level 三档 + RAG 默认仅召回 production + admin 提升降级 UI）**——
+  - §4 数据模型新增：`templates` 表追加 `maturity_level` 列（PostgreSQL ENUM `template_maturity_enum`，值 `production / experimental / draft`，NOT NULL，server_default `'experimental'`），由 Alembic migration 009 加列并 backfill：`id ~ '^(sva|cov)_.+_v[0-9]+$'` 命名规范的官方种子模板升为 `production`，其余行（含 `is_active=false`、含历史 `L6_E2E_*` 测试模板）落 `experimental`。三档语义如下：
+    - `production`：经人工核验、**进入 RAG 召回主库**的官方模板；`stage1_hybrid_search` Qdrant Filter + `engine.py` DB 二次过滤 + `dense_top1_score`（off-topic gate / code_type_mismatch gate）三处均**仅**消费此档
+    - `experimental`：贡献流通过 admin review 后**默认落到这一档**；模板已可读、可由库管理员维护，但**不参与 RAG 召回**，避免污染主库
+    - `draft`：内部测试 / 早期实验位，亦**不参与 RAG 召回**
+  - 与既有 `maturity` 列（值 `draft / validated / production`）的区分：`maturity` 描述"开发成熟度"（模板设计者标注的迭代位），`maturity_level` 描述"生产门控"（是否进入 RAG 召回主库）；两列并存、语义独立，**不得混用**——前端 Admin UI、ORM、迁移三处分别引用，不在同一 Form.Item 中编辑
+  - §3.6（贡献流权限矩阵）+ §3.7（模板贡献与审核机制）生命周期更新：贡献流 `_create_template_from_contribution` 新建模板时 `maturity_level` 固定为 `'experimental'`（不依赖 contribution 的 `maturity` 字段取值），admin 通过 review 后该模板**仍保持 `experimental`，须 super_admin 显式 PATCH 才能升为 `production` 并进入 RAG 召回主库**。完整生命周期：提交贡献 → admin review 通过 → 默认 `experimental` → super_admin 显式提升 `production` → RAG 召回生效
+  - §3.4（模板库管理）Admin UI 扩展：模板表格新增 `maturity_level` 列（带颜色 Tag：`production=green` / `experimental=orange` / `draft=blue`）；行内操作区新增「升级到 production」「降级到 experimental」两个按钮，**仅 `role=='super_admin'` 用户可见可点**（`lib_admin` 隐藏）。后端 `PATCH /api/v1/admin/templates/{id}` 校验：当 payload 含 `maturity_level` 且 `current_user.role != 'super_admin'` 时返 HTTP 403 `detail="仅 super_admin 可修改 maturity_level"`；非法 enum 值返 HTTP 422
+  - §3.7.2 / §3.7.3 贡献流明确：用户在 Step 2 编辑 / admin 在三栏审核界面修改的内容**均不影响 `maturity_level`**——批准入库的模板恒以 `experimental` 落库
+  - **不在范围内**：自动语料质量评分（`draft → experimental` 自动升级）由 FEAT-14 承接；`production → 退役` 流程留待后续票；前端 Library 页 / Generate 页不展示 `maturity_level`（用户视角对 production-only 召回无感）
+  - **风险记录**：`dense_top1_score` 加 maturity Filter 后，off-topic gate 与 code_type_mismatch gate 的阈值可能需重新校准（`OFFTOPIC_DENSE_THRESHOLD` / `CODE_TYPE_MISMATCH_MARGIN`），由 SRE 在上线后跑 `calibrate_offtopic_threshold.py` 验证；Qdrant payload 冷启动须先 `alembic upgrade head` 再 `lib_manager rebuild`，否则现有 points 因缺 `maturity_level` payload 字段会被 stage1 Filter 全部过滤掉 → RAG 召回为空 → 全量 503
 
 ---
 
@@ -74,70 +104,41 @@ IC验证工程师在日常工作中需要大量编写SystemVerilog断言（SVA�
 
 #### 3.1.1 两份输入表格
 
-平台提供两份固定格式的Excel模板供下载，工程师按需填写：
+平台提供两份固定格式的Excel模板供下载，工程师按需填写：**前端不再要求用户在上传前选择 code_type，系统按 Excel 各 sheet 名（`SVA需求` / `Coverage需求`）自动识别每行对应的 code_type**，详见 §3.1.2 处理流程与 ARCHITECTURE §3.9 解析层；同一份 Excel 中两个 sheet 均填了数据时，系统会在一次上传里混合生成两类代码。
 
-**SVA断言需求表**（每行 = 一条断言需求）：
+**FEAT-19 推倒重建说明（v3.7 起）**：批量 Excel schema 从 v3.6 的 17 列（SVA）/ 19 列（Coverage）大表**精简为 3 列**，删除 `所属模块 / 时钟 / 复位信号 / 复位极性 / 协议 / 信号1~4 (名称+位宽+角色) / 严重级别 / 覆盖类型 / 主信号 / 交叉信号 / Bin提示 / 采样条件` 共 14~16 个用户手填字段。这些字段在单条页 `/generate` 表单中已由独立控件承载，在批量场景下与 pipeline 6 级回退（`clk="clk"` / `rst="rst_n"` / `signals=[]` 等默认值兜底）语义重复。**旧 17/19 列模板不再向后兼容**，请重新通过 `GET /api/v1/batch/template` 下载新模板；继续上传旧模板的后果详见 ARCHITECTURE §3.9.1 末段。
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| 编号 | 文本 | 是 | SVA-001，用于结果追踪 |
-| 所属模块 | 文本 | 是 | 断言挂载的模块/接口名 |
-| 时钟 | 文本 | 是 | 时钟信号名 |
-| 复位信号 | 文本 | 是 | 复位信号名 |
-| 复位极性 | 枚举 | 是 | 高有效 / 低有效 |
-| 协议 | 枚举 | 否 | AXI4 / AHB / APB / 通用，辅助RAG过滤 |
-| 信号1名称 | 文本 | 是 | — |
-| 信号1位宽 | 整数 | 是 | bit |
-| 信号1角色 | 枚举 | 是 | valid / ready / data / state / req / ack / start / end / enable / count / other |
-| 信号2名称 | 文本 | 否 | — |
-| 信号2位宽 | 整数 | 否 | — |
-| 信号2角色 | 枚举 | 否 | 同上 |
-| 信号3名称 | 文本 | 否 | — |
-| 信号3位宽 | 整数 | 否 | — |
-| 信号3角色 | 枚举 | 否 | 同上 |
-| 信号4名称 | 文本 | 否 | — |
-| 信号4位宽 | 整数 | 否 | — |
-| 信号4角色 | 枚举 | 否 | 同上 |
-| 验证意图 | 长文本 | 是 | 自然语言描述，驱动RAG检索匹配模板 |
-| 严重级别 | 枚举 | 否 | error / warning / info（默认error） |
-| 备注 | 文本 | 否 | 可选补充说明 |
-| **[输出]匹配模板** | 文本 | — | 系统回填，如 SVA-HAND-001 |
-| **[输出]置信度** | 数字 | — | 系统回填，如 0.95 |
-| **[输出]生成状态** | 枚举 | — | 系统回填：已生成 / 需确认 / 需修改 |
+**SVA断言需求表**（每行 = 一条断言需求，共 3 个用户列 + 3 个系统输出列）：
 
-**功能覆盖率需求表**（每行 = 一个covergroup需求）：
+| 列 | 字段 | 类型 | 必填 | 说明 |
+|----|------|------|------|------|
+| A | 编号 | 文本 | 是 | SVA-001，用于结果追踪 |
+| B | 验证意图 | 长文本 | 是 | 自然语言描述，驱动RAG检索匹配模板（信号名 / 时钟 / 复位等结构化字段由 pipeline 默认值兜底，无需手填） |
+| C | 备注 | 文本 | 否 | 可选补充说明，pipeline 不消费 |
+| D | **[输出]匹配模板** | 文本 | — | 系统回填，如 SVA-HAND-001 |
+| E | **[输出]置信度** | 数字 | — | 系统回填，如 0.95 |
+| F | **[输出]生成状态** | 枚举 | — | 系统回填：已生成 / 需确认 / 需修改 |
 
-| 字段 | 类型 | 必填 | 说明 |
-|------|------|------|------|
-| 编号 | 文本 | 是 | COV-001，用于结果追踪 |
-| 所属模块 | 文本 | 是 | covergroup挂载的模块/接口名 |
-| 采样时钟 | 文本 | 是 | 采样时钟信号名 |
-| 复位信号 | 文本 | 是 | 复位信号名 |
-| 复位极性 | 枚举 | 是 | 高有效 / 低有效 |
-| 覆盖类型 | 枚举 | 否 | 值覆盖 / 转移覆盖 / 交叉覆盖，辅助RAG过滤 |
-| 主信号名称 | 文本 | 是 | 主要覆盖信号名 |
-| 主信号位宽 | 整数 | 是 | bit |
-| 主信号数据类型 | 枚举 | 是 | logic / uint / enum |
-| 交叉信号1名称 | 文本 | 否 | 交叉覆盖时填写 |
-| 交叉信号1位宽 | 整数 | 否 | — |
-| 交叉信号1数据类型 | 枚举 | 否 | logic / uint / enum |
-| 交叉信号2名称 | 文本 | 否 | 三维交叉时填写 |
-| 交叉信号2位宽 | 整数 | 否 | — |
-| 交叉信号2数据类型 | 枚举 | 否 | logic / uint / enum |
-| Bin提示 | 文本 | 否 | 期望分段，如 `1,2,4,8,16` 或 `0-15,16-255` |
-| 采样条件 | 文本 | 否 | 采样触发条件，留空则时钟沿采样 |
-| 覆盖意图 | 长文本 | 是 | 自然语言描述，驱动RAG检索匹配模板 |
-| 备注 | 文本 | 否 | 可选补充说明 |
-| **[输出]匹配模板** | 文本 | — | 系统回填，如 COV-VAL-001 |
-| **[输出]置信度** | 数字 | — | 系统回填，如 0.92 |
-| **[输出]生成状态** | 枚举 | — | 系统回填：已生成 / 需确认 / 需修改 |
+**功能覆盖率需求表**（每行 = 一个covergroup需求，共 3 个用户列 + 3 个系统输出列）：
+
+| 列 | 字段 | 类型 | 必填 | 说明 |
+|----|------|------|------|------|
+| A | 编号 | 文本 | 是 | COV-001，用于结果追踪 |
+| B | 覆盖意图 | 长文本 | 是 | 自然语言描述，驱动RAG检索匹配模板（主信号 / 交叉信号 / Bin 提示 / 采样条件等结构化字段由 pipeline 默认值兜底，无需手填） |
+| C | 备注 | 文本 | 否 | 可选补充说明，pipeline 不消费 |
+| D | **[输出]匹配模板** | 文本 | — | 系统回填，如 COV-VAL-001 |
+| E | **[输出]置信度** | 数字 | — | 系统回填，如 0.92 |
+| F | **[输出]生成状态** | 枚举 | — | 系统回填：已生成 / 需确认 / 需修改 |
+
+说明：批量页第 1 行为表头、第 2 行为占位提示行（仅 B2 写浅灰提示文字，A2 留空——保证空模板原样上传 preflight 不会误把提示当 row_id）、第 3 行起为用户填写区；A/B 列必填，C 列可空；D/E/F 输出列在下载的空模板里不会出现（由 schema `output=true` 字段过滤），仅在后续 Excel 回填功能落地时由系统写入。
 
 #### 3.1.2 处理流程
 
 ```
-工程师下载标准Excel模板 → 填写需求行（可选：使用场景构建器辅助填写）
+工程师下载标准Excel模板 → 按 3 列格式填写需求行（A=编号、B=验证/覆盖意图、C=备注；模块/时钟/复位/信号等结构化字段无需手填，由 pipeline 默认值兜底）
   ↓
-上传表格
+上传表格（系统检视 workbook.sheetnames → CodeTypeRegistry 反查 → 每个匹配 sheet 独立解析为 code_type 已知的行；
+         未注册的 sheet 名静默跳过；所有已知 sheet 均无有效数据行时返 HTTP 400 detail.type=no_valid_rows）
   ↓
 【前置信度预检】（见 §3.8 第三层）
   系统快速扫描所有行，展示逐行预估置信度
@@ -149,7 +150,7 @@ IC验证工程师在日常工作中需要大量编写SystemVerilog断言（SVA�
 每行：验证意图 →【LLM标准化】（见 §3.8 第一层）→ bge-m3向量化
       → Qdrant RAG检索（含协议/类型过滤）
       → Top-3候选 → reranker精排 → LLM选模板（工具调用）
-      → 信号角色表直接填充模板参数 → Jinja2渲染
+      → pipeline 6 级回退默认值兜底填充模板参数（clk="clk" / rst="rst_n" / signals=[]） → Jinja2渲染
   ↓
 结果回填到Excel原表（输出列）+ Web端展示进度与结果列表
   ↓
@@ -162,9 +163,9 @@ IC验证工程师在日常工作中需要大量编写SystemVerilog断言（SVA�
 
 #### 3.1.3 信号角色的作用
 
-表格中每个信号明确标注"角色"（valid/ready/data/state等），在RAG匹配到模板后，系统直接将信号名填入模板对应参数位置，**无需LLM猜测信号角色**，参数填充完全确定性。
+v3.7 (FEAT-19) 起，批量 Excel 不再要求工程师手填信号角色表——表格只保留意图列。RAG 匹配到模板后，系统按 pipeline 6 级回退（`clk="clk"` / `rst="rst_n"` / `signals=[]` 等默认值）填充模板参数；如生成结果需要更精确的信号名，工程师可在 Web 端展开行后编辑参数面板重渲染（见 §3.1.4）。
 
-Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最匹配的一个，并确认角色与模板参数的对应关系。
+Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最匹配的一个，并按意图反推参数填充（不再依赖用户填写的信号角色列）。
 
 #### 3.1.4 结果查看与操作
 
@@ -332,40 +333,67 @@ Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最
 
 ---
 
-#### 3.7.2 贡献向导（v3.0 大幅简化为单页表单）
+#### 3.7.2 贡献向导（v3.1 两步式 Modal，2 字段必填）
 
-点击「贡献新模板」打开单页（不再分多 Step Modal），用户只需填以下 4 个字段：
+点击「贡献新模板」打开两步 Modal（Ant Design Steps），用户**只需必填 2 个字段**：
+
+**Step 1 — 输入验证意图**
 
 | 字段 | 说明 | 必填 |
 |------|------|------|
-| 模板名称 | 简短描述性名称，如"AXI 写通道地址稳定断言" | ✓ |
-| 代码类型 | 单选：SVA 断言 / UVM 覆盖率 | ✓ |
-| 验证场景描述 | 自然语言描述这个模板要解决什么问题（用于 RAG 语义匹配，**写得越具体匹配率越高**） | ✓ |
-| 代码示例 | Monaco Editor SystemVerilog 高亮——**直接粘贴你设计里能跑的代码**，含真实信号名、状态枚举值、数字字面量；后端 LLM 会自动识别哪些是参数、哪些是固定结构 | ✓ |
+| `original_intent` | 自然语言描述你要验证的场景（4 行 TextArea），如"检测 AXI 写通道在 awvalid 拉高到 awready 到来期间地址保持稳定" | ✓ |
+| `code_type` | 单选：SVA 断言 / UVM 覆盖率 | ✓ |
 
-**不需要填**：~~参数定义表单~~ / ~~占位符映射~~ / ~~分类下拉~~ / ~~协议下拉~~ / ~~关键词~~——这些全部由后端 LLM 反推。
+点「生成预览」→ 前端调 `POST /api/v1/contributions/preview`（不入库，仅返回 LLM 生成结果），后端同步跑 LLM + 3 道校验（5-15s），成功进入 Step 2。
 
-提交按钮文案："**提交，由 AI 协助参数化**"。
+**Step 2 — 预览编辑与提交**
+
+LLM 生成的 5 字段在 Step 2 中展示为**可编辑表单**：
+
+| 字段 | 控件 | 来源 | 用户能改？ |
+|------|------|------|----------|
+| `template_name` | Input | LLM 按 `^(sva|cov)_[a-z][a-z0-9_]*_v\d+$` 规范生成 | ✅ |
+| `description` | TextArea（3 行） | LLM 按标准 IC 验证措辞生成 | ✅ |
+| `demo_code` | TextArea（12 行 monospace） | LLM 生成的完整 SVA/UVM 代码（含真实信号名） | ✅ |
+| `parameter_defs` | （隐藏） | LLM 反推参数定义；用户不直接看 | — |
+| `keywords` | （隐藏） | LLM 推测；用户不直接看 | — |
+
+若预览响应中 `name_conflict: true`，Step 2 顶部显示黄色 Warning Alert："此名称与现有模板重名，请修改 `template_name` 后再提交"。
+
+底部两个动作按钮：
+
+- **提交审核**：调 `POST /api/v1/contributions`（携带 Step 2 中用户最终确认/编辑后的 5 字段），状态入 `pending_review` 进审核队列；Modal 关闭，刷新列表
+- **立即使用**：同样调 `POST /api/v1/contributions` 入审核队列，但**不关闭 Modal**——Step 2 页面内展示可复制代码框（`<pre>` monospace 块 + 「复制代码」按钮 + 提示文案"代码已就绪，可直接复制使用。模板已提交审核，审核通过后将加入模板库。"）。**不跳转 `/generate`** —— 该贡献处于 `pending_review` 不在 Qdrant 中，跳过去只会触发第五道闸 `no_matching_template` 进入循环
+
+**不需要填**：~~参数定义表单~~ / ~~占位符映射~~ / ~~分类下拉~~ / ~~协议下拉~~ / ~~关键词~~ / ~~模板名称~~ / ~~场景描述~~ / ~~代码示例~~——全部由后端 LLM 一次性生成；用户负责语义级校对。
+
+**向后兼容**：原 4 字段提交路径（caller 同时显式传 `template_name + description + demo_code`）仍受支持——`POST /api/v1/contributions` 按 3 个分支选择路径：(1) 缺关键字段触发 intent-only 生成；(2) 显式传 `parameter_defs` 走 v2 批量路径不调 LLM；(3) 4 字段齐全走原 demo 反推路径。
 
 ---
 
-#### 3.7.3 后端 LLM 反推流程（提交时一次性跑）
+#### 3.7.3 后端 LLM 生成流程（preview / submit 两端共用）
 
-后端收到提交后**同步**完成（耗时预估 5-15s）：
+`generate_from_intent(original_intent, code_type, llm)` 同步完成（耗时预估 5-15s），preview 与 submit（分支 1）端点共用：
 
-1. **LLM 参数化 pass**（沿用 `llm_configs.is_default`）：
-   - System prompt 喂模板库已有 schema 风格作为示例
-   - User prompt = 用户填的 description + 代码示例
-   - 输出：(a) `parameters` JSON（含 name / type / required / description / expr_type / role_hint / default），(b) `template_body`（用 `{{ param }}` 占位真实信号的 Jinja2 模板），(c) 推测的 `keywords` / `subcategory` / `protocol`
-2. **自动校验**（三道，任一失败回 422 让用户重提）：
-   - Jinja2 用占位值能渲染通过（StrictUndefined 不报错）
-   - `parameters` JSON 字段命名合法（无中文 / 无特殊字符 / `expr_type` 都声明）
-   - 渲染后的 SV 代码经轻量词法扫描通过（括号/分号配平、关键字识别）
-3. **dedup 预扫**：用 description 跑一次语义查重（沿用 `check_semantic_duplicate`，阈值 0.90），若命中已有模板，提交记录里附"相似模板列表"供审核员对比
-4. 全部通过 → 状态 `pending_review`，进入审核队列
-5. **任一失败** → 返回 422 `contribution_parse_failed`，前端弹 Modal 显示具体失败原因，用户可改代码示例后重提
+1. **LLM 一次性生成 5 字段**（沿用 `llm_configs.is_default`）：
+   - System prompt 喂模板库已有 schema 风格 + 命名规范（`sva_<scenario>_v<N>` / `cov_<scenario>_v<N>`）作为约束
+   - User prompt = `original_intent + code_type`
+   - 输出：(a) `template_name`、(b) `description`、(c) `demo_code`（含真实信号名 / 字面量的完整 SV 代码），(d) `parameters` JSON（含 name / type / required / description / expr_type / role_hint / default），(e) `jinja_body`（用 `{{ param }}` 占位真实信号的 Jinja2 模板），(f) `keywords` / `subcategory` / `protocol`
+2. **自动校验**（4 道，任一失败回 422 `contribution_parse_failed`，`detail` 含 `stage` + `reason`）：
+   - `_validate_template_name`：必须匹配 `^(sva|cov)_[a-z][a-z0-9_]*_v\d+$`（`stage="template_name"`）
+   - `_validate_parameter_defs`：每项含 `name/type/required/description/expr_type`，name 是合法 SV 标识符，`expr_type ∈ {sv_identifier, sv_identifier_list, sv_boolean_expr, sv_bins_expr, integer, free_text}`（`stage ∈ {param_defs_shape, param_defs_empty, param_defs_name, param_defs_expr_type}`）
+   - `_validate_jinja_rendering`：Jinja2 用占位值跑 `SandboxedEnvironment` + `StrictUndefined` 渲染通过（`stage ∈ {jinja_empty, jinja_syntax, jinja_sandbox (SSTI/不安全操作), jinja_render (StrictUndefined / 参数引用失败)}`）
+   - `_validate_keywords`：必须是 `list[str]`，自动去重 / 过滤空串；非 list 即拒（`stage="keywords_shape"`）
+3. **`name_conflict` 检测**（preview 端点专属，非阻塞）：跑 `check_name_duplicate`，命中已入库模板时响应携带 `name_conflict: true`；submit 端点遇重名仍 422 `contribution_name_duplicate` 阻塞
+4. **dedup 预扫**（submit 端点）：用 description 跑一次语义查重（沿用 `check_semantic_duplicate`，阈值 0.90），命中已有模板时把"相似模板列表"塞 `original_row_json["similar_templates"]` 供审核员对比；查重失败（Qdrant 暂时不可达等）非阻塞
+5. submit 全部通过 → 状态 `pending_review`，进入审核队列
 
-错误情况下用户**不会**看到中间产物——只看到"你的代码示例太复杂/有语法歧义/含太多边角逻辑，请简化"的友好提示。
+错误情况下用户**不会**看到中间产物——只看到"你的描述太模糊 / LLM 生成的代码无法参数化"的友好提示，用户可改 Step 1 的 `original_intent` 重新生成预览。
+
+**双层审核机制**：
+
+- **第一层（用户验证 LLM 输出）**：Step 2 预览页就是用户对 LLM 生成质量的把关——任何不准确的命名、措辞或代码细节，用户可在 Step 2 直接改后再提交；这是 v3.1 把"参数化脏活推给 LLM"后增加的关键反馈环
+- **第二层（管理员审批入库）**：与 §3.7.5 既有三栏审核完全一致，审核员对左/中/右栏任意修改后批准触发 §3.10.2 入库流水线
 
 #### 3.7.4 我的贡献（普通用户）
 
@@ -407,11 +435,26 @@ Claude（LLM）在此流程中仅做一件事：从Top-3候选模板中选择最
 
 | 操作 | 说明 |
 |------|------|
-| 批准并入库 | 取中栏 + 右栏当前内容（含审核员的修改）触发模板创建流水线（再跑一次 Jinja2 验证→向量化→写 Qdrant + PostgreSQL），系统自动分配模板 ID |
-| 请求修改 | 必填审核意见，贡献者收到通知后可重新编辑提交（**只能改左栏：description + 代码示例**，重提会重新跑 LLM 反推） |
+| 批准并入库 | 取中栏 + 右栏当前内容（含审核员的修改）触发模板创建流水线（再跑一次 Jinja2 验证→向量化→写 Qdrant + PostgreSQL），系统自动分配模板 ID。**v3.5 / FEAT-13 起**：入库时 `maturity_level` 固定为 `'experimental'`（即使审核员在中/右栏改过 `maturity` 字段亦不影响 `maturity_level`），模板**暂不进入 RAG 召回主库**，须 super_admin 在「模板库管理」页显式点「升级到 production」后方生效 |
+| 请求修改 | 必填审核意见，贡献者收到通知后可重新编辑提交（v3.1：贡献者只能在两步 Modal 中改 `original_intent + code_type` 后重新走预览/编辑流程，重提会重新跑 LLM 生成；审核员对中右栏的旧手改在重提后丢弃，避免新旧产物错配） |
 | 退回 | 必填退回原因，记录归档，状态标为已退回 |
 
-**v3.0 不做**：审核员与 LLM 的多轮对话（"AI 这个 parameters 拆得不对，再来一遍"）—— v3.5 议题。当前若 LLM 反推质量不好，审核员直接手改中/右栏即可。
+**v3.0 不做**：审核员与 LLM 的多轮对话（"AI 这个 parameters 拆得不对，再来一遍"）—— 后续议题。当前若 LLM 反推质量不好，审核员直接手改中/右栏即可。
+
+**v3.5 / FEAT-13 — 模板成熟度门控生命周期补充**：贡献流通过 review 不再意味着"立即上 RAG 召回主库"。完整生命周期：
+
+```
+用户提交贡献 → admin review → 通过 → 模板入库（maturity_level='experimental'）
+                                     ↓
+                              super_admin 在「模板库管理」页显式
+                              点「升级到 production」 → maturity_level='production'
+                                     ↓
+                              进入 RAG stage1 召回主库（Qdrant Filter 通过）
+                                     ↓
+                              后续生成请求开始命中本模板
+```
+
+设计原则："通过 admin review" 是"质量门"（模板写法合规、Jinja2 可渲染、参数定义合理），"super_admin 提升 production" 是"召回门"（确认本模板适合作为团队级官方模板纳入主库）。两道门解耦后，库管理员可以放心批准"看起来对但还需观察"的贡献，不必担心未经充分核验的模板立即影响所有用户的生成结果。`maturity_level='experimental'` 的模板仍可在「模板库」页被浏览、被库管理员维护，仅**不参与 RAG 召回**。
 
 #### 3.7.6 通知机制
 
@@ -506,6 +549,107 @@ LLM 静默标准化（旧 §3.8 第一层）**保留但角色降级**：
 1. 否则 LLM 会引导用户产出"看起来标准但库里没有任何模板能渲染"的句子——用户走出 IntentBuilder 又被 RAG empty / under_specified 打回来
 2. 让 IntentBuilder 既是"意图标准化器"也是"模板发现器"——对库里有的需求几乎不会走到贡献路径
 3. 对库里**没有**的需求自然显式化（LLM 会明说"候选都不像"），引导用户去 §3.7 贡献
+
+---
+
+### 3.9 用户反馈机制（L3）
+
+**背景**：v3.0 之前，平台只在管理员侧收集"贡献被采纳"这一种正向信号；普通用户对每次生成结果的质量判断（"这条对/这条错"）没有结构化采集渠道，模板库优化只能靠管理员主观采样。L3 把"质量信号"沉淀到 `generation_records` 表，**为 §3.10 分析仪表盘提供原始数据**。
+
+#### 3.9.1 3 档评分按钮
+
+GeneratePage 在 `result` 阶段（生成代码渲染完成后）于代码卡片下方插入反馈条，3 个按钮一字排开：
+
+| 按钮 | rating 值 | 交互 |
+|---|---|---|
+| 👍 好评 | 1 | 单击即提交，无 Modal |
+| 😐 一般 | 2 | 单击即提交，无 Modal |
+| 👎 差评 | 3 | 单击弹差评 Modal（见 §3.9.2），Modal 内 Submit 才提交 |
+
+提交成功后整组按钮置灰（`feedbackSubmitted=true`），右侧显示"已提交反馈"文字；同一 `generation_record_id` 只允许评一次。重新发起一次新生成后 `feedbackSubmitted` 归零。
+
+#### 3.9.2 差评 Modal（reason_tags + comment）
+
+差评必须至少选 1 个 `reason_tag`（前端 `Checkbox.Group` + 不选则 Submit 按钮触发 `message.warning('请至少选择一个差评原因')`，不发请求）。固定 7 项枚举（Stage 1 不允许用户自定义，新增需走 §CONTRIBUTING.md 流程）：
+
+| 枚举值 | 中文标签 |
+|---|---|
+| `wrong_template` | 模板选错 |
+| `hallucinated_signal` | 幻觉信号名 |
+| `syntax_error` | 语法错误 |
+| `semantic_error` | 语义错误 |
+| `style_bad` | 风格不佳 |
+| `missing_disable_iff` | 缺少 disable iff |
+| `other` | 其他 |
+
+Modal 内还有可选 `comment` 文本框（≤ 2048 字符），允许用户描述具体问题。`comment` 在所有评分档位都可填（不限于差评）。
+
+#### 3.9.3 提交契约
+
+| 维度 | 值 |
+|---|---|
+| 端点 | `POST /api/v1/feedback/{generation_record_id}` |
+| 权限 | JWT 登录用户；普通用户只能给**自己**的 `generation_record` 评分；`lib_admin` / `super_admin` 可补评他人记录（兜底审核场景） |
+| 成功响应 | HTTP 204 No Content |
+| 失败响应 | 422（rating 非 1/2/3、rating=3 但 reason_tags 空）/ 403（user_id 不匹配且非 admin）/ 404（generation_record 不存在） |
+| 写入字段 | `generation_records.feedback_rating` / `feedback_reason_tags`（JSONB 数组）/ `feedback_comment` / `feedback_at`（UTC 时间）；若原记录 `generation_mode` 为 NULL 则回填 `'rag'`（防 batch 老记录穿透）；显式 `'rag'` / `'llm_direct'` 值**不**回写。**适用范围（v3.3 / FEAT-11 起）**：FeedbackBar 对 `rag` 与 `llm_direct` 两种 record 都可用——前端按 `generation_record_id` 独立 lock，触发一次 `llm-fallback` 后产生新 record，`feedbackSubmitted` 归零让用户重新评分 `llm_direct` 结果 |
+
+**Stage 范围（明确不做）**：
+- 不做反馈数据的邮件 / Webhook 推送（仅入库）
+- 不做好评/一般评分触发任何自动流程（仅存储）
+- 不实现批量任务行级反馈（仅单条生成路径）
+- 不允许用户修改已提交的反馈（如需修改让 admin 走 PATCH）
+
+**与 §6.2 用户对比报告的边界（v3.4 / FEAT-12）**：L3 差评针对单条记录的质量打分，写入 `generation_records.feedback_*` 4 列；§6.2 用户对比报告针对成对（RAG 源 + LLM 直接生成子记录）的差异提交，写入独立的 `improvement_reports` 表（详见 §6.2 与 ARCH §4.1.4）。两者在 result 阶段并存（FeedbackBar + 「提交对比报告」按钮各自独立锁定），允许同一对记录同时存在差评与对比报告。L4 仪表盘（§3.10）暂不消费 `improvement_reports` 数据，仅依赖 L3 反馈。
+
+---
+
+### 3.10 管理员分析仪表盘（L4）
+
+**背景**：库管理员需要从"高频差评模板 / NoMatchingTemplate 趋势 / 意图-模板混淆热点"三个维度发现要修复的模板，**让模板库改进有数据驱动**。L4 把 §3.9 用户反馈、`generate.py` 5 道闸触发事件、`rag_top3` 候选日志聚合为 4 个 KPI 端点，前端 `/admin/analytics` 一站式呈现。
+
+#### 3.10.1 4 个 KPI 端点
+
+全部要求 `lib_admin` / `super_admin`；时间窗 `days` 默认 7、上限 90（防全表扫）。
+
+**v3.3 / FEAT-11 起**：4 个端点全部新增 optional `generation_mode` query 参数（值 `rag` / `llm_direct`，omit = 全量），用于在双模架构下隔离统计两条路径的质量信号。`template-issues` 端点在 `generation_mode=llm_direct` 时把 `template_id IS NULL` 行归入 `__llm_direct__` 桶不再被默认 `IS NOT NULL` filter 排除——LLM 直接生成的代码没有对应 template_id，这是设计内行为。
+
+| 端点 | 返回字段 | 数据源 / 聚合逻辑 |
+|---|---|---|
+| `GET /api/v1/admin/analytics/feedback-summary` | `{days, total_generations, total_feedbacks, feedback_rate, bad_rate, no_match_rate}` | `total_*` = `count(generation_records)` 按时间窗；`bad_rate` = 差评数 / **反馈总数**（防 0/0 NaN）；`no_match_rate` = `gate_error_type='no_matching_template'` 记录数 / 总生成数 |
+| `GET /api/v1/admin/analytics/template-issues` | `[{template_id, total_count, bad_count, bad_rate}]` top-N（默认 10） | 仅取 `template_id IS NOT NULL AND feedback_rating IS NOT NULL` 记录，按 `template_id` group by；排序 by `bad_rate DESC, bad_count DESC` |
+| `GET /api/v1/admin/analytics/intent-confusion` | `[{intent, expected_template, actual_template, code_type, count}]` top-N | **仅** `feedback_rating=3 AND template_id != rag_top3[0].template_id`；`expected_template = rag_top3[0].template_id`（视 RAG top-1 为期望），`actual_template = template_id`；按 `(expected, actual)` 二元组聚合（不用用户原文做 key，脱敏 + 防基数爆炸），`intent` 字段返代表性截断样本（200 字符）；`code_type` 从 `templates` 表 join 出 actual 的 code_type，为前端复制 corpus 条目准备 |
+| `GET /api/v1/admin/analytics/no-match-rate` | `[{date, total, no_match_count, no_match_rate}]` | 按 UTC 日界 group by；`no_match_count` = 当日 `gate_error_type='no_matching_template'` 记录数；`total` = 当日所有 `generation_records`（含 gate 触发记录）；**不补零行**——不足 days 天时只返实际有数据的天数 |
+
+无数据情况下所有率值返 `0.0`、列表返 `[]`，**不报 500**。
+
+#### 3.10.2 仪表盘页面（`/admin/analytics`）
+
+`AdminAnalyticsPage.tsx` 挂载于 `/admin/analytics`，`RequireAdmin` 包裹。布局：
+
+1. **KPI 卡片行**（Ant Design `Statistic`）：4 个数字 / 百分比展示总生成数、反馈率、差评率、NoMatch 率
+2. **7 天趋势折线图**（`@ant-design/charts` Line）：消费 `/no-match-rate` 数据，X 轴日期、Y 轴 `no_match_rate`
+3. **差评模板 top-10 表**（Ant Design `Table`）：消费 `/template-issues`，列含 template_id / total_count / bad_count / bad_rate
+4. **intent confusion 表**（Ant Design `Table`）：消费 `/intent-confusion`，每行末尾有「复制为 corpus 条目」按钮——点击后将该行格式化为 `template_selection_corpus.yaml` 兼容的 YAML 块（含 id / intent / code_type / expected_template / note）写入剪贴板
+
+#### 3.10.3 intent-confusion → corpus 闭环
+
+混淆样本是回归测试语料的天然来源（CONTRIBUTING.md §12 近邻模板混淆对回归语料维护流程）。「复制为 corpus 条目」按钮生成的 YAML 格式直接兼容 `backend/tests/data/template_selection_corpus.yaml`：
+
+```yaml
+  - id: confusion_<timestamp>_<expected>_vs_<actual>
+    intent: "<原始意图前 200 字符>"
+    code_type: <actual_template 的 code_type，由后端 join 自动填好>
+    expected_template: <rag_top3[0].template_id>
+    note: "From production confusion log: intent classified as <actual> but expected <expected> (count=N)"
+```
+
+管理员复制后人工 append 到 yaml（**不**自动写回—— Stage 1 不做），下次 PR 上 CI 时回归套件自动守护这条规则。
+
+**Stage 范围（明确不做）**：
+- 不实现 CSV 导出（仅前端单条复制）
+- 不做仪表盘数据的 Redis 缓存（量级 < 1 周生成数，PG 直查足够）
+- 不实现 L4 自动告警（差评率突增邮件等，留待 L5）
 
 ---
 
@@ -634,8 +778,23 @@ LLM 静默标准化（旧 §3.8 第一层）**保留但角色降级**：
 
 **Step C · 渲染（render）**：系统按确认后的参数渲染最终代码，存入生成历史。
 
-**短路路径（意图缓存命中）**：
+**短路路径 1（意图缓存命中）**：
 - 历史上相同意图已生成过同一模板与同一参数 → 系统直接返回缓存代码，跳过确认面板，对用户呈现为一步式
+
+**短路路径 2（高置信 RAG 自动渲染，v3.3 / FEAT-11 起）**：
+- 当 preview 同时满足以下四条件时，`pipeline_preview` 同样把 `quick_render=True` 设为 True，前端跳过确认面板直接调 `/render`：
+  1. `confidence_source == "llm_step1"`（LLM 主动选中模板，未走 rag_fallback）
+  2. `STEP1_VERIFY_ENABLED=true` 且 A8 二次验证通过（LLM 自审 yes）
+  3. 选中模板的 stage3 reranker score ≥ `RERANKER_MIN_SCORE_THRESHOLD`（默认 0.30）
+  4. 所有 required 参数的源都属于高置信源集合 `{llm, regex, signal_list, default}`（不含 `semantic_fallback` / `placeholder`）
+- 任一条件不满足即保留原 ConfirmationPanel 流程，用户可手工编辑参数后再 render（无回归）
+- 前端 `handlePreviewSuccess` 的 `quick_render` 旗标处理对"意图缓存命中"与"高置信 RAG"两种来源完全一致——前者 `confidence_source==intent_cache`、后者 `confidence_source==llm_step1`，差异仅在置信徽标颜色
+
+**LLM 直接生成兜底（result 阶段，v3.3 / FEAT-11 起）**：
+- result 阶段在代码卡片下方展示「对生成结果不满意？尝试 LLM 直接生成」secondary 按钮，**仅在 `state.result.generation_mode === 'rag'` 时显示**——已经是 `llm_direct` 的记录不再展示该按钮，禁止链式 fallback
+- 点击 → spinner → `POST /api/v1/generate/llm-fallback {generation_record_id}` → 后端载入源记录的 intent / code_type / signals / clk / rst → 调 `LLMClient.generate_code_freeform`（围栏接受 `systemverilog` / `sv` / `verilog` 三种 lang 或裸 ` ``` `）→ 返回 `{code, generation_record_id, generation_mode: "llm_direct", cache_hit}` → 前端替换代码区 + 反馈状态归零
+- 代码卡片头部强制渲染 `<Tag color="orange">LLM 直接生成 · 非确定性</Tag>` 提示用户当前结果不在确定性契约保护范围内
+- 同一输入命中 `gen_llm:{llm_config_id}:{sha256(canonical(intent+code_type+signals+clk+rst))}` 7d TTL Redis 缓存时返缓存代码（cache_hit=True）；切换默认 LLM 配置即 flush 该前缀（与 `gen:*` / `intent_cache:*` 同步清空）
 
 **软提示路径（低置信度，**非硬闸**）**：
 - 当 `confidence_source == "rag_fallback"`（LLM Step1 没主动选中、由 RAG top-1 兜底）时，确认面板顶部展示提示条与「去意图构建器精修」「贡献新模板」两个入口
@@ -664,17 +823,83 @@ LLM 静默标准化（旧 §3.8 第一层）**保留但角色降级**：
 | **code_type 错配** | 422 | `code_type_mismatch` | 无 | 弹"代码类型选错了"Modal 引导切换，停留生成页 |
 | **under_specified** | 422 | `under_specified` | `/intent-builder?prefill=<intent>&missing=<param_names>&template_id=<id>` | 前端读 `redirect_to` 自动 `router.push`，进入 IntentBuilder 多轮对话补足信息 |
 | **empty_retrieval** | 503 | `empty_retrieval` | 无 | 弹"系统暂不可用，请稍后或联系管理员"，停留生成页（基础设施问题，跳哪里都救不了） |
+| **llm_direct_chained_not_allowed**（v3.3） | 422 | `llm_direct_chained_not_allowed` | 无 | 用户对已是 `llm_direct` 的记录再次点 fallback 按钮（理论上前端按 `generation_mode==='rag'` 守门已阻止；保留作 API 直调防线）；前端 `message.error` 文案"已是 LLM 直接生成结果，不支持链式兜底"，停留 result 页 |
+| **llm_direct_no_code**（v3.3） | 422 | `llm_direct_no_code` | 无 | `LLMClient.generate_code_freeform` 解析失败（LLM 返纯文字无 ` ```systemverilog/sv/verilog``` ` 围栏）；前端 `message.error` "LLM 未生成可用 SV 代码块，请稍后重试或换 LLM 配置"，停留 result 页 |
+| **llm_direct_internal_error · 422 分支**（v3.3） | 422 | `llm_direct_internal_error` | 无 | 非 `no_sv_code_block` 类 `ValueError`（LLM 输出可解析但内容异常 / Pydantic 校验失败等）；`detail.message` 是固定文案不泄漏内部 repr；前端 `message.error` "LLM 直接生成失败，请稍后重试"，停留 result 页 |
+| **llm_direct_internal_error · 500 分支**（v3.3） | 500 | `llm_direct_internal_error` | 无 | `except Exception` 兜底（DB 写入失败 / 网络超时 / LLM SDK 内部错误等基础设施失败）；与 422 同名 `type`，靠 HTTP 状态区分——422 用户重试可能解决，500 需 SRE 介入；前端 `message.error` 同 422 分支，但状态码会出现在 toast 文案的"HTTP 500"段 |
+| **duplicate_report**（v3.4 / FEAT-12） | 409 | `duplicate_report` | 无 | 同一 `(rag_record_id, llm_direct_record_id)` 对已存在 `improvement_reports` 行；`detail.existing_report_id` 为已有记录的 UUID。前端 `handleApiError` 将"提交对比报告"按钮置 disabled、文案改为"已有人提交对比报告，admin 处理中"，停留 result 页 |
+| **invalid_record_ref**（v3.4 / FEAT-12） | 422 | `invalid_record_ref` | 无 | `POST /improvement-reports` 中 `rag_record_id` 或 `llm_direct_record_id` 在 `generation_records` 中不存在（被 admin 删除 / ID 拼错）；前端 `message.error` "记录不存在，可能已被删除，请刷新页面"，停留 result 页 |
+| **illegal_status_transition**（v3.4 / FEAT-12） | 422 | `illegal_status_transition` | 无 | `PATCH /admin/improvement-reports/{id}` 试图非法跳转 admin 三态状态机（如 `pending → resolved` 跳过 `in_review`、`resolved → pending` 倒退、`resolved → in_review` 倒退）；`detail.message` 描述合法跳转链。前端 `message.error` 提示 admin"非法状态跳转"，停留 admin 详情页 |
 
-后端 except 链顺序固定（OffTopic → CodeTypeMismatch → UnderSpecified → EmptyRetrieval → 兜底 ValueError），不要泛化为 `except ValueError`。
+后端 except 链顺序固定（OffTopic → CodeTypeMismatch → UnderSpecified → EmptyRetrieval → 兜底 ValueError），不要泛化为 `except ValueError`。`llm_direct_*` 错误由 `POST /generate/llm-fallback` 端点独立返回，与上述 5 道闸的 except 链路无关。`llm_direct_internal_error` 同名 `type` 同时出现在 422 和 500，前端 `handleApiError` 据 HTTP 状态分流即可（不依赖 detail.type 区分）。`duplicate_report` / `invalid_record_ref` / `illegal_status_transition`（FEAT-12）由 `improvement_reports` 路由独立返回，亦与上述 except 链无关，三者均不带 `redirect_to`。
 
 **IntentBuilder 处理后的回流**：用户在 IntentBuilder 中通过多轮对话产出标准化 intent 后，点击「用这条意图回去生成」，前端 `router.push("/generate?prefill=<refined_intent>")` 跳回生成页，自动填入 TextArea 并触发新一轮 /preview——若仍触发 under_specified，循环（用户可继续 IntentBuilder 精修或退到贡献流）。
 
-### 6.2 批量生成主流程
+### 6.2 用户对比报告（FEAT-12 / v3.4）
 
-1. 用户下载Excel模板
-2. 填写Excel（描述列 + 信号列）
-3. 上传Excel，选择默认代码类型
-4. 系统显示解析预览（行数、识别到的列）
+**用户旅程**：result 阶段当且仅当 `state.result.generation_mode === 'llm_direct' && state.result.parent_record_id != null` 时，FeedbackBar 旁渲染独立 secondary 按钮「提交对比报告」（与 §3.9 L3 差评按钮并存，两个交互互相独立）。`rag` 路径记录与"冷启动 llm_direct"（parent_record_id 为空，本期实际不可达）均不渲染该按钮。
+
+**触发位置与既有差异**：
+- L3 差评（§3.9）：每条记录单独打分（1/2/3），回写 `generation_records.feedback_*` 4 列，关心"这条结果质量怎样"
+- 对比报告（§6.2 本节）：成对（RAG 源 + LLM 直接生成子记录）一次性提交，写入新表 `improvement_reports`，关心"RAG vs LLM 直接生成的差异是否值得 admin 关注、问题在哪类"
+- 二者可同时使用——用户既可对 LLM 直接生成结果打 3 分差评，也可同一对再提交对比报告，互不抑制
+
+**提交 Modal（4 项分类 + 自由文本）**：
+
+| 字段 | 控件 | 必填 | 说明 |
+|---|---|---|---|
+| `report_categories` | `Checkbox.Group`（4 选项可多选） | 否（可全不勾） | 见下方枚举表 |
+| `reporter_note` | `TextArea`（rows=4，无字数上限校验） | 否（可空） | 用户自由描述差异点 |
+
+`report_categories` 枚举（`ReportCategoryEnum`，slug ↔ 中文 label）：
+
+| slug | 中文 label | 含义 |
+|---|---|---|
+| `wrong_template` | 模板选错 | RAG 选中的模板与意图不符（语义错配） |
+| `wrong_params` | 参数映射错 | 模板正确但参数填充错误（信号名/状态列表/表达式映射错） |
+| `poor_style` | 代码风格差 | 模板正确、参数正确，但生成风格不符合团队规范（命名、缩进、注释） |
+| `other` | 其他 | 上述 3 类无法归纳的差异 |
+
+**"全选填均为空也允许提交"是显式契约**：用户可不勾任何分类、不写任何 note 直接点「提交」，HTTP 201 成功 → 后端写入 `status='pending'` + `report_categories=[]` + `reporter_note=NULL` 记录。设计原则：降低提交摩擦——用户观察到差异即可一键留痕，分类与详述可由 admin 在审阅时反向补充。
+
+**按钮 disabled 状态**：
+
+| 触发条件 | 按钮文案 | 触发机制 |
+|---|---|---|
+| 本次会话内已提交成功 | 「已提交」（gray） | 前端 state.reported 旗标 |
+| 同一对 `(rag_record_id, llm_direct_record_id)` 已有他人/历史报告 | 「已有人提交对比报告，admin 处理中」（gray） | `GET /api/v1/improvement-reports/check?rag_record_id=&llm_direct_record_id=` mount 时查询；或 `POST` 时捕获 409 `duplicate_report` 兜底刷新按钮态 |
+
+**admin 三态审阅工作流**：
+
+```
+pending ──admin 打开详情页（mount 自动 PATCH）──► in_review ──admin 写 note + 「标记已处理」──► resolved
+```
+
+合法跳转：`pending → in_review`、`in_review → resolved`。**所有其他跳转一律 422 `illegal_status_transition`**，包括但不限于 `pending → resolved`（跳过 in_review）、`resolved → pending`（倒退）、`resolved → in_review`（倒退）、`in_review → pending`（倒退）。多 admin 并发进入 `in_review` 不做认领锁（last-write-wins），FEAT-12 不解决该并发问题。
+
+admin 端入口：侧边栏「管理」分组新增「对比报告」菜单项 `/admin/improvement-reports`，仅 `lib_admin` / `super_admin` 可见。
+
+- **列表页**：分页 Table，含 ID / 状态 Tag（pending/in_review/resolved 三色）/ 提交用户名 / RAG 模板名 / 分类 Tag 组 / 提交时间 / 操作"查看"。Filter Bar 支持 `status` 单选 + `categories` 多选，默认 `created_at DESC`
+- **详情页**（`/admin/improvement-reports/:id`）：三列 Card 横向布局——左 RAG 记录（output_code / template_name / params_used / original_intent / generation_mode）/ 中 LLM Direct 记录（同字段）/ 右用户提交内容（categories / note）+ admin_note 编辑区 + 「标记已处理」按钮。mount 时若 `status === 'pending'`，前端**自动**调 `PATCH /api/v1/admin/improvement-reports/{id} { status: 'in_review' }`，无需 admin 主动点击
+
+**Out of scope（明确不做，留 FEAT-13 或后续票）**：
+- **语料回流**：resolved 报告自动 / 半自动写入 `template_corpus_cases` 闭环（留 FEAT-13）
+- admin 端报告 CSV 导出
+- 邮件 / Webhook 推送通知（admin 有新报告待审）
+- 报告评论 / 互相回复（admin ↔ 用户对话）；`admin_note` 为单向字段
+- 跨 admin 的认领锁（多 admin 同时进入 `in_review` 均允许，last-write-wins）
+- 删除 improvement_report
+- 用户撤回已提交的报告
+- 报告字段长度上限校验（`reporter_note` / `admin_note` 均不设 DB 层 CHECK 约束）
+- 批量任务（Celery）路径生成记录的对比报告（`parent_record_id` 在 batch 路径中不写入，故无源记录可对比）
+- 贡献向导路径生成记录的对比报告
+
+### 6.3 批量生成主流程
+
+1. 用户下载Excel模板（3 列格式：A=编号、B=验证/覆盖意图、C=备注）
+2. 在 Excel 第 3 行起按需填写 A/B/C 三列（B 列必填；模块/时钟/复位/信号等结构化字段无需手填）
+3. 上传Excel（无需在前端选择 code_type，按 sheet 名自动识别；见 §3.1.2）
+4. 系统显示解析预览（行数、识别到的 sheet → code_type）
 5. 确认开始批量生成
 6. 显示实时进度（已完成/总数）
 7. 生成完成，展示结果列表（含每行状态）
